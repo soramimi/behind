@@ -7,8 +7,45 @@
 #include <stdint.h>
 #include <string>
 #include <vector>
-
+#include "RandomNumber.h"
 #include <sys/socket.h>
+
+struct Global {
+};
+
+extern Global *global;
+
+namespace misc {
+static inline std::string unquote(std::string value)
+{
+	if (value.size() > 2) {
+		if (value[0] == '\"' && value[value.size() - 1] == '\"') {
+			value = value.substr(1, value.size() - 2);
+		}
+	}
+	return value;
+}
+static inline bool to_bool(std::string const &value)
+{
+	std::string v = unquote(value);
+	if (v == "yes") return true;
+	if (v == "no") return false;
+	return false;
+}
+}
+
+struct Option {
+	bool case_randomize = false;
+	void set(std::string const &section, std::string const &key, std::string const &value)
+	{
+		if (key == "case-randomize") {
+			case_randomize = misc::to_bool(value);
+			return;
+
+
+		}
+	}
+};
 
 enum class DNS_TYPE : uint16_t {
 	A = 1,
@@ -28,6 +65,7 @@ struct Forwarder {
 
 class Behind {
 	friend class Cache;
+public:
 private:
 	struct dns_record_t;
 	struct dns_header_t;
@@ -40,7 +78,7 @@ private:
 	Private *m;
 
 public:
-	Behind();
+	Behind(Option const &opt);
 	~Behind();
 	void main();
 	void add_nxdomain(const std::string &domain);
