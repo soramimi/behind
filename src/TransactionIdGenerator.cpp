@@ -1,0 +1,41 @@
+#include "TransactionIdGenerator.h"
+
+struct TransactionIdGenerator::Private {
+	std::random_device rd;
+	std::mt19937 gen;
+	std::uniform_int_distribution<int> dist64k;
+	std::uniform_int_distribution<int> dist32k;
+	uint16_t pool[65536];
+	int index = 0;
+
+	Private()
+		: gen(rd())
+		, dist64k(0, 0xffff)
+		, dist32k(0, 0x7fff)
+	{
+	}
+};
+
+TransactionIdGenerator::TransactionIdGenerator()
+	: m(new Private)
+{
+	std::iota(m->pool, m->pool + 65536, 0);
+	for (int i = 0; i < 65536; ++i) {
+		int j = m->dist64k(m->gen);
+		std::swap(m->pool[i], m->pool[j]);
+	}
+}
+
+TransactionIdGenerator::~TransactionIdGenerator()
+{
+	delete m;
+}
+
+uint16_t TransactionIdGenerator::next()
+{
+	int i = (m->index + m->dist32k(m->gen)) & 0xffff;
+	std::swap(m->pool[m->index], m->pool[i]);
+	uint16_t id = m->pool[m->index];
+	m->index = (m->index + 1) & 0xffff;
+	return id;
+}

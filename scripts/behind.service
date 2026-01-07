@@ -1,0 +1,20 @@
+[Unit]
+Description=Behind DNS Service
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/soramimi/develop/behind/_bin/behind
+Restart=on-failure
+RestartSec=5
+
+User=soramimi
+Group=soramimi
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+

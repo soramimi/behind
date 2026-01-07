@@ -1,0 +1,5 @@
+*.user
+src/*.o
+_bin/
+build/
+src/nxdomain
