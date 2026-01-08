@@ -24,3 +24,11 @@ std::string misc::strtolower(std::string_view const &s)
 	return r;
 }
 
+std::string misc::trimmed(char const *begin, char const *end)
+{
+	char const *left = begin;
+	char const *right = end;
+	while (left < right && isspace((unsigned char)*left)) left++;
+	while (left < right && isspace((unsigned char)right[-1])) right--;
+	return std::string(left, right);
+}

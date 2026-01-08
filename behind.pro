@@ -9,6 +9,8 @@ gcc:QMAKE_CXXFLAGS += -Wno-switch
 
 SOURCES += \
     src/Behind.cpp \
+    src/ConfigParser.cpp \
+    src/Logger.cpp \
     src/RandomNumber.cpp \
     src/TransactionIdGenerator.cpp \
     src/inetresolver.cpp \
@@ -19,6 +21,8 @@ SOURCES += \
 
 HEADERS += \
     src/Behind.h \
+    src/ConfigParser.h \
+    src/Logger.h \
     src/RandomNumber.h \
     src/TransactionIdGenerator.h \
     src/inetresolver.h \

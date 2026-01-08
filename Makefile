@@ -8,7 +8,7 @@ clean:
 	rm -fr build
 
 install:
-	cd src; make install
+	cp scripts/behind.service /etc/systemd/system/
 
 restart:
 	sudo systemctl restart behind

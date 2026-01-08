@@ -6,6 +6,7 @@
 #include <map>
 #include <stdint.h>
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include "RandomNumber.h"
 #include <sys/socket.h>
@@ -15,36 +16,10 @@ struct Global {
 
 extern Global *global;
 
-namespace misc {
-static inline std::string unquote(std::string value)
-{
-	if (value.size() > 2) {
-		if (value[0] == '\"' && value[value.size() - 1] == '\"') {
-			value = value.substr(1, value.size() - 2);
-		}
-	}
-	return value;
-}
-static inline bool to_bool(std::string const &value)
-{
-	std::string v = unquote(value);
-	if (v == "yes") return true;
-	if (v == "no") return false;
-	return false;
-}
-}
-
 struct Option {
+	std::string forward_addr;
 	bool case_randomize = false;
-	void set(std::string const &section, std::string const &key, std::string const &value)
-	{
-		if (key == "case-randomize") {
-			case_randomize = misc::to_bool(value);
-			return;
-
-
-		}
-	}
+	std::unordered_set<std::string> nxdomain;
 };
 
 enum class DNS_TYPE : uint16_t {
@@ -100,11 +75,14 @@ private:
 	int parse_question_section(char const *begin, char const *end, char const *ptr, question_t *out);
 	Forwarder get_forwarder();
 	void init_forwarder();
-	void purge();
+	void clean();
 	bool take_query(uint16_t id, query_t *out);
 	void delete_pending_query(uint16_t id);
 	void push_query(query_t const &query);
 	void parse_dns_packet(char const *begin, char const *end, dns_header_t *header, std::list<question_t> *questions, std::list<answer_t> *answers);
+
+	bool is_nxdomain(const std::string &name);
+	void process(void *private_d, int family, int sock);
 };
 
 #endif // BEHIND_H
