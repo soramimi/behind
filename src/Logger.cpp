@@ -11,6 +11,8 @@
 #include <vector>
 #include <string>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 Logger x_logger;
 
@@ -23,7 +25,7 @@ struct Logger::LogItem {
 };
 
 struct Logger::Private {
-	int fd_log = 2;
+	int fd_log = -1;
 	std::vector<Logger::LogItem> items;
 	std::thread thread;
 	std::mutex mutex;
@@ -91,9 +93,43 @@ void Logger::write(LogItem const &item)
 	}
 }
 
+void Logger::rotate()
+{
+	if (m->fd_log == -1) return;
+	
+	const int N = 9;
+	int i = N;
+	std::string dst = log_path() + '.' + std::to_string(i);
+	unlink(dst.c_str());
+	while (i > 0) {
+		i--;
+		std::string src = log_path() + '.' + std::to_string(i);
+		rename(src.c_str(), dst.c_str());
+		dst = src;
+	}
+
+	int fd_dst = open(dst.c_str(), O_WRONLY | O_CREAT | O_TRUNC, log_file_permission());
+	if (fd_dst != -1) {
+		lseek(m->fd_log, 0, SEEK_SET);
+		while (1) {
+			char buf[4096];
+			int n = read(m->fd_log, buf, sizeof(buf));
+			if (n < 1) break;
+			if (::write(fd_dst, buf, n) != n) break;
+		}
+		close(fd_dst);
+	}
+	lseek(m->fd_log, 0, SEEK_SET);
+	ftruncate(m->fd_log, 0);
+}
+
 void Logger::x_start()
 {
 	m->interrupted = false;
+	m->fd_log = open(log_path().c_str(), O_RDWR | O_CREAT | O_APPEND, log_file_permission());
+	if (m->fd_log == -1) {
+		logprintf(LOG_DEFAULT, "failed to open log file: %s", log_path().c_str());
+	}
 	m->thread = std::thread([this](){
 		while (1) {
 			std::vector<LogItem> items;
@@ -104,6 +140,12 @@ void Logger::x_start()
 					m->cv.wait(lock);
 				}
 				std::swap(items, m->items);
+			}
+			{
+				struct stat st;
+				if (fstat(m->fd_log, &st) == 0 && st.st_size >= log_rotate_size()) {
+					rotate();
+				}
 			}
 			for (LogItem const &item : items) {
 				write(item);

@@ -2,17 +2,34 @@
 #define LOGGER_H
 
 #include <chrono>
+#include <string>
 
 class Logger {
 private:
 	struct Private;
 	Private *m;
+
 	struct LogItem;
 	typedef std::chrono::system_clock::time_point time_point_t;
+
+	std::string log_path() const
+	{
+		return "/tmp/behind.log";
+	}
+	int log_file_permission() const
+	{
+		return 0644;
+	}
+	int log_rotate_size() const
+	{
+		return 1 * 1024 * 1024;
+	}
+
 	time_point_t now();
 	void write(const char *ptr, size_t len);
 	void write(const LogItem &item);
 	void push(const LogItem &item);
+	void rotate();
 	void x_start();
 	void x_stop();
 public:

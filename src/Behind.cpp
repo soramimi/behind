@@ -42,24 +42,41 @@ std::string randomize_case(std::string qname)
 	return qname;
 }
 
+std::string addr_to_string(int family, struct sockaddr *addr)
+{
+	char buf[INET6_ADDRSTRLEN];
+	if (family == AF_INET) {
+		struct sockaddr_in *sa4 = (struct sockaddr_in *)addr;
+		// in_addr_t s_addr = sa4->sin_addr.s_addr;
+		if (inet_ntop(AF_INET, &sa4->sin_addr, buf, sizeof(buf))) {
+			return buf;
+		}
+	} else if (family == AF_INET6) {
+		struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)addr;
+		if (inet_ntop(AF_INET6, &sa6->sin6_addr, buf, sizeof(buf))) {
+			return buf;
+		}
+	}
+	return {};
+}
+
+
 struct Behind::dns_record_t {
 	DNS_TYPE type = DNS_TYPE::A;
 	uint8_t addr[16] = {0};
 
 	std::string to_string() const
 	{
-		char buf[INET6_ADDRSTRLEN];
 		if (type == DNS_TYPE::A) {
-			struct in_addr *in4 = (struct in_addr *)addr;
-			if (inet_ntop(AF_INET, in4, buf, sizeof(buf))) {
-				return buf;
-			}
+			struct sockaddr_in a = {};
+			a.sin_addr.s_addr = *(uint32_t *)addr;
+			return addr_to_string(AF_INET, (struct sockaddr *)&a);
 		} else if (type == DNS_TYPE::AAAA) {
-			struct in6_addr *in6 = (struct in6_addr *)addr;
-			if (inet_ntop(AF_INET6, in6, buf, sizeof(buf))) {
-				return buf;
-			}
+			struct sockaddr_in6 a = {};
+			memcpy(&a.sin6_addr.s6_addr, addr, 16);
+			return addr_to_string(AF_INET6, (struct sockaddr *)&a);
 		}
+		return {};
 	}
 };
 
@@ -645,23 +662,26 @@ void Behind::process(void *private_d, int family, int sock)
 		if ((header.flags & 0xf800) == 0x0000) { // standard query
 			std::vector<char> res;
 			for (std::list<question_t>::const_iterator it = questions.begin(); it != questions.end(); it++) {
+				char const *qtype_str = "?";
 				bool nxdomain = true;
 				question_t const &q = *it;
 				if (!q.name.empty()) {
 					if (q.clas == DNS_CLASS_IN) {
 						if (q.type == DNS_TYPE::A || q.type == DNS_TYPE::AAAA) {
-							logprintf(LOG_DEFAULT, "query: %s %s\n", q.name.c_str(), (q.type == DNS_TYPE::A ? "A" : "AAAA"));
+							// search from cache
+							dns_cache_t *cache = nullptr;
+							if (q.type == DNS_TYPE::A) {
+								qtype_str = "A";
+								cache = &m->dns_cache.a;
+							} else if (q.type == DNS_TYPE::AAAA) {
+								qtype_str = "AAAA";
+								cache = &m->dns_cache.aaaa;
+							}
+							logprintf(LOG_DEFAULT, "query: %s %s\n", q.name.c_str(), qtype_str);
 							// check nxdomain list
 							if (is_nxdomain(q.name)) {
 								nxdomain = true;
 							} else {
-								// search from cache
-								dns_cache_t *cache = nullptr;
-								if (q.type == DNS_TYPE::A) {
-									cache = &m->dns_cache.a;
-								} else if (q.type == DNS_TYPE::AAAA) {
-									cache = &m->dns_cache.aaaa;
-								}
 								if (cache) {
 									std::vector<dns_record_t> const *records = cache->find(q.name);
 									if (records && !records->empty()) {
@@ -670,13 +690,29 @@ void Behind::process(void *private_d, int family, int sock)
 										write_dns_header(&res, header.id, flags, 1, 1, 0, 0);
 										write_dns_question_rr(&res, q.name, q.type, q.clas);
 										write_dns_answer_rr(&res, q.name, q.clas, ttl(), rec);
+										std::string client;
 										if (family == AF_INET) {
+											client = addr_to_string(family, (struct sockaddr *)&d->sa4);
 											sendto(d->sock4, &res[0], (int)res.size(), 0, (struct sockaddr *)&d->sa4, sizeof(sockaddr_in));
 										} else if (family == AF_INET6) {
+											client = addr_to_string(family, (struct sockaddr *)&d->sa6);
 											sendto(d->sock6, &res[0], (int)res.size(), 0, (struct sockaddr *)&d->sa6, sizeof(sockaddr_in6));
 										}
-										std::string addr_str = rec.to_string();
-										logprintf(LOG_DEFAULT, "response from cache: %s %s\n", q.name.c_str(), addr_str.c_str());
+										{
+											char const *type = "?";
+											if (rec.type == DNS_TYPE::A) {
+												type = "A";
+											} else if (rec.type == DNS_TYPE::AAAA) {
+												type = "AAAA";
+											}
+											std::string addr_str = rec.to_string();
+											logprintf(LOG_DEFAULT, "reply: <<%s %s %s>> to %s (from cache)\n"
+													  , q.name.c_str()
+													  , type
+													  , addr_str.c_str()
+													  , client.c_str()
+													  );
+										}
 										nxdomain = false;
 										break;
 									}
@@ -739,12 +775,19 @@ void Behind::process(void *private_d, int family, int sock)
 						question_t const &q = *it;
 						write_dns_question_rr(&res, q.name, q.type, q.clas);
 					}
+					std::string client;
 					if (family == AF_INET) {
+						client = addr_to_string(family, (struct sockaddr *)&d->sa4);
 						sendto(d->sock4, &res[0], (int)res.size(), 0, (struct sockaddr *)&d->sa4, sizeof(sockaddr_in));
 					} else if (family == AF_INET6) {
+						client = addr_to_string(family, (struct sockaddr *)&d->sa6);
 						sendto(d->sock6, &res[0], (int)res.size(), 0, (struct sockaddr *)&d->sa6, sizeof(sockaddr_in6));
 					}
-					logprintf(LOG_DEFAULT, "response: %s = NXDOMAIN\n", q.name.c_str());
+					logprintf(LOG_DEFAULT, "response: <<%s %s NXDOMAIN>> to %s\n"
+							  , q.name.c_str()
+							  , qtype_str
+							  , client.c_str()
+							  );
 				}
 			}
 		} else if (header.flags & 0x8000) { // response
@@ -785,9 +828,28 @@ void Behind::process(void *private_d, int family, int sock)
 						res.reserve(1500);
 						uint16_t flags = header.flags;
 						write_dns_header(&res, q.requester_id, flags, 0, (uint16_t)records.size(), 0, 0);
+						std::string client;
+						if (q.client_family == AF_INET) {
+							client = addr_to_string(AF_INET, (struct sockaddr *)&q.client_sa4);
+						} else if (q.client_family == AF_INET6) {
+							client = addr_to_string(AF_INET6, (struct sockaddr *)&q.client_sa6);
+						}
 						for (int i = 0; i < (int)records.size(); i++) {
 							write_dns_answer_rr(&res, q.request_name, DNS_CLASS_IN, ttl(), records[i]);
-							logprintf(LOG_DEFAULT, "response: %s = %s\n", q.request_name.c_str(), records[i].to_string().c_str());
+							{
+								char const *type = "?";
+								if (records[i].type == DNS_TYPE::A) {
+									type = "A";
+								} else if (records[i].type == DNS_TYPE::AAAA) {
+									type = "AAAA";
+								}
+								logprintf(LOG_DEFAULT, "response: <<%s %s %s>> to %s\n"
+										  , q.request_name.c_str()
+										  , type
+										  , records[i].to_string().c_str()
+										  , client.c_str()
+										  );
+							}
 						}
 						if (q.client_family == AF_INET) {
 							sendto(d->sock4, &res[0], (int)res.size(), 0, (struct sockaddr *)&q.client_sa4, sizeof(sockaddr_in));
