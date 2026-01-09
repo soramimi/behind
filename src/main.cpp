@@ -10,6 +10,8 @@
 #include <string.h>
 #include <unistd.h>
 
+InetResolver::Type parse_inet_address(std::string name, InetResolver::Addr *addr_out, int *port_out);
+
 Global *global = nullptr;
 
 bool set_option(std::string const &section, std::string const &key, std::string const &value, Option *opt)
@@ -38,6 +40,14 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 			opt->nxdomain.insert(opt->nxdomain.end(), value);
 			return true;
 		}
+	} else if (section == "hosts") {
+		InetResolver::Addr addr;
+		auto type = parse_inet_address(value, &addr, nullptr);
+		if (type == InetResolver::UNDEFINED) {
+			logprintf(LOG_DEFAULT, "invalid address in hosts: %s\n", value.c_str());
+			return false;
+		}
+		opt->hosts[key] = addr;
 	} else {
 		logprintf(LOG_DEFAULT, "unknown section: [%s]\n", section.c_str());
 		return false;
@@ -82,7 +92,6 @@ int main2(Behind *ns, Option *opt)
 {
 	auto Perform = [&](){
 		try {
-
 			ns->main();
 		} catch (std::string const &e) {
 			logprintf(LOG_DEFAULT, "%s\n", e.c_str());

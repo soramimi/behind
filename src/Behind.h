@@ -6,6 +6,7 @@
 #include <map>
 #include <stdint.h>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include "RandomNumber.h"
@@ -20,6 +21,7 @@ struct Option {
 	std::string forward_addr;
 	bool case_randomize = false;
 	std::unordered_set<std::string> nxdomain;
+	std::unordered_map<std::string, InetResolver::Addr> hosts;
 };
 
 enum class DNS_TYPE : uint16_t {
@@ -82,6 +84,7 @@ private:
 	void parse_dns_packet(char const *begin, char const *end, dns_header_t *header, std::list<question_t> *questions, std::list<answer_t> *answers);
 
 	bool is_nxdomain(const std::string &name);
+	void send_response(void *private_d, int family, const dns_header_t &header, const question_t &q, const dns_record_t &rec);
 	void process(void *private_d, int family, int sock);
 };
 

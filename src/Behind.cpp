@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <assert.h>
 
 #define stricmp(A, B) strcasecmp(A, B)
 #define STRERROR(S) (std::string(S) + strerror(errno))
@@ -411,6 +412,105 @@ size_t parse_int(char const *p, int *out)
 	return i;
 }
 
+InetResolver::Type parse_inet_address(std::string name, InetResolver::Addr *addr_out, int *port_out)
+{
+	char const *host_begin = name.c_str();
+	char const *host_end = host_begin + name.size();
+
+	// detect address type
+	char const *p = name.c_str();
+	bool in4 = true;
+	bool in6 = true;
+	bool bracket = false;
+	int dots = 0;
+	p += parse_space(p);
+	while (*p) {
+		int c = (unsigned char)*p++;
+		if (c == ']') {
+			host_end = p - 1;
+			in4 = false;
+			if (!bracket) {
+				in6 = false;
+				break;
+			}
+			if (*p == ':') {
+				break;
+			}
+			break;
+		} else if (c == '[') {
+			host_begin = p;
+			bracket = true;
+			in4 = false;
+		} else if (isdigit(c)) {
+			// ok
+		} else if (isxdigit(c)) {
+			in4 = false;
+		} else if (c == ':') {
+			if (in4) {
+				if (dots == 3) {
+					host_end = p;
+					break;
+				}
+				in4 = false;
+			}
+		} else if (c == '.') {
+			in6 = false;
+			dots++;
+			if (dots > 3) {
+				in4 = false;
+				break;
+			}
+		} else {
+			in4 = in6 = false;
+			break;
+		}
+	}
+	if (dots != 3) {
+		in4 = false;
+	}
+	if (*p == ':') {
+		p++;
+		int port = 53;
+		size_t len = parse_int(p, &port);
+		if (len > 0) {
+			p += len;
+			if (port_out) {
+				*port_out = port;
+			}
+		} else {
+			in4 = in6 = false;
+		}
+	}
+	p += parse_space(p);
+	if (*p) {
+		in4 = in6 = false;
+	}
+	name = std::string(host_begin, host_end - host_begin);
+
+	InetResolver::Addr addr;
+	if (in4) {
+		addr.type = InetResolver::IN4;
+		struct sockaddr_in sa4 = {};
+		inet_pton(AF_INET, name.c_str(), &sa4.sin_addr);
+		addr.addr.emplace_back();
+		addr.addr.front().resize(4);
+		memcpy(addr.addr.front().data(), &sa4.sin_addr.s_addr, 4);
+	} else if (in6) {
+		addr.type = InetResolver::IN6;
+		struct sockaddr_in6 sa6 = {};
+		inet_pton(AF_INET6, name.c_str(), &sa6.sin6_addr);
+		addr.addr.emplace_back();
+		addr.addr.front().resize(16);
+		memcpy(addr.addr.front().data(), sa6.sin6_addr.s6_addr, 16);
+	}
+
+	if (addr_out) {
+		*addr_out = addr;
+	}
+
+	return addr.type;
+}
+
 void Behind::init_forwarder()
 {
 	// std::string name = "8.8.8.8";
@@ -637,6 +737,40 @@ bool Behind::is_nxdomain(std::string const &name)
 	return false;
 }
 
+void Behind::send_response(void *private_d, int family, dns_header_t const &header, question_t const &q, dns_record_t const &rec)
+{
+	Private::D *d = static_cast<Private::D *>(private_d);
+
+	std::vector<char> res;
+	uint16_t flags = 0x8180;
+	write_dns_header(&res, header.id, flags, 1, 1, 0, 0);
+	write_dns_question_rr(&res, q.name, q.type, q.clas);
+	write_dns_answer_rr(&res, q.name, q.clas, ttl(), rec);
+	std::string client;
+	if (family == AF_INET) {
+		client = addr_to_string(family, (struct sockaddr *)&d->sa4);
+		sendto(d->sock4, &res[0], (int)res.size(), 0, (struct sockaddr *)&d->sa4, sizeof(sockaddr_in));
+	} else if (family == AF_INET6) {
+		client = addr_to_string(family, (struct sockaddr *)&d->sa6);
+		sendto(d->sock6, &res[0], (int)res.size(), 0, (struct sockaddr *)&d->sa6, sizeof(sockaddr_in6));
+	}
+	{
+		char const *type = "?";
+		if (rec.type == DNS_TYPE::A) {
+			type = "A";
+		} else if (rec.type == DNS_TYPE::AAAA) {
+			type = "AAAA";
+		}
+		std::string addr_str = rec.to_string();
+		logprintf(LOG_DEFAULT, "response: <<%s %s %s>> to %s (from cache)\n"
+				  , q.name.c_str()
+				  , type
+				  , addr_str.c_str()
+				  , client.c_str()
+				  );
+	}
+}
+
 void Behind::process(void *private_d, int family, int sock)
 {
 	Private::D *d = static_cast<Private::D *>(private_d);
@@ -682,85 +816,94 @@ void Behind::process(void *private_d, int family, int sock)
 							if (is_nxdomain(q.name)) {
 								nxdomain = true;
 							} else {
+								bool forward = true;
+								{
+									// check known hosts
+									auto it = m->option.hosts.find(q.name);
+									if (it != m->option.hosts.end()) {
+										dns_record_t rec;
+										InetResolver::Addr const &addr = it->second;
+										if (!addr.addr.empty()) {
+											if (q.type == DNS_TYPE::A && addr.type == InetResolver::IN4) {
+												rec.type = DNS_TYPE::A;
+												for (std::vector<char> const &a : addr.addr) {
+													assert(a.size() == 4);
+													memcpy(rec.addr, a.data(), 4);
+												}
+												nxdomain = false;
+											} else if (q.type == DNS_TYPE::AAAA && addr.type == InetResolver::IN6) {
+												rec.type = DNS_TYPE::AAAA;
+												for (std::vector<char> const &a : addr.addr) {
+													assert(a.size() == 16);
+													memcpy(rec.addr, a.data(), 16);
+												}
+												nxdomain = false;
+											} else {
+												nxdomain = true;
+											}
+											if (!nxdomain) {
+												send_response(d, family, header, q, rec);
+												forward = false;
+											}
+										}
+									}
+								}
 								if (cache) {
 									std::vector<dns_record_t> const *records = cache->find(q.name);
 									if (records && !records->empty()) {
 										dns_record_t const &rec = records->front();
-										uint16_t flags = 0x8180;
-										write_dns_header(&res, header.id, flags, 1, 1, 0, 0);
-										write_dns_question_rr(&res, q.name, q.type, q.clas);
-										write_dns_answer_rr(&res, q.name, q.clas, ttl(), rec);
-										std::string client;
-										if (family == AF_INET) {
-											client = addr_to_string(family, (struct sockaddr *)&d->sa4);
-											sendto(d->sock4, &res[0], (int)res.size(), 0, (struct sockaddr *)&d->sa4, sizeof(sockaddr_in));
-										} else if (family == AF_INET6) {
-											client = addr_to_string(family, (struct sockaddr *)&d->sa6);
-											sendto(d->sock6, &res[0], (int)res.size(), 0, (struct sockaddr *)&d->sa6, sizeof(sockaddr_in6));
-										}
-										{
-											char const *type = "?";
-											if (rec.type == DNS_TYPE::A) {
-												type = "A";
-											} else if (rec.type == DNS_TYPE::AAAA) {
-												type = "AAAA";
-											}
-											std::string addr_str = rec.to_string();
-											logprintf(LOG_DEFAULT, "reply: <<%s %s %s>> to %s (from cache)\n"
-													  , q.name.c_str()
-													  , type
-													  , addr_str.c_str()
-													  , client.c_str()
-													  );
-										}
+										send_response(d, family, header, q, rec);
 										nxdomain = false;
+										forward = false;
 										break;
 									}
 								}
-								// not found, forward to upstream
-								Forwarder forwarder = get_forwarder();
-								if (forwarder) {
-									uint16_t id = m->txid_gen.next();
-									delete_pending_query(id);
-									std::vector<char> req;
-									req.reserve(1500);
-									write_dns_header(&req, id, 0x0100, 1, 0, 0, 0);
-									std::string query_name = q.name;
-									if (m->option.case_randomize) {
-										query_name = randomize_case(query_name);
-									}
-									write_dns_question_rr(&req, query_name, q.type, DNS_CLASS_IN);
-									ssize_t len = 0;
-									if (forwarder.af_type == AF_INET) {
-										struct sockaddr_in to;
-										init_sa4(&to, forwarder.port);
-										memcpy(&to.sin_addr.s_addr, forwarder.addr, 4);
-										len = sendto(d->sock4, &req[0], (int)req.size(), 0, (struct sockaddr *)&to, sizeof(sockaddr_in)); // forward
-									} else if (forwarder.af_type == AF_INET6) {
-										struct sockaddr_in6 to;
-										init_sa6(&to, forwarder.port);
-										memcpy(&to.sin6_addr.s6_addr, forwarder.addr, 16);
-										len = sendto(d->sock6, &req[0], (int)req.size(), 0, (struct sockaddr *)&to, sizeof(sockaddr_in6)); // forward
-									}
-									if (len > 0) {
-										query_t t;
-										t.time = misc::get_tick_count();
-										t.requester_id = header.id;
-										t.upstream_id = id;
-										t.type = q.type;
-										t.client_family = family;
-										if (family == AF_INET) {
-											t.client_sa4 = d->sa4;
-										} else if (family == AF_INET6) {
-											t.client_sa6 = d->sa6;
+								if (forward) {
+									// not found, forward to upstream
+									Forwarder forwarder = get_forwarder();
+									if (forwarder) {
+										uint16_t id = m->txid_gen.next();
+										delete_pending_query(id);
+										std::vector<char> req;
+										req.reserve(1500);
+										write_dns_header(&req, id, 0x0100, 1, 0, 0, 0);
+										std::string query_name = q.name;
+										if (m->option.case_randomize) {
+											query_name = randomize_case(query_name);
 										}
-										t.request_name = q.name;
-										t.forward_name = query_name;
-										push_query(t);
+										write_dns_question_rr(&req, query_name, q.type, DNS_CLASS_IN);
+										ssize_t len = 0;
+										if (forwarder.af_type == AF_INET) {
+											struct sockaddr_in to;
+											init_sa4(&to, forwarder.port);
+											memcpy(&to.sin_addr.s_addr, forwarder.addr, 4);
+											len = sendto(d->sock4, &req[0], (int)req.size(), 0, (struct sockaddr *)&to, sizeof(sockaddr_in)); // forward
+										} else if (forwarder.af_type == AF_INET6) {
+											struct sockaddr_in6 to;
+											init_sa6(&to, forwarder.port);
+											memcpy(&to.sin6_addr.s6_addr, forwarder.addr, 16);
+											len = sendto(d->sock6, &req[0], (int)req.size(), 0, (struct sockaddr *)&to, sizeof(sockaddr_in6)); // forward
+										}
+										if (len > 0) {
+											query_t t;
+											t.time = misc::get_tick_count();
+											t.requester_id = header.id;
+											t.upstream_id = id;
+											t.type = q.type;
+											t.client_family = family;
+											if (family == AF_INET) {
+												t.client_sa4 = d->sa4;
+											} else if (family == AF_INET6) {
+												t.client_sa6 = d->sa6;
+											}
+											t.request_name = q.name;
+											t.forward_name = query_name;
+											push_query(t);
+										}
+										logprintf(LOG_DEFAULT, "forward: %s\n", query_name.c_str());
+										nxdomain = false;
+										break;
 									}
-									logprintf(LOG_DEFAULT, "forward: %s\n", query_name.c_str());
-									nxdomain = false;
-									break;
 								}
 							}
 						}

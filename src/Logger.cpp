@@ -171,7 +171,7 @@ void Logger::start()
 
 void Logger::stop()
 {
-	x_logger.stop();
+	x_logger.x_stop();
 }
 
 void Logger::push(Logger::LogItem const &item)
