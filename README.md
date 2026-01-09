@@ -9,6 +9,8 @@ BEHIND is a lightweight DNS forwarding server - a DNS server lesser than BIND.
 - **DNS Cache**: 5-minute response caching with up to 4096 entries
 - **Security**: DNS 0x20 encoding (case randomization) to mitigate DNS spoofing attacks
 - **Domain Filtering**: Block specific domains by returning NXDOMAIN (useful for ad-blocking)
+- **Static Host Resolution**: Define custom hostname-to-IP mappings in the configuration
+- **Logging**: Automatic log file rotation with date-based filenames
 - **Lightweight**: Minimal resource usage and fast response times
 
 ## Building
@@ -67,6 +69,21 @@ addr = doubleclick.net
 addr = ads.example.com
 ```
 
+#### [hosts]
+Define static hostname-to-IP address mappings:
+
+```ini
+[hosts]
+printer1.lan = 192.168.123.123
+myserver.local = 192.168.1.100
+ipv6host.local = 2001:db8::1
+```
+
+These mappings take precedence over DNS queries and are useful for:
+- Local network devices without proper DNS entries
+- Testing and development environments
+- Overriding public DNS records with local addresses
+
 ## Usage
 
 ### Running Manually
@@ -116,13 +133,22 @@ sudo systemctl status behind
 BEHIND acts as a DNS proxy/forwarder:
 
 1. Listens for DNS queries on UDP port 53
-2. Checks if the domain should be blocked (NXDOMAIN list)
-3. Checks the local cache for recent responses
-4. If not cached, forwards the query to the configured upstream DNS server
-5. Caches the response for 5 minutes
-6. Returns the response to the client
+2. Checks if there's a static host mapping in the [hosts] section
+3. Checks if the domain should be blocked (NXDOMAIN list)
+4. Checks the local cache for recent responses
+5. If not cached, forwards the query to the configured upstream DNS server
+6. Caches the response for 5 minutes
+7. Returns the response to the client
 
 The case randomization feature (when enabled) randomly changes the case of letters in domain names to help detect and prevent DNS spoofing attacks.
+
+### Logging
+
+BEHIND automatically manages log files:
+- Log files are created in the working directory
+- Filenames include the date (e.g., `behind_2026-01-10.log`)
+- Logs automatically rotate to a new file when the date changes
+- All DNS queries and responses are logged for troubleshooting
 
 ## License
 
