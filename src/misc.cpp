@@ -16,10 +16,9 @@ uint64_t misc::get_tick_count()
 
 std::string misc::strtolower(std::string_view const &s)
 {
-	std::string r;
-	r.resize(s.size());
-	for (size_t i = 0; i < s.size(); i++) {
-		r[i] = (char)std::tolower((unsigned char)s[i]);
+	std::string r(s);
+	for (size_t i = 0; i < r.size(); i++) {
+		r[i] = (char)std::tolower((unsigned char)r[i]);
 	}
 	return r;
 }

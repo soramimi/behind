@@ -6,12 +6,14 @@
 #include "rwfile.h"
 #include <algorithm>
 #include <arpa/inet.h>
+#include <assert.h>
 #include <errno.h>
 #include <ifaddrs.h>
 #include <limits>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <numeric>
+#include <regex>
 #include <stdint.h>
 #include <string.h>
 #include <string_view>
@@ -21,7 +23,6 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
-#include <assert.h>
 
 #define stricmp(A, B) strcasecmp(A, B)
 #define STRERROR(S) (std::string(S) + strerror(errno))
@@ -63,19 +64,23 @@ std::string addr_to_string(int family, struct sockaddr *addr)
 
 
 struct Behind::dns_record_t {
+	std::string name;
 	DNS_TYPE type = DNS_TYPE::A;
-	uint8_t addr[16] = {0};
+	std::vector<uint8_t> addr;
 
 	std::string to_string() const
 	{
-		if (type == DNS_TYPE::A) {
+		if (type == DNS_TYPE::A && addr.size() == 4) {
 			struct sockaddr_in a = {};
-			a.sin_addr.s_addr = *(uint32_t *)addr;
+			a.sin_addr.s_addr = *(uint32_t *)addr.data();
 			return addr_to_string(AF_INET, (struct sockaddr *)&a);
-		} else if (type == DNS_TYPE::AAAA) {
+		} else if (type == DNS_TYPE::AAAA && addr.size() == 16) {
 			struct sockaddr_in6 a = {};
-			memcpy(&a.sin6_addr.s6_addr, addr, 16);
+			memcpy(&a.sin6_addr.s6_addr, addr.data(), 16);
 			return addr_to_string(AF_INET6, (struct sockaddr *)&a);
+		} else if (type == DNS_TYPE::CNAME && addr.size() < 255) {
+			std::string_view sv((char const *)addr.data(), addr.size());
+			return std::string(sv);
 		}
 		return {};
 	}
@@ -115,7 +120,7 @@ struct Behind::answer_t {
 	DNS_TYPE type;
 	uint16_t clas;
 	uint32_t ttl;
-	std::vector<char> data;
+	std::vector<uint8_t> data;
 };
 
 class Behind::dns_cache_t {
@@ -183,8 +188,7 @@ struct Behind::Private {
 	Option option;
 	TransactionIdGenerator txid_gen;
 	InetResolver resolver;
-	int ttl;
-	// std::unordered_set<std::string> nxdomain_list;
+	int ttl = 5 * 60;
 	struct {
 		Behind::dns_cache_t a;
 		Behind::dns_cache_t aaaa;
@@ -205,10 +209,7 @@ Behind::Behind(const Option &opt)
 {
 	m->option = opt;
 
-	init_ttl();
 	init_forwarder();
-
-	add_nxdomain("doubleclick.net");
 }
 
 Behind::~Behind()
@@ -216,10 +217,7 @@ Behind::~Behind()
 	delete m;
 }
 
-void Behind::add_nxdomain(std::string const &domain)
-{
-	// m->nxdomain_list.insert(domain);
-}
+
 
 bool Behind::eqi(const std::string &l, const std::string &r)
 {
@@ -285,25 +283,25 @@ int Behind::decode_name(const char *begin, const char *end, const char *ptr, std
 {
 	if (begin && ptr && begin <= ptr && ptr < end) {
 		char const *start = ptr;
-		if ((*ptr & 0xc0) == 0xc0) {
-			if (ptr + 1 < end) {
-				int o = ((ptr[0] & 0x3f) << 8) | (ptr[1] & 0xff);
-				decode_name(begin, end, begin + o, out);
-				ptr += 2;
-			}
-		} else {
-			while (ptr < end) {
-				int len = *ptr & 0xff;
-				ptr++;
-				if (len == 0 || len > 63) {
-					break;
+		while (ptr < end) {
+			if ((*ptr & 0xc0) == 0xc0) {
+				if (ptr + 1 < end) {
+					int o = ((ptr[0] & 0x3f) << 8) | (ptr[1] & 0xff);
+					decode_name(begin, end, begin + o, out);
+					ptr += 2;
 				}
-				if (!out->empty()) {
-					out->push_back('.');
-				}
-				out->insert(out->end(), ptr, ptr + len);
-				ptr += len;
+				break;
 			}
+			int len = *ptr & 0xff;
+			ptr++;
+			if (len == 0 || len > 63) {
+				break;
+			}
+			if (!out->empty()) {
+				out->push_back('.');
+			}
+			out->insert(out->end(), ptr, ptr + len);
+			ptr += len;
 		}
 		if (ptr < start || ptr > end) {
 			ptr = end;
@@ -345,22 +343,35 @@ void Behind::write_dns_question_rr(std::vector<char> *out, const std::string &na
 	write_us(out, clas);
 }
 
-void Behind::write_dns_answer_rr(std::vector<char> *out, const std::string &name, uint16_t clas, uint32_t ttl, const Behind::dns_record_t &item)
+void Behind::write_dns_answer_rr(std::vector<char> *out, std::string const &name, uint16_t clas, uint32_t ttl, const Behind::dns_record_t &item)
 {
+	std::vector<char> cname;
 	int len = 0;
-	if (item.type == DNS_TYPE::A) {
-		len = 4;
-	} else if (item.type == DNS_TYPE::AAAA) {
-		len = 16;
+	len = item.addr.size();
+	if (item.type == DNS_TYPE::A && len == 4) {
+		// len = 4;
+	} else if (item.type == DNS_TYPE::AAAA && len == 16) {
+		// len = 16;
+	} else if (item.type == DNS_TYPE::CNAME && len < 255) {
+		// len = item.addr.size();
+		std::basic_string_view sv((char const *)item.addr.data(), item.addr.size());
+		std::string s(sv);
+		write_name(&cname, s);
+		len = cname.size();
 	} else {
 		return;
 	}
 	write_name(out, name);
+	// write_name(out, item.name);
 	write_us(out, (int)item.type);
 	write_us(out, clas);
 	write_ul(out, ttl);
 	write_us(out, len);
-	write(out, (char const *)item.addr, len);
+	if (item.type == DNS_TYPE::CNAME) {
+		write(out, cname.data(), cname.size());
+	} else {
+		write(out, (char const *)item.addr.data(), len);
+	}
 }
 
 int Behind::parse_question_section(const char *begin, const char *end, const char *ptr, Behind::question_t *out)
@@ -470,7 +481,7 @@ InetResolver::Type parse_inet_address(std::string name, InetResolver::Addr *addr
 	}
 	if (*p == ':') {
 		p++;
-		int port = 53;
+		int port = 0;
 		size_t len = parse_int(p, &port);
 		if (len > 0) {
 			p += len;
@@ -513,103 +524,26 @@ InetResolver::Type parse_inet_address(std::string name, InetResolver::Addr *addr
 
 void Behind::init_forwarder()
 {
-	// std::string name = "8.8.8.8";
-	// std::string name = "2001:4860:4860::8888";
-	// std::string name = "2a10:50c0::ad1:ff";
-	// std::string name = "2a10:50c0::ad2:ff";
 	std::string name = m->option.forward_addr;
 
-	char const *host_begin = name.c_str();
-	char const *host_end = host_begin + name.size();
+	InetResolver::Addr addr;
+	int port = 53;
+
+	InetResolver::Type type = parse_inet_address(name, &addr, &port);
+
+	m->resolver.resolve(name.c_str(), type, &addr);
 
 	Forwarder forwarder;
-
-	// detect address type
-	char const *p = name.c_str();
-	bool in4 = true;
-	bool in6 = true;
-	bool bracket = false;
-	int dots = 0;
-	p += parse_space(p);
-	while (*p) {
-		int c = (unsigned char)*p++;
-		if (c == ']') {
-			host_end = p - 1;
-			in4 = false;
-			if (!bracket) {
-				in6 = false;
-				break;
-			}
-			if (*p == ':') {
-				break;
-			}
-			break;
-		} else if (c == '[') {
-			host_begin = p;
-			bracket = true;
-			in4 = false;
-		} else if (isdigit(c)) {
-			// ok
-		} else if (isxdigit(c)) {
-			in4 = false;
-		} else if (c == ':') {
-			if (in4) {
-				if (dots == 3) {
-					host_end = p;
-					break;
-				}
-				in4 = false;
-			}
-		} else if (c == '.') {
-			in6 = false;
-			dots++;
-			if (dots > 3) {
-				in4 = false;
-				break;
-			}
-		} else {
-			in4 = in6 = false;
-			break;
+	if (!addr.empty()) {
+		if (type == InetResolver::IN4) {
+			struct in_addr const *p = (struct in_addr const *)addr.to_in4(0);
+			forwarder.af_type = AF_INET;
+			memcpy(forwarder.addr, &p->s_addr, 4);
+		} else if (type == InetResolver::IN6) {
+			struct in6_addr const *p = (struct in6_addr const *)addr.to_in6(0);
+			forwarder.af_type = AF_INET6;
+			memcpy(forwarder.addr, &p->s6_addr, 16);
 		}
-	}
-	if (dots != 3) {
-		in4 = false;
-	}
-	if (*p == ':') {
-		p++;
-		int port = 53;
-		size_t len = parse_int(p, &port);
-		if (len > 0) {
-			p += len;
-			forwarder.port = port;
-		} else {
-			in4 = in6 = false;
-		}
-	}
-	p += parse_space(p);
-	if (*p) {
-		in4 = in6 = false;
-	}
-	name = std::string(host_begin, host_end - host_begin);
-
-	InetResolver::Addr addr;
-	auto type = InetResolver::UNDEFINED;
-	if (in4) {
-		type = InetResolver::IN4;
-	} else if (in6) {
-		type = InetResolver::IN6;
-	}
-	m->resolver.resolve(name.c_str(), type, &addr);
-	if (addr.empty()) {
-		forwarder = {};
-	} else if (type == InetResolver::IN4) {
-		struct in_addr const *p = (struct in_addr const *)addr.to_in4(0);
-		forwarder.af_type = AF_INET;
-		memcpy(forwarder.addr, &p->s_addr, 4);
-	} else if (type == InetResolver::IN6) {
-		struct in6_addr const *p = (struct in6_addr const *)addr.to_in6(0);
-		forwarder.af_type = AF_INET6;
-		memcpy(forwarder.addr, &p->s6_addr, 16);
 	}
 
 	m->forwarder = forwarder;
@@ -658,11 +592,6 @@ void Behind::push_query(const Behind::query_t &query)
 	m->queries.push_back(query);
 }
 
-void Behind::init_ttl()
-{
-	m->ttl = 60;
-}
-
 void Behind::parse_dns_packet(const char *begin, const char *end, Behind::dns_header_t *header, std::list<Behind::question_t> *questions, std::list<Behind::answer_t> *answers)
 {
 	char const *ptr = begin;
@@ -701,10 +630,23 @@ void Behind::parse_dns_packet(const char *begin, const char *end, Behind::dns_he
 			if (ptr + rdlen <= end) {
 				std::list<answer_t>::iterator it = answers->insert(answers->end(), answer_t());
 				*it = a;
-				if (rdlen > 0) {
-					it->data.resize(rdlen);
-					memcpy(&it->data[0], ptr, rdlen);
-					ptr += rdlen;
+				if ((a.type == DNS_TYPE::A && rdlen == 4) || (a.type == DNS_TYPE::AAAA && rdlen == 16)) {
+					if (rdlen > 0) {
+						it->data.resize(rdlen);
+						memcpy(it->data.data(), ptr, rdlen);
+						ptr += rdlen;
+					}
+				} else if (a.type == DNS_TYPE::CNAME && rdlen < 255) {
+					if (rdlen > 0) {
+						std::string name;
+						int n = decode_name(begin, end, ptr, &name);
+						if (n > 0 && !name.empty()) {
+							name = misc::strtolower(name);
+							it->data.resize(name.size());
+							memcpy(it->data.data(), name.c_str(), name.size());
+						}
+						ptr += rdlen;
+					}
 				}
 			}
 		}
@@ -730,22 +672,48 @@ static void init_sa6(struct sockaddr_in6 *sa6, int port)
 bool Behind::is_nxdomain(std::string const &name)
 {
 	std::string key = misc::strtolower(name);
-	auto it = m->option.nxdomain.find(key);
-	if (it != m->option.nxdomain.end()) {
-		return true;
+	for (std::string const &nxdomain : m->option.nxdomain) {
+		if (nxdomain.size() > 2) {
+			if (nxdomain[0] == '/' && nxdomain[nxdomain.size() - 1] == '/') {
+				std::string pattern = nxdomain.substr(1, nxdomain.size() - 2);
+				if (std::regex_match(key, std::regex(pattern))) {
+					return true;
+				}
+			} else if (nxdomain[0] == '*' || nxdomain[1] == '.') {
+				size_t n = nxdomain.size() - 1;
+				if (key.size() > n && memcmp(key.c_str() + key.size() - n, nxdomain.c_str() + 1, n) == 0) {
+					return true;
+				}
+				if (strcmp(key.c_str(), nxdomain.c_str() + 2) == 0) {
+					return true;
+				}
+			} else if (nxdomain[nxdomain.size() - 1] == '*' || nxdomain[nxdomain.size() - 2] == '.') {
+				size_t n = nxdomain.size() - 1;
+				if (key.size() > n && memcmp(key.c_str(), nxdomain.c_str(), n) == 0) {
+					return true;
+				}
+			} else if (key == nxdomain) {
+				return true;
+			}
+		}
 	}
 	return false;
 }
 
-void Behind::send_response(void *private_d, int family, dns_header_t const &header, question_t const &q, dns_record_t const &rec)
+void Behind::send_response(void *private_d, int family, dns_header_t const &header, question_t const &q, std::vector<dns_record_t> const &rec)
 {
 	Private::D *d = static_cast<Private::D *>(private_d);
 
 	std::vector<char> res;
 	uint16_t flags = 0x8180;
-	write_dns_header(&res, header.id, flags, 1, 1, 0, 0);
+	uint16_t ancount = uint16_t(std::min(rec.size(), (size_t)16));
+	write_dns_header(&res, header.id, flags, 1, ancount, 0, 0);
 	write_dns_question_rr(&res, q.name, q.type, q.clas);
-	write_dns_answer_rr(&res, q.name, q.clas, ttl(), rec);
+	for (int i = 0; i < ancount; i++) {
+		dns_record_t const &r = rec[i];
+		std::string name = stricmp(q.name.c_str(), r.name.c_str()) == 0 ? q.name : misc::strtolower(r.name);
+		write_dns_answer_rr(&res, name, q.clas, ttl(), r);
+	}
 	std::string client;
 	if (family == AF_INET) {
 		client = addr_to_string(family, (struct sockaddr *)&d->sa4);
@@ -754,24 +722,44 @@ void Behind::send_response(void *private_d, int family, dns_header_t const &head
 		client = addr_to_string(family, (struct sockaddr *)&d->sa6);
 		sendto(d->sock6, &res[0], (int)res.size(), 0, (struct sockaddr *)&d->sa6, sizeof(sockaddr_in6));
 	}
-	{
-		char const *type = "?";
-		if (rec.type == DNS_TYPE::A) {
-			type = "A";
-		} else if (rec.type == DNS_TYPE::AAAA) {
-			type = "AAAA";
+	if (ancount > 0) {
+		for (int i = 0; i < ancount; i++) {
+			dns_record_t const &r = rec[i];
+			char const *qtype = "?";
+			if (r.type == DNS_TYPE::A) {
+				qtype = "A";
+			} else if (r.type == DNS_TYPE::AAAA) {
+				qtype = "AAAA";
+			} else if (r.type == DNS_TYPE::CNAME) {
+				qtype = "CNAME";
+			}
+			std::string name = misc::strtolower(q.name);
+			std::string addr_str = r.to_string();
+			logprintf(LOG_DEFAULT, "R: <<%s %s %s>> to %s (from cache)\n"
+					  , name.c_str()
+					  , qtype
+					  , addr_str.c_str()
+					  , client.c_str()
+					  );
 		}
-		std::string addr_str = rec.to_string();
-		logprintf(LOG_DEFAULT, "response: <<%s %s %s>> to %s (from cache)\n"
+	} else {
+		char const *qtype = "?";
+		if (q.type == DNS_TYPE::A) {
+			qtype = "A";
+		} else if (q.type == DNS_TYPE::AAAA) {
+			qtype = "AAAA";
+		} else if (q.type == DNS_TYPE::CNAME) {
+			qtype = "CNAME";
+		}
+		logprintf(LOG_DEFAULT, "R: <<%s %s NOANSWER>> to %s (from cache)\n"
 				  , q.name.c_str()
-				  , type
-				  , addr_str.c_str()
+				  , qtype
 				  , client.c_str()
 				  );
 	}
 }
 
-void Behind::process(void *private_d, int family, int sock)
+void Behind::process(void *private_d, int family)
 {
 	Private::D *d = static_cast<Private::D *>(private_d);
 
@@ -794,68 +782,74 @@ void Behind::process(void *private_d, int family, int sock)
 		parse_dns_packet(buf, buf + len, &header, &questions, &answers);
 
 		if ((header.flags & 0xf800) == 0x0000) { // standard query
-			std::vector<char> res;
 			for (std::list<question_t>::const_iterator it = questions.begin(); it != questions.end(); it++) {
 				char const *qtype_str = "?";
-				bool nxdomain = true;
+				bool nxdomain = false;
 				question_t const &q = *it;
+				dns_cache_t *cache = nullptr;
+				if (q.type == DNS_TYPE::A) {
+					qtype_str = "A";
+					cache = &m->dns_cache.a;
+				} else if (q.type == DNS_TYPE::AAAA) {
+					qtype_str = "AAAA";
+					cache = &m->dns_cache.aaaa;
+				}
 				if (!q.name.empty()) {
 					if (q.clas == DNS_CLASS_IN) {
 						if (q.type == DNS_TYPE::A || q.type == DNS_TYPE::AAAA) {
-							// search from cache
-							dns_cache_t *cache = nullptr;
-							if (q.type == DNS_TYPE::A) {
-								qtype_str = "A";
-								cache = &m->dns_cache.a;
-							} else if (q.type == DNS_TYPE::AAAA) {
-								qtype_str = "AAAA";
-								cache = &m->dns_cache.aaaa;
-							}
-							logprintf(LOG_DEFAULT, "query: %s %s\n", q.name.c_str(), qtype_str);
-							// check nxdomain list
-							if (is_nxdomain(q.name)) {
-								nxdomain = true;
-							} else {
-								bool forward = true;
-								{
-									// check known hosts
-									auto it = m->option.hosts.find(q.name);
-									if (it != m->option.hosts.end()) {
-										dns_record_t rec;
-										InetResolver::Addr const &addr = it->second;
-										if (!addr.addr.empty()) {
-											if (q.type == DNS_TYPE::A && addr.type == InetResolver::IN4) {
-												rec.type = DNS_TYPE::A;
-												for (std::vector<char> const &a : addr.addr) {
-													assert(a.size() == 4);
-													memcpy(rec.addr, a.data(), 4);
-												}
-												nxdomain = false;
-											} else if (q.type == DNS_TYPE::AAAA && addr.type == InetResolver::IN6) {
-												rec.type = DNS_TYPE::AAAA;
-												for (std::vector<char> const &a : addr.addr) {
-													assert(a.size() == 16);
-													memcpy(rec.addr, a.data(), 16);
-												}
-												nxdomain = false;
-											} else {
-												nxdomain = true;
+							logprintf(LOG_DEFAULT, "Q: %s %s\n", q.name.c_str(), qtype_str);
+							bool forward = true;
+							std::string key = misc::strtolower(q.name);
+							{
+								// check known hosts
+								auto it = m->option.hosts.find(key);
+								if (it != m->option.hosts.end()) {
+									forward = false;
+									std::vector<dns_record_t> rec;
+									InetResolver::Addr const &addr = it->second;
+									if (!addr.addr.empty()) {
+										if (q.type == DNS_TYPE::A && addr.type == InetResolver::IN4) {
+											dns_record_t r;
+											r.name = q.name;
+											r.type = DNS_TYPE::A;
+											for (std::vector<uint8_t> const &a : addr.addr) {
+												assert(a.size() == 4);
+												// memcpy(r.addr.data(), a.data(), 4);
+												r.addr = a;
+												rec.push_back(r);
 											}
-											if (!nxdomain) {
-												send_response(d, family, header, q, rec);
-												forward = false;
+											nxdomain = false;
+										} else if (q.type == DNS_TYPE::AAAA && addr.type == InetResolver::IN6) {
+											dns_record_t r;
+											r.name = q.name;
+											r.type = DNS_TYPE::AAAA;
+											for (std::vector<uint8_t> const &a : addr.addr) {
+												assert(a.size() == 16);
+												// memcpy(r.addr, a.data(), 16);
+												r.addr = a;
+												rec.push_back(r);
 											}
+											nxdomain = false;
+										} else {
+											nxdomain = true;
+										}
+										if (!nxdomain) {
+											send_response(d, family, header, q, rec);
 										}
 									}
 								}
+							}
+							if (nxdomain || is_nxdomain(q.name)) {
+								nxdomain = true;
+							} else {
+								nxdomain = true;
+								// search from cache
 								if (cache) {
-									std::vector<dns_record_t> const *records = cache->find(q.name);
-									if (records && !records->empty()) {
-										dns_record_t const &rec = records->front();
-										send_response(d, family, header, q, rec);
+									std::vector<dns_record_t> const *records = cache->find(key);
+									if (records) {
+										send_response(d, family, header, q, *records);
 										nxdomain = false;
 										forward = false;
-										break;
 									}
 								}
 								if (forward) {
@@ -900,9 +894,8 @@ void Behind::process(void *private_d, int family, int sock)
 											t.forward_name = query_name;
 											push_query(t);
 										}
-										logprintf(LOG_DEFAULT, "forward: %s\n", query_name.c_str());
+										logprintf(LOG_DEFAULT, "F: %s\n", query_name.c_str());
 										nxdomain = false;
-										break;
 									}
 								}
 							}
@@ -926,8 +919,9 @@ void Behind::process(void *private_d, int family, int sock)
 						client = addr_to_string(family, (struct sockaddr *)&d->sa6);
 						sendto(d->sock6, &res[0], (int)res.size(), 0, (struct sockaddr *)&d->sa6, sizeof(sockaddr_in6));
 					}
-					logprintf(LOG_DEFAULT, "response: <<%s %s NXDOMAIN>> to %s\n"
-							  , q.name.c_str()
+					std::string name = misc::strtolower(q.name);
+					logprintf(LOG_DEFAULT, "R: <<%s %s NXDOMAIN>> to %s\n"
+							  , name.c_str()
 							  , qtype_str
 							  , client.c_str()
 							  );
@@ -944,12 +938,15 @@ void Behind::process(void *private_d, int family, int sock)
 						records.reserve(10);
 						for (std::list<answer_t>::const_iterator it = answers.begin(); it != answers.end(); it++) {
 							answer_t const &a = *it;
-							if (a.clas == DNS_CLASS_IN && a.type == q.type) {
+							if (a.clas == DNS_CLASS_IN) {
+							// if (a.clas == DNS_CLASS_IN && a.type == q.type) {
 								auto size = a.data.size();
-								if ((a.type == DNS_TYPE::A && size == 4) || (a.type == DNS_TYPE::AAAA && size == 16)) {
+								if ((a.type == DNS_TYPE::A && size == 4) || (a.type == DNS_TYPE::AAAA && size == 16) || (a.type == DNS_TYPE::CNAME && size < 255)) {
 									dns_record_t item;
+									item.name = stricmp(q.request_name.c_str(), a.name.c_str()) == 0 ? q.request_name : misc::strtolower(a.name);
 									item.type = a.type;
-									memcpy(item.addr, &a.data[0], size);
+									// memcpy(item.addr, &a.data[0], size);
+									item.addr = a.data;
 									records.push_back(item);
 								}
 							}
@@ -978,16 +975,19 @@ void Behind::process(void *private_d, int family, int sock)
 							client = addr_to_string(AF_INET6, (struct sockaddr *)&q.client_sa6);
 						}
 						for (int i = 0; i < (int)records.size(); i++) {
-							write_dns_answer_rr(&res, q.request_name, DNS_CLASS_IN, ttl(), records[i]);
+							write_dns_answer_rr(&res, records[i].name, DNS_CLASS_IN, ttl(), records[i]);
 							{
 								char const *type = "?";
 								if (records[i].type == DNS_TYPE::A) {
 									type = "A";
 								} else if (records[i].type == DNS_TYPE::AAAA) {
 									type = "AAAA";
+								} else if (records[i].type == DNS_TYPE::CNAME) {
+									type = "CNAME";
 								}
-								logprintf(LOG_DEFAULT, "response: <<%s %s %s>> to %s\n"
-										  , q.request_name.c_str()
+								std::string name = misc::strtolower(q.request_name);
+								logprintf(LOG_DEFAULT, "R: <<%s %s %s>> to %s\n"
+										  , name.c_str()
 										  , type
 										  , records[i].to_string().c_str()
 										  , client.c_str()
@@ -1047,10 +1047,10 @@ void Behind::main()
 		select(maxfd + 1, &fds, NULL, NULL, NULL);
 
 		if (FD_ISSET(d.sock4, &fds)) {
-			process(&d, AF_INET, d.sock4);
+			process(&d, AF_INET);
 		}
 		if (FD_ISSET(d.sock6, &fds)) {
-			process(&d, AF_INET6, d.sock6);
+			process(&d, AF_INET6);
 		}
 
 		clean();

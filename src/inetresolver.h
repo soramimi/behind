@@ -3,6 +3,7 @@
 
 #include <vector>
 #include <string>
+#include <cstdint>
 
 class InetResolver {
 public:
@@ -15,7 +16,7 @@ public:
 	typedef void _in6_addr;
 	struct Addr {
 		Type type = UNDEFINED;
-		std::vector<std::vector<char>> addr;
+		std::vector<std::vector<uint8_t>> addr;
 		size_t size() const
 		{
 			return addr.size();

@@ -20,12 +20,13 @@ extern Global *global;
 struct Option {
 	std::string forward_addr;
 	bool case_randomize = false;
-	std::unordered_set<std::string> nxdomain;
+	std::vector<std::string> nxdomain;
 	std::unordered_map<std::string, InetResolver::Addr> hosts;
 };
 
 enum class DNS_TYPE : uint16_t {
 	A = 1,
+	CNAME = 5,
 	PTR = 12,
 	AAAA = 28,
 };
@@ -58,11 +59,9 @@ public:
 	Behind(Option const &opt);
 	~Behind();
 	void main();
-	void add_nxdomain(const std::string &domain);
 private:
 	static inline bool eqi(std::string const &l, std::string const &r);
 	uint16_t listen_port() const;
-	void init_ttl();
 	int ttl() const;
 	static void write(std::vector<char> *out, char c);
 	static void write(std::vector<char> *out, char const *src, int len);
@@ -73,7 +72,7 @@ private:
 	int decode_name(char const *begin, char const *end, char const *ptr, std::string *name);
 	static void write_dns_header(std::vector<char> *out, uint16_t id, uint16_t flags, uint16_t qdcount, uint16_t ancount, uint16_t nscount, uint16_t arcount);
 	void write_dns_question_rr(std::vector<char> *out, std::string const &name, DNS_TYPE type, uint16_t clas);
-	void write_dns_answer_rr(std::vector<char> *out, std::string const &name, uint16_t clas, uint32_t ttl, dns_record_t const &item);
+	void write_dns_answer_rr(std::vector<char> *out, const std::string &name, uint16_t clas, uint32_t ttl, dns_record_t const &item);
 	int parse_question_section(char const *begin, char const *end, char const *ptr, question_t *out);
 	Forwarder get_forwarder();
 	void init_forwarder();
@@ -84,8 +83,8 @@ private:
 	void parse_dns_packet(char const *begin, char const *end, dns_header_t *header, std::list<question_t> *questions, std::list<answer_t> *answers);
 
 	bool is_nxdomain(const std::string &name);
-	void send_response(void *private_d, int family, const dns_header_t &header, const question_t &q, const dns_record_t &rec);
-	void process(void *private_d, int family, int sock);
+	void send_response(void *private_d, int family, const dns_header_t &header, const question_t &q, std::vector<dns_record_t> const &rec);
+	void process(void *private_d, int family);
 };
 
 #endif // BEHIND_H

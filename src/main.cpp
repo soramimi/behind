@@ -48,6 +48,7 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 			return false;
 		}
 		opt->hosts[key] = addr;
+		return true;
 	} else {
 		logprintf(LOG_DEFAULT, "unknown section: [%s]\n", section.c_str());
 		return false;

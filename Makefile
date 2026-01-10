@@ -30,3 +30,9 @@ q1:
 
 q2:
 	dig @127.0.0.1 -p 5300 doubleclick.net
+
+q3:
+	dig @127.0.0.1 -p 5300 pbs.twimg.com
+
+q4:
+	dig @127.0.0.1 -p 5300 www.amazon.co.jp

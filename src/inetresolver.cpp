@@ -34,7 +34,7 @@ bool InetResolver::resolve(const char *name, Type type, Addr *out)
 		}
 		for (struct addrinfo *p = res; p; p = p->ai_next) {
 			struct sockaddr_in *addr = (struct sockaddr_in *)p->ai_addr;
-			std::vector<char> a(sizeof(in_addr));
+			std::vector<uint8_t> a(sizeof(in_addr));
 			memcpy(a.data(), &addr->sin_addr.s_addr, sizeof(struct in_addr));
 			out->addr.push_back(a);
 			break;
@@ -54,7 +54,7 @@ bool InetResolver::resolve(const char *name, Type type, Addr *out)
 		}
 		for (struct addrinfo *p = res; p; p = p->ai_next) {
 			struct sockaddr_in6 *addr = (struct sockaddr_in6 *)p->ai_addr;
-			std::vector<char> a(sizeof(in6_addr));
+			std::vector<uint8_t> a(sizeof(in6_addr));
 			memcpy(a.data(), addr->sin6_addr.s6_addr, sizeof(struct in6_addr));
 			out->addr.push_back(a);
 			break;
