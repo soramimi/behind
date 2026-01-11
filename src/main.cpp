@@ -114,7 +114,7 @@ int main(int argc, char **argv)
 
 	logprintf(LOG_DEFAULT, "=== Starting BEHIND DNS Server ===\n");
 	for (int i = 1; i < argc; i++) {
-		logprintf(LOG_DEFAULT, "arg[%d] = %s\n", i, argv[i]);
+		logprintf(LOG_DEFAULT, "argv[%d] = %s\n", i, argv[i]);
 	}
 
 	Option opt;

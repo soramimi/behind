@@ -30,6 +30,7 @@ enum class DNS_TYPE : uint16_t {
 	PTR = 12,
 	AAAA = 28,
 };
+char const *dns_type_to_string(DNS_TYPE type);
 
 struct Forwarder {
 	sa_family_t af_type = AF_UNSPEC;
