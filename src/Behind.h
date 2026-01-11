@@ -17,11 +17,20 @@ struct Global {
 
 extern Global *global;
 
+class Hosts {
+private:
+	std::unordered_map<std::string, InetResolver::Addr> map_;
+public:
+	InetResolver::Addr const *find(std::string const &name);
+	InetResolver::Addr &operator [] (std::string const &name);
+};
+
 struct Option {
 	std::string forward_addr;
 	bool case_randomize = false;
 	std::vector<std::string> nxdomain;
-	std::unordered_map<std::string, InetResolver::Addr> hosts;
+	Hosts hosts;
+
 };
 
 enum class DNS_TYPE : uint16_t {
@@ -81,10 +90,10 @@ private:
 	bool take_query(uint16_t id, query_t *out);
 	void delete_pending_query(uint16_t id);
 	void push_query(query_t const &query);
-	void parse_dns_packet(char const *begin, char const *end, dns_header_t *header, std::list<question_t> *questions, std::list<answer_t> *answers);
+	void parse_dns_packet(char const *begin, char const *end, dns_header_t *header, std::vector<question_t> *questions, std::vector<answer_t> *answers);
 
 	bool is_nxdomain(const std::string &name);
-	void send_response(void *private_d, int family, const dns_header_t &header, const question_t &q, std::vector<dns_record_t> const &rec);
+	bool send_response(void *private_d, int family, const dns_header_t &header, std::vector<question_t> const &q, std::vector<dns_record_t> const &rec);
 	void process(void *private_d, int family);
 };
 

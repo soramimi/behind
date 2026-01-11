@@ -68,7 +68,7 @@ bool parse_option(int argc, char **argv, Option *opt)
 			if (strcmp(arg, "-C") == 0 || strcmp(arg, "--conf") == 0) {
 				if (argi < argc) {
 					std::string confpath = argv[argi++];
-					bool ok = ConfigParser::parse(confpath.c_str(), [](std::string const &section, std::string const &key, std::string const &value, void *cookie){
+					ok = ConfigParser::parse(confpath.c_str(), [](std::string const &section, std::string const &key, std::string const &value, void *cookie){
 						Option *opt = static_cast<Option *>(cookie);
 						set_option(section, key, value, opt);
 					}, opt);
@@ -89,7 +89,7 @@ bool parse_option(int argc, char **argv, Option *opt)
 	return ok;
 }
 
-int main2(Behind *ns, Option *opt)
+int main2(Behind *ns)
 {
 	auto Perform = [&](){
 		try {
@@ -120,7 +120,7 @@ int main(int argc, char **argv)
 	Option opt;
 	parse_option(argc, argv, &opt);
 	Behind ns(opt);
-	main2(&ns, &opt);
+	main2(&ns);
 
 	Logger::stop();
 
