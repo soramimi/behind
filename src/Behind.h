@@ -69,6 +69,7 @@ public:
 	Behind(Option const &opt);
 	~Behind();
 	void main();
+	void test();
 private:
 	static inline bool eqi(std::string const &l, std::string const &r);
 	uint16_t listen_port() const;

@@ -5,6 +5,7 @@ Wants=network.target
 
 [Service]
 Type=simple
+WorkingDirectory=/home/soramimi/develop/behind
 ExecStart=/home/soramimi/develop/behind/_bin/behind -C /home/soramimi/develop/behind/scripts/behind.conf
 Restart=on-failure
 RestartSec=5

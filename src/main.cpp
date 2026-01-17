@@ -120,6 +120,7 @@ int main(int argc, char **argv)
 	Option opt;
 	parse_option(argc, argv, &opt);
 	Behind ns(opt);
+	ns.test();
 	main2(&ns);
 
 	Logger::stop();

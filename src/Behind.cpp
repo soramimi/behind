@@ -204,6 +204,21 @@ struct Behind::Private {
 	};
 };
 
+const InetResolver::Addr *Hosts::find(const std::string &name)
+{
+	std::string key = misc::strtolower(name);
+	auto it = map_.find(key);
+	if (it != map_.end()) {
+		return &it->second;
+	}
+	return nullptr;
+}
+
+InetResolver::Addr &Hosts::operator [](const std::string &name)
+{
+	return map_[misc::strtolower(name)];
+}
+
 Behind::Behind(const Option &opt)
 	: m(new Private())
 {
@@ -806,13 +821,13 @@ bool Behind::send_response(void *private_d, int family, dns_header_t const &head
 {
 	Private::D *d = static_cast<Private::D *>(private_d);
 
-	std::vector<char> res;
+	std::vector<char> buffer;
 	uint16_t ancount = uint16_t(std::min(rec.size(), (size_t)16));
-	write_dns_header(&res, header.id, header.flags, 1, ancount, 0, 0);
+	write_dns_header(&buffer, header.id, header.flags, 1, ancount, 0, 0);
 
 	for (auto it = questions.begin(); it != questions.end(); it++) {
 		question_t const &q = *it;
-		write_dns_question_rr(&res, q.name, q.type, q.clas);
+		write_dns_question_rr(&buffer, q.name, q.type, q.clas);
 	}
 	question_t q;
 	if (!questions.empty()) {
@@ -821,7 +836,7 @@ bool Behind::send_response(void *private_d, int family, dns_header_t const &head
 	for (int i = 0; i < ancount; i++) {
 		dns_record_t const &r = rec[i];
 		std::string name = stricmp(q.name.c_str(), r.name.c_str()) == 0 ? q.name : misc::strtolower(r.name);
-		write_dns_answer_rr(&res, name, q.clas, ttl(), r);
+		write_dns_answer_rr(&buffer, name, q.clas, ttl(), r);
 	}
 	std::string client;
 	SendTo sender;
@@ -830,8 +845,7 @@ bool Behind::send_response(void *private_d, int family, dns_header_t const &head
 	} else if (family == AF_INET6) {
 		sender.set_sa6(d->sock6, &d->sa6);
 	}
-	int size = (int)res.size();
-	bool ok = sender.sendto(&res[0], size) == size;;
+	bool ok = sender.sendto(&buffer[0], buffer.size()) == buffer.size();
 	client = sender.addr_to_string();
 
 	char const *qtype = dns_type_to_string(q.type);
@@ -859,6 +873,38 @@ bool Behind::send_response(void *private_d, int family, dns_header_t const &head
 				  , qtype
 				  , client.c_str()
 				  );
+	}
+
+	if (0) {
+		if (header.flags & 0x8000) {
+			if (stricmp(q.name.c_str(), "www.google.com") == 0) {
+				char const *path = "testcase/google_response.bin";
+				writefile(path, &buffer);
+			} else if (stricmp(q.name.c_str(), "doubleclick.net") == 0) {
+				char const *path = "testcase/doubleclick_response.bin";
+				writefile(path, &buffer);
+			} else if (stricmp(q.name.c_str(), "www.soramimi.jp") == 0) {
+				char const *path = "testcase/soramimi_response.bin";
+				writefile(path, &buffer);
+			} else if (stricmp(q.name.c_str(), "www.amazon.co.jp") == 0) {
+				char const *path = "testcase/amazon_response.bin";
+				writefile(path, &buffer);
+			}
+		} else {
+			if (stricmp(q.name.c_str(), "www.google.com") == 0) {
+				char const *path = "testcase/google_query.bin";
+				writefile(path, &buffer);
+			} else if (stricmp(q.name.c_str(), "doubleclick.net") == 0) {
+				char const *path = "testcase/doubleclick_query.bin";
+				writefile(path, &buffer);
+			} else if (stricmp(q.name.c_str(), "www.soramimi.jp") == 0) {
+				char const *path = "testcase/soramimi_query.bin";
+				writefile(path, &buffer);
+			} else if (stricmp(q.name.c_str(), "www.amazon.co.jp") == 0) {
+				char const *path = "testcase/amazon_query.bin";
+				writefile(path, &buffer);
+			}
+		}
 	}
 
 	return ok;
@@ -1049,6 +1095,109 @@ void Behind::process(void *private_d, int family)
 	}
 }
 
+std::string to_string(std::vector<uint8_t> const &buf)
+{
+	if (buf.empty()) {
+		return std::string();
+	}
+	return std::string((char const *)buf.data(), buf.size());
+}
+
+#define EXPECT_EQ(a, b) assert((a) == (b))
+
+void Behind::test()
+{
+	std::vector<char> buf;
+	char const *file;
+
+	file = "testcase/google_response.bin";
+	if (readfile(file, &buf) && !buf.empty()) {
+		char const *begin = buf.data();
+		char const *end = begin + buf.size();
+		Behind::dns_header_t header;
+		std::vector<Behind::question_t> questions;
+		std::vector<Behind::answer_t> answers;
+		parse_dns_packet(begin, end, &header, &questions, &answers);
+		logprintf(LOG_DEFAULT, "TEST: parsed <%s>, %d questions and %d answers\n", file, (int)questions.size(), (int)answers.size());
+
+		EXPECT_EQ(header.flags, 0x8180);
+		EXPECT_EQ(header.ancount, 1);
+		EXPECT_EQ(header.qdcount, 1);
+		EXPECT_EQ(answers.size(), 1);
+		EXPECT_EQ(questions.size(), 1);
+
+		EXPECT_EQ(questions[0].clas, DNS_CLASS_IN);
+		EXPECT_EQ(questions[0].type, DNS_TYPE::A);
+		EXPECT_EQ(questions[0].name, "www.google.com");
+
+		EXPECT_EQ(answers[0].clas, DNS_CLASS_IN);
+		EXPECT_EQ(answers[0].type, DNS_TYPE::A);
+		EXPECT_EQ(answers[0].name, "www.google.com");
+		EXPECT_EQ(to_string(answers[0].data), std::string("\x8e\xfa\xc2\xc4", 4));
+		EXPECT_EQ(answers[0].ttl, 300);
+	}
+
+	file = "testcase/amazon_response.bin";
+	if (readfile(file, &buf) && !buf.empty()) {
+		char const *begin = buf.data();
+		char const *end = begin + buf.size();
+		Behind::dns_header_t header;
+		std::vector<Behind::question_t> questions;
+		std::vector<Behind::answer_t> answers;
+		parse_dns_packet(begin, end, &header, &questions, &answers);
+		logprintf(LOG_DEFAULT, "TEST: parsed <%s>, %d questions and %d answers\n", file, (int)questions.size(), (int)answers.size());
+
+		EXPECT_EQ(header.flags, 0x8180);
+		EXPECT_EQ(header.ancount, 3);
+		EXPECT_EQ(header.qdcount, 1);
+		EXPECT_EQ(answers.size(), 3);
+		EXPECT_EQ(questions.size(), 1);
+
+		EXPECT_EQ(questions[0].clas, DNS_CLASS_IN);
+		EXPECT_EQ(questions[0].type, DNS_TYPE::A);
+		EXPECT_EQ(questions[0].name, "www.amazon.co.jp");
+
+		EXPECT_EQ(answers[0].clas, DNS_CLASS_IN);
+		EXPECT_EQ(answers[0].type, DNS_TYPE::CNAME);
+		EXPECT_EQ(answers[0].name, "www.amazon.co.jp");
+		EXPECT_EQ(to_string(answers[0].data), "tp.4d5ad1d2b-frontier.amazon.co.jp");
+		EXPECT_EQ(answers[0].ttl, 300);
+
+		EXPECT_EQ(answers[1].clas, DNS_CLASS_IN);
+		EXPECT_EQ(answers[1].type, DNS_TYPE::CNAME);
+		EXPECT_EQ(answers[1].name, "tp.4d5ad1d2b-frontier.amazon.co.jp");
+		EXPECT_EQ(to_string(answers[1].data), "cf.4d5ad1d2b-frontier.amazon.co.jp");
+		EXPECT_EQ(answers[1].ttl, 300);
+
+		EXPECT_EQ(answers[2].clas, DNS_CLASS_IN);
+		EXPECT_EQ(answers[2].type, DNS_TYPE::A);
+		EXPECT_EQ(answers[2].name, "cf.4d5ad1d2b-frontier.amazon.co.jp");
+		EXPECT_EQ(to_string(answers[2].data), std::string("\x03\xa8\xfb\x86", 4));
+		EXPECT_EQ(answers[2].ttl, 300);
+	}
+
+	file = "testcase/doubleclick_response.bin";
+	if (readfile(file, &buf) && !buf.empty()) {
+		char const *begin = buf.data();
+		char const *end = begin + buf.size();
+		Behind::dns_header_t header;
+		std::vector<Behind::question_t> questions;
+		std::vector<Behind::answer_t> answers;
+		parse_dns_packet(begin, end, &header, &questions, &answers);
+		logprintf(LOG_DEFAULT, "TEST: parsed <%s>, %d questions and %d answers\n", file, (int)questions.size(), (int)answers.size());
+
+		EXPECT_EQ(header.flags, 0x8003); // NXDOMAIN
+		EXPECT_EQ(header.ancount, 0);
+		EXPECT_EQ(header.qdcount, 1);
+		EXPECT_EQ(answers.size(), 0);
+		EXPECT_EQ(questions.size(), 1);
+
+		EXPECT_EQ(questions[0].clas, DNS_CLASS_IN);
+		EXPECT_EQ(questions[0].type, DNS_TYPE::A);
+		EXPECT_EQ(questions[0].name, "doubleclick.net");
+	}
+}
+
 void Behind::main()
 {
 	Private::D d;
@@ -1102,19 +1251,3 @@ void Behind::main()
 	closesocket(d.sock4);
 }
 
-
-
-const InetResolver::Addr *Hosts::find(const std::string &name)
-{
-	std::string key = misc::strtolower(name);
-	auto it = map_.find(key);
-	if (it != map_.end()) {
-		return &it->second;
-	}
-	return nullptr;
-}
-
-InetResolver::Addr &Hosts::operator [](const std::string &name)
-{
-	return map_[misc::strtolower(name)];
-}
