@@ -96,6 +96,7 @@ int main2(Behind *ns)
 			ns->main();
 		} catch (std::string const &e) {
 			logprintf(LOG_DEFAULT, "%s\n", e.c_str());
+			fprintf(stderr, "%s\n", e.c_str());
 		}
 	};
 

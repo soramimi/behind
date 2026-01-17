@@ -66,6 +66,8 @@ std::string addr_to_string(int family, struct sockaddr *addr)
 struct Behind::dns_record_t {
 	std::string name;
 	DNS_TYPE type = DNS_TYPE::A;
+	uint16_t clas = AF_INET;
+	uint32_t ttl = 300;
 	std::vector<uint8_t> addr;
 
 	std::string to_string() const
@@ -115,6 +117,14 @@ struct Behind::question_t {
 	uint16_t clas;
 };
 
+static inline bool operator == (const Behind::question_t &l, const Behind::question_t &r)
+{
+	if (l.name != r.name) return false;
+	if (l.type != r.type) return false;
+	if (l.clas != r.clas) return false;
+	return true;
+}
+
 struct Behind::answer_t {
 	std::string name;
 	DNS_TYPE type;
@@ -122,6 +132,15 @@ struct Behind::answer_t {
 	uint32_t ttl;
 	std::vector<uint8_t> data;
 };
+
+static inline bool operator == (const Behind::answer_t &l, const Behind::answer_t &r)
+{
+	if (l.type != r.type) return false;
+	if (l.clas != r.clas) return false;
+	if (l.data.size() != r.data.size()) return false;
+	if (memcmp(l.data.data(), r.data.data(), l.data.size()) != 0) return false;
+	return true;
+}
 
 class Behind::dns_cache_t {
 public:
@@ -817,27 +836,47 @@ char const *dns_type_to_string(DNS_TYPE type)
 	}
 }
 
+struct Behind::ResponseData {
+	Behind::question_t q;
+	std::vector<char> buffer;
+	operator bool () const
+	{
+		return !buffer.empty();
+	}
+};
+
+Behind::ResponseData Behind::make_response(void *private_d, dns_header_t const &header, std::vector<question_t> const &questions, std::vector<dns_record_t> const &rec)
+{
+	Private::D *d = static_cast<Private::D *>(private_d);
+
+	ResponseData ret;
+
+	uint16_t ancount = uint16_t(std::min(rec.size(), (size_t)16));
+	write_dns_header(&ret.buffer, header.id, header.flags, 1, ancount, 0, 0);
+
+	for (auto it = questions.begin(); it != questions.end(); it++) {
+		question_t const &q = *it;
+		write_dns_question_rr(&ret.buffer, q.name, q.type, q.clas);
+	}
+	if (!questions.empty()) {
+		ret.q = questions.front();
+	}
+	for (int i = 0; i < ancount; i++) {
+		dns_record_t const &r = rec[i];
+		std::string name = stricmp(ret.q.name.c_str(), r.name.c_str()) == 0 ? ret.q.name : misc::strtolower(r.name);
+		write_dns_answer_rr(&ret.buffer, name, ret.q.clas, r.ttl, r);
+	}
+
+	return ret;
+}
+
 bool Behind::send_response(void *private_d, int family, dns_header_t const &header, std::vector<question_t> const &questions, std::vector<dns_record_t> const &rec)
 {
 	Private::D *d = static_cast<Private::D *>(private_d);
 
-	std::vector<char> buffer;
-	uint16_t ancount = uint16_t(std::min(rec.size(), (size_t)16));
-	write_dns_header(&buffer, header.id, header.flags, 1, ancount, 0, 0);
+	ResponseData response = make_response(private_d, header, questions, rec);
+	if (!response) return false;
 
-	for (auto it = questions.begin(); it != questions.end(); it++) {
-		question_t const &q = *it;
-		write_dns_question_rr(&buffer, q.name, q.type, q.clas);
-	}
-	question_t q;
-	if (!questions.empty()) {
-		q = questions.front();
-	}
-	for (int i = 0; i < ancount; i++) {
-		dns_record_t const &r = rec[i];
-		std::string name = stricmp(q.name.c_str(), r.name.c_str()) == 0 ? q.name : misc::strtolower(r.name);
-		write_dns_answer_rr(&buffer, name, q.clas, ttl(), r);
-	}
 	std::string client;
 	SendTo sender;
 	if (family == AF_INET) {
@@ -845,20 +884,20 @@ bool Behind::send_response(void *private_d, int family, dns_header_t const &head
 	} else if (family == AF_INET6) {
 		sender.set_sa6(d->sock6, &d->sa6);
 	}
-	bool ok = sender.sendto(&buffer[0], buffer.size()) == buffer.size();
+	bool ok = sender.sendto(&response.buffer[0], response.buffer.size()) == response.buffer.size();
 	client = sender.addr_to_string();
 
-	char const *qtype = dns_type_to_string(q.type);
+	char const *qtype = dns_type_to_string(response.q.type);
 	if ((header.flags & 0x000f) == 3) { // NXDOMAIN
 		logprintf(LOG_DEFAULT, "R: <<%s %s NXDOMAIN>> to %s\n"
-				  , q.name.c_str()
+				  , response.q.name.c_str()
 				  , qtype
 				  , client.c_str()
 				  );
-	} else if (ancount > 0) {
-		for (int i = 0; i < ancount; i++) {
+	} else if (rec.size() > 0) {
+		for (int i = 0; i < rec.size(); i++) {
 			dns_record_t const &r = rec[i];
-			std::string name = misc::strtolower(q.name);
+			std::string name = misc::strtolower(response.q.name);
 			std::string addr_str = r.to_string();
 			logprintf(LOG_DEFAULT, "R: <<%s %s %s>> to %s (from cache)\n"
 					  , name.c_str()
@@ -869,7 +908,7 @@ bool Behind::send_response(void *private_d, int family, dns_header_t const &head
 		}
 	} else {
 		logprintf(LOG_DEFAULT, "R: <<%s %s NOANSWER>> to %s (from cache)\n"
-				  , q.name.c_str()
+				  , response.q.name.c_str()
 				  , qtype
 				  , client.c_str()
 				  );
@@ -877,37 +916,58 @@ bool Behind::send_response(void *private_d, int family, dns_header_t const &head
 
 	if (0) {
 		if (header.flags & 0x8000) {
-			if (stricmp(q.name.c_str(), "www.google.com") == 0) {
+			if (stricmp(response.q.name.c_str(), "www.google.com") == 0) {
 				char const *path = "testcase/google_response.bin";
-				writefile(path, &buffer);
-			} else if (stricmp(q.name.c_str(), "doubleclick.net") == 0) {
+				writefile(path, &response.buffer);
+			} else if (stricmp(response.q.name.c_str(), "doubleclick.net") == 0) {
 				char const *path = "testcase/doubleclick_response.bin";
-				writefile(path, &buffer);
-			} else if (stricmp(q.name.c_str(), "www.soramimi.jp") == 0) {
+				writefile(path, &response.buffer);
+			} else if (stricmp(response.q.name.c_str(), "www.soramimi.jp") == 0) {
 				char const *path = "testcase/soramimi_response.bin";
-				writefile(path, &buffer);
-			} else if (stricmp(q.name.c_str(), "www.amazon.co.jp") == 0) {
+				writefile(path, &response.buffer);
+			} else if (stricmp(response.q.name.c_str(), "www.amazon.co.jp") == 0) {
 				char const *path = "testcase/amazon_response.bin";
-				writefile(path, &buffer);
+				writefile(path, &response.buffer);
 			}
 		} else {
-			if (stricmp(q.name.c_str(), "www.google.com") == 0) {
+			if (stricmp(response.q.name.c_str(), "www.google.com") == 0) {
 				char const *path = "testcase/google_query.bin";
-				writefile(path, &buffer);
-			} else if (stricmp(q.name.c_str(), "doubleclick.net") == 0) {
+				writefile(path, &response.buffer);
+			} else if (stricmp(response.q.name.c_str(), "doubleclick.net") == 0) {
 				char const *path = "testcase/doubleclick_query.bin";
-				writefile(path, &buffer);
-			} else if (stricmp(q.name.c_str(), "www.soramimi.jp") == 0) {
+				writefile(path, &response.buffer);
+			} else if (stricmp(response.q.name.c_str(), "www.soramimi.jp") == 0) {
 				char const *path = "testcase/soramimi_query.bin";
-				writefile(path, &buffer);
-			} else if (stricmp(q.name.c_str(), "www.amazon.co.jp") == 0) {
+				writefile(path, &response.buffer);
+			} else if (stricmp(response.q.name.c_str(), "www.amazon.co.jp") == 0) {
 				char const *path = "testcase/amazon_query.bin";
-				writefile(path, &buffer);
+				writefile(path, &response.buffer);
 			}
 		}
 	}
 
 	return ok;
+}
+
+std::vector<Behind::dns_record_t> Behind::make_records(query_t const &q, std::vector<answer_t> const &answers)
+{
+	std::vector<dns_record_t> records;
+	records.reserve(10);
+	for (auto it = answers.begin(); it != answers.end(); it++) {
+		answer_t const &a = *it;
+		if (a.clas == DNS_CLASS_IN) {
+			auto size = a.data.size();
+			if ((a.type == DNS_TYPE::A && size == 4) || (a.type == DNS_TYPE::AAAA && size == 16) || (a.type == DNS_TYPE::CNAME && size < 255)) {
+				dns_record_t item;
+				item.name = stricmp(q.request_name.c_str(), a.name.c_str()) == 0 ? q.request_name : misc::strtolower(a.name);
+				item.type = a.type;
+				item.addr = a.data;
+				item.ttl = a.ttl;
+				records.push_back(item);
+			}
+		}
+	}
+	return records;
 }
 
 void Behind::process(void *private_d, int family)
@@ -965,6 +1025,7 @@ void Behind::process(void *private_d, int family)
 										dns_record_t r;
 										r.name = q.name;
 										r.type = q.type;
+										r.ttl = ttl();
 										for (std::vector<uint8_t> const &a : addr->addr) {
 											r.addr = a;
 											rec.push_back(r);
@@ -1051,21 +1112,7 @@ void Behind::process(void *private_d, int family)
 						std::string qname = questions.front().name;
 						qname = stricmp(q.request_name.c_str(), qname.c_str()) == 0 ? q.request_name : misc::strtolower(qname);
 						// make answer
-						std::vector<dns_record_t> records;
-						records.reserve(10);
-						for (auto it = answers.begin(); it != answers.end(); it++) {
-							answer_t const &a = *it;
-							if (a.clas == DNS_CLASS_IN) {
-								auto size = a.data.size();
-								if ((a.type == DNS_TYPE::A && size == 4) || (a.type == DNS_TYPE::AAAA && size == 16) || (a.type == DNS_TYPE::CNAME && size < 255)) {
-									dns_record_t item;
-									item.name = stricmp(q.request_name.c_str(), a.name.c_str()) == 0 ? q.request_name : misc::strtolower(a.name);
-									item.type = a.type;
-									item.addr = a.data;
-									records.push_back(item);
-								}
-							}
-						}
+						std::vector<dns_record_t> records = make_records(q, answers);
 						// update cahce
 						{
 							Behind::dns_cache_t *cache = nullptr;
@@ -1174,6 +1221,29 @@ void Behind::test()
 		EXPECT_EQ(answers[2].name, "cf.4d5ad1d2b-frontier.amazon.co.jp");
 		EXPECT_EQ(to_string(answers[2].data), std::string("\x03\xa8\xfb\x86", 4));
 		EXPECT_EQ(answers[2].ttl, 300);
+
+		{
+			Private::D d;
+
+			query_t q;
+			q.request_name = questions[0].name;
+			std::vector<dns_record_t> rec = make_records(q, answers);
+			ResponseData response = make_response(&d, header, questions, rec);
+
+			Behind::dns_header_t header2;
+			std::vector<Behind::question_t> questions2;
+			std::vector<Behind::answer_t> answers2;
+			char const *begin = response.buffer.data();
+			char const *end = begin + response.buffer.size();
+			parse_dns_packet(begin, end, &header2, &questions2, &answers2);
+
+			EXPECT_EQ(header2.flags, 0x8180);
+			EXPECT_EQ(header2.ancount, 3);
+			EXPECT_EQ(header2.qdcount, 1);
+
+			EXPECT_EQ(questions, questions2);
+			EXPECT_EQ(answers, answers2);
+		}
 	}
 
 	file = "testcase/doubleclick_response.bin";

@@ -54,13 +54,13 @@ struct Forwarder {
 class Behind {
 	friend class Cache;
 public:
-private:
 	struct dns_record_t;
 	struct dns_header_t;
 	struct query_t;
 	struct question_t;
 	struct answer_t;
 	struct dns_cache_t;
+private:
 
 	struct Private;
 	Private *m;
@@ -78,12 +78,12 @@ private:
 	static void write(std::vector<char> *out, char const *src, int len);
 	static void write_us(std::vector<char> *out, uint16_t v);
 	static void write_ul(std::vector<char> *out, uint32_t v);
-	void write_name(std::vector<char> *out, std::string const &name);
+	static void write_name(std::vector<char> *out, std::string const &name);
 	int decode_name(char const *begin, char const *end, char const *ptr, std::vector<char> *out);
 	int decode_name(char const *begin, char const *end, char const *ptr, std::string *name);
 	static void write_dns_header(std::vector<char> *out, uint16_t id, uint16_t flags, uint16_t qdcount, uint16_t ancount, uint16_t nscount, uint16_t arcount);
-	void write_dns_question_rr(std::vector<char> *out, std::string const &name, DNS_TYPE type, uint16_t clas);
-	void write_dns_answer_rr(std::vector<char> *out, const std::string &name, uint16_t clas, uint32_t ttl, dns_record_t const &item);
+	static void write_dns_question_rr(std::vector<char> *out, std::string const &name, DNS_TYPE type, uint16_t clas);
+	static void write_dns_answer_rr(std::vector<char> *out, const std::string &name, uint16_t clas, uint32_t ttl, dns_record_t const &item);
 	int parse_question_section(char const *begin, char const *end, char const *ptr, question_t *out);
 	Forwarder get_forwarder();
 	void init_forwarder();
@@ -94,7 +94,12 @@ private:
 	void parse_dns_packet(char const *begin, char const *end, dns_header_t *header, std::vector<question_t> *questions, std::vector<answer_t> *answers);
 
 	bool is_nxdomain(const std::string &name);
+
+	static std::vector<dns_record_t> make_records(const query_t &q, const std::vector<answer_t> &answers);
+	struct ResponseData;
+	static ResponseData make_response(void *private_d, const dns_header_t &header, const std::vector<question_t> &questions, const std::vector<dns_record_t> &rec);
 	bool send_response(void *private_d, int family, const dns_header_t &header, std::vector<question_t> const &q, std::vector<dns_record_t> const &rec);
+
 	void process(void *private_d, int family);
 };
 
