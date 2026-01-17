@@ -292,16 +292,38 @@ void Behind::write_ul(std::vector<char> *out, uint32_t v)
 	write(out, (char const *)&v, 4);
 }
 
-void Behind::write_name(std::vector<char> *out, const std::string &name)
+void Behind::write_us(void *out, uint16_t v)
+{
+	v = htons(v);
+	memcpy(out, (char const *)&v, 2);
+}
+
+void Behind::write_ul(void *out, uint32_t v)
+{
+	v = htonl(v);
+	memcpy(out, (char const *)&v, 4);
+}
+
+bool Behind::write_name(std::vector<char> *out, std::map<std::string, size_t> *namemap, const std::string &name)
 {
 	char const *name_begin = name.c_str();
 	char const *name_end = name_begin + name.size();
 	char const *srcptr = name_begin;
 	while (srcptr < name_end) {
+		if (namemap) {
+			auto it = namemap->find(srcptr);
+			if (it != namemap->end()) {
+				uint16_t offset = it->second;
+				offset |= 0xc000;
+				write_us(out, offset);
+				return true;
+			}
+		}
 		char const *dot = strchr(srcptr, '.');
 		int len = (dot ? dot : name_end) - srcptr;
-		if (len < 1 || len > 63) {
-			return;
+		if (len < 1 || len > 63) return false;
+		if (namemap) {
+			(*namemap)[srcptr] = out->size();
 		}
 		write(out, (char)len);
 		write(out, srcptr, len);
@@ -311,6 +333,7 @@ void Behind::write_name(std::vector<char> *out, const std::string &name)
 		srcptr += len + 1;
 	}
 	write(out, (char)0);
+	return true;
 }
 
 int Behind::decode_name(const char *begin, const char *end, const char *ptr, std::vector<char> *out)
@@ -370,42 +393,40 @@ void Behind::write_dns_header(std::vector<char> *out, uint16_t id, uint16_t flag
 	write(out, (char const *)tmp, 12);
 }
 
-void Behind::write_dns_question_rr(std::vector<char> *out, const std::string &name, DNS_TYPE type, uint16_t clas)
+void Behind::write_dns_question_rr(std::vector<char> *out, std::map<std::string, size_t> *namemap, const std::string &name, DNS_TYPE type, uint16_t clas)
 {
-	write_name(out, name);
+	write_name(out, namemap, name);
 	write_us(out, (uint16_t)type);
 	write_us(out, clas);
 }
 
-void Behind::write_dns_answer_rr(std::vector<char> *out, std::string const &name, uint16_t clas, uint32_t ttl, const Behind::dns_record_t &item)
+bool Behind::write_dns_answer_rr(std::vector<char> *out, std::map<std::string, size_t> *namemap, std::string const &name, uint16_t clas, uint32_t ttl, const Behind::dns_record_t &item)
 {
-	std::vector<char> cname;
-	int len = 0;
-	len = item.addr.size();
-	if (item.type == DNS_TYPE::A && len == 4) {
-		// len = 4;
-	} else if (item.type == DNS_TYPE::AAAA && len == 16) {
-		// len = 16;
-	} else if (item.type == DNS_TYPE::CNAME && len < 255) {
-		// len = item.addr.size();
-		std::basic_string_view sv((char const *)item.addr.data(), item.addr.size());
-		std::string s(sv);
-		write_name(&cname, s);
-		len = cname.size();
-	} else {
-		return;
-	}
-	write_name(out, name);
-	// write_name(out, item.name);
+	write_name(out, namemap, name);
 	write_us(out, (int)item.type);
 	write_us(out, clas);
 	write_ul(out, ttl);
-	write_us(out, len);
+
+	int len = 0;
+	len = item.addr.size();
 	if (item.type == DNS_TYPE::CNAME) {
-		write(out, cname.data(), cname.size());
+		std::string cname((char const *)item.addr.data(), item.addr.size());
+		size_t i = out->size();
+		write_us(out, 0);
+		write_name(out, namemap, cname);
+		write_us(&out->at(i), out->size() - i - 2);
 	} else {
+		if (item.type == DNS_TYPE::A && len == 4) {
+			// len = 4;
+		} else if (item.type == DNS_TYPE::AAAA && len == 16) {
+			// len = 16;
+		} else {
+			return false;
+		}
+		write_us(out, len);
 		write(out, (char const *)item.addr.data(), len);
 	}
+	return true;
 }
 
 int Behind::parse_question_section(const char *begin, const char *end, const char *ptr, Behind::question_t *out)
@@ -745,7 +766,6 @@ struct SendTo {
 		const int len = 4;
 		sockaddr_in sa;
 		init_sa4(&sa, addr, port);
-		// memcpy(&sa.sin_addr.s_addr, addr, len);
 		set_sa4(&sa);
 	}
 	void set_sa6(in6_addr const *addr, int port)
@@ -753,7 +773,6 @@ struct SendTo {
 		const int len = 16;
 		sockaddr_in6 sa;
 		init_sa6(&sa, addr, port);
-		// memcpy(&sa.sin6_addr.s6_addr, addr, len);
 		set_sa6(&sa);
 	}
 	void set_sa4(int sock, in_addr const *addr, int port)
@@ -847,16 +866,15 @@ struct Behind::ResponseData {
 
 Behind::ResponseData Behind::make_response(void *private_d, dns_header_t const &header, std::vector<question_t> const &questions, std::vector<dns_record_t> const &rec)
 {
-	Private::D *d = static_cast<Private::D *>(private_d);
-
 	ResponseData ret;
+	std::map<std::string, size_t> namemap;
 
 	uint16_t ancount = uint16_t(std::min(rec.size(), (size_t)16));
 	write_dns_header(&ret.buffer, header.id, header.flags, 1, ancount, 0, 0);
 
 	for (auto it = questions.begin(); it != questions.end(); it++) {
 		question_t const &q = *it;
-		write_dns_question_rr(&ret.buffer, q.name, q.type, q.clas);
+		write_dns_question_rr(&ret.buffer, &namemap, q.name, q.type, q.clas);
 	}
 	if (!questions.empty()) {
 		ret.q = questions.front();
@@ -864,7 +882,9 @@ Behind::ResponseData Behind::make_response(void *private_d, dns_header_t const &
 	for (int i = 0; i < ancount; i++) {
 		dns_record_t const &r = rec[i];
 		std::string name = stricmp(ret.q.name.c_str(), r.name.c_str()) == 0 ? ret.q.name : misc::strtolower(r.name);
-		write_dns_answer_rr(&ret.buffer, name, ret.q.clas, r.ttl, r);
+		if (!write_dns_answer_rr(&ret.buffer, &namemap, name, ret.q.clas, r.ttl, r)) {
+			return {};
+		}
 	}
 
 	return ret;
@@ -1182,6 +1202,29 @@ void Behind::test()
 		EXPECT_EQ(answers[0].name, "www.google.com");
 		EXPECT_EQ(to_string(answers[0].data), std::string("\x8e\xfa\xc2\xc4", 4));
 		EXPECT_EQ(answers[0].ttl, 300);
+
+		{
+			Private::D d;
+
+			query_t q;
+			q.request_name = questions[0].name;
+			std::vector<dns_record_t> rec = make_records(q, answers);
+			ResponseData response = make_response(&d, header, questions, rec);
+
+			Behind::dns_header_t header2;
+			std::vector<Behind::question_t> questions2;
+			std::vector<Behind::answer_t> answers2;
+			char const *begin = response.buffer.data();
+			char const *end = begin + response.buffer.size();
+			parse_dns_packet(begin, end, &header2, &questions2, &answers2);
+
+			EXPECT_EQ(header2.flags, 0x8180);
+			EXPECT_EQ(header2.ancount, 1);
+			EXPECT_EQ(header2.qdcount, 1);
+
+			EXPECT_EQ(questions, questions2);
+			EXPECT_EQ(answers, answers2);
+		}
 	}
 
 	file = "testcase/amazon_response.bin";

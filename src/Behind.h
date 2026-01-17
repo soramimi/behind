@@ -65,6 +65,13 @@ private:
 	struct Private;
 	Private *m;
 
+	struct Pointers {
+		char *begin;
+		char *end;
+		char *ptr;
+	};
+
+
 public:
 	Behind(Option const &opt);
 	~Behind();
@@ -78,20 +85,22 @@ private:
 	static void write(std::vector<char> *out, char const *src, int len);
 	static void write_us(std::vector<char> *out, uint16_t v);
 	static void write_ul(std::vector<char> *out, uint32_t v);
-	static void write_name(std::vector<char> *out, std::string const &name);
-	int decode_name(char const *begin, char const *end, char const *ptr, std::vector<char> *out);
-	int decode_name(char const *begin, char const *end, char const *ptr, std::string *name);
+	static void write_us(void *out, uint16_t v);
+	static void write_ul(void *out, uint32_t v);
+	static bool write_name(std::vector<char> *out, std::map<std::string, size_t> *namemap, std::string const &name);
+	static int decode_name(char const *begin, char const *end, char const *ptr, std::vector<char> *out);
+	static int decode_name(char const *begin, char const *end, char const *ptr, std::string *name);
 	static void write_dns_header(std::vector<char> *out, uint16_t id, uint16_t flags, uint16_t qdcount, uint16_t ancount, uint16_t nscount, uint16_t arcount);
-	static void write_dns_question_rr(std::vector<char> *out, std::string const &name, DNS_TYPE type, uint16_t clas);
-	static void write_dns_answer_rr(std::vector<char> *out, const std::string &name, uint16_t clas, uint32_t ttl, dns_record_t const &item);
-	int parse_question_section(char const *begin, char const *end, char const *ptr, question_t *out);
+	static void write_dns_question_rr(std::vector<char> *out, std::map<std::string, size_t> *namemap, std::string const &name, DNS_TYPE type, uint16_t clas);
+	static bool write_dns_answer_rr(std::vector<char> *out, std::map<std::string, size_t> *namemap, const std::string &name, uint16_t clas, uint32_t ttl, dns_record_t const &item);
+	static int parse_question_section(char const *begin, char const *end, char const *ptr, question_t *out);
 	Forwarder get_forwarder();
 	void init_forwarder();
 	void clean();
 	bool take_query(uint16_t id, query_t *out);
 	void delete_pending_query(uint16_t id);
 	void push_query(query_t const &query);
-	void parse_dns_packet(char const *begin, char const *end, dns_header_t *header, std::vector<question_t> *questions, std::vector<answer_t> *answers);
+	static void parse_dns_packet(char const *begin, char const *end, dns_header_t *header, std::vector<question_t> *questions, std::vector<answer_t> *answers);
 
 	bool is_nxdomain(const std::string &name);
 
