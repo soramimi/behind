@@ -7,9 +7,11 @@
 #include <arpa/inet.h>
 #include <cassert>
 #include <cstring>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <regex>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -872,7 +874,7 @@ Behind::ResponseData Behind::make_response(void *private_d, dns_header_t const &
 	return ret;
 }
 
-bool Behind::send_response(void *private_d, int family, dns_header_t const &header, std::vector<question_t> const &questions, std::vector<dns_record_t> const &rec)
+bool Behind::send_response(void *private_d, int family, dns_header_t const &header, std::vector<question_t> const &questions, std::vector<dns_record_t> const &rec, bool from_cache)
 {
 	Private::D *d = static_cast<Private::D *>(private_d);
 
@@ -889,6 +891,11 @@ bool Behind::send_response(void *private_d, int family, dns_header_t const &head
 	bool ok = sender.sendto(&response.buffer[0], response.buffer.size()) == response.buffer.size();
 	client = sender.addr_to_string();
 
+	char const *comment = "";
+	if (from_cache) {
+		comment = " (from cache)";
+	}
+
 	char const *qtype = dns_type_to_string(response.q.type);
 	if ((header.flags & 0x000f) == 3) { // NXDOMAIN
 		logprintf(LOG_DEFAULT, "R: <<%s %s NXDOMAIN>> to %s\n"
@@ -901,18 +908,20 @@ bool Behind::send_response(void *private_d, int family, dns_header_t const &head
 			dns_record_t const &r = rec[i];
 			std::string name = misc::strtolower(response.q.name);
 			std::string addr_str = r.to_string();
-			logprintf(LOG_DEFAULT, "R: <<%s %s %s>> to %s (from cache)\n"
+			logprintf(LOG_DEFAULT, "R: <<%s %s %s>> to %s%s\n"
 					  , name.c_str()
 					  , qtype
 					  , addr_str.c_str()
 					  , client.c_str()
+					  , comment
 					  );
 		}
 	} else {
-		logprintf(LOG_DEFAULT, "R: <<%s %s NOANSWER>> to %s (from cache)\n"
+		logprintf(LOG_DEFAULT, "R: <<%s %s NOANSWER>> to %s%s\n"
 				  , response.q.name.c_str()
 				  , qtype
 				  , client.c_str()
+				  , comment
 				  );
 	}
 
@@ -1034,7 +1043,7 @@ void Behind::process(void *private_d, int family)
 										}
 										auto h = header;
 										h.flags = 0x8180;
-										send_response(d, family, h, {q}, rec);
+										send_response(d, family, h, {q}, rec, false);
 									} else {
 										state = State::NXDOMAIN;
 									}
@@ -1050,7 +1059,7 @@ void Behind::process(void *private_d, int family)
 									if (records) {
 										auto h = header;
 										h.flags = 0x8180;
-										send_response(d, family, h, {q}, *records);
+										send_response(d, family, h, {q}, *records, true);
 										state = State::NONE;
 									}
 								}
@@ -1074,7 +1083,7 @@ void Behind::process(void *private_d, int family)
 										auto d2 = *d;
 										init_sa4(&d2.sa4, (in_addr const *)forwarder.addr, forwarder.port);
 										init_sa6(&d2.sa6, (in6_addr const *)forwarder.addr, forwarder.port);
-										if (send_response(&d2, forwarder.af_type, h, {q2}, {})) {
+										if (send_response(&d2, forwarder.af_type, h, {q2}, {}, false)) {
 											query_t t;
 											t.time = misc::get_tick_count();
 											t.requester_id = header.id;
@@ -1102,7 +1111,7 @@ void Behind::process(void *private_d, int family)
 				if (state == State::NXDOMAIN) {
 					auto h = header;
 					h.flags = 0x8003;
-					send_response(private_d, family, h, questions, {});
+					send_response(private_d, family, h, questions, {}, false);
 				}
 			}
 		} else if (header.flags & 0x8000) { // response
@@ -1136,7 +1145,7 @@ void Behind::process(void *private_d, int family)
 						for (question_t &q3 : questions2) {
 							q3.name = stricmp(q.request_name.c_str(), q3.name.c_str()) == 0 ? q.request_name : misc::strtolower(q3.name);
 						}
-						send_response(&d2, q.client_family, h, questions2, records);
+						send_response(&d2, q.client_family, h, questions2, records, false);
 					}
 				}
 			}
@@ -1293,56 +1302,134 @@ void Behind::test()
 	}
 }
 
+void Behind::init_socket4(void *private_d)
+{
+	Private::D *d = static_cast<Private::D *>(private_d);
+
+	int sock = socket(PF_INET, SOCK_DGRAM, 0);
+	if (sock == INVALID_SOCKET) {
+		throw STRERROR("socket: ");
+	}
+
+	fcntl(sock, F_SETFL, O_NONBLOCK);
+
+	{
+		int yes = 1;
+		setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
+	}
+
+	init_sa4(&d->sa4, nullptr, listen_port());
+	if (bind(sock, (struct sockaddr *)&d->sa4, sizeof(d->sa4)) == SOCKET_ERROR) {
+		throw STRERROR("bind: ");
+	}
+
+	d->sock4 = sock;
+}
+
+void Behind::init_socket6(void *private_d)
+{
+	Private::D *d = static_cast<Private::D *>(private_d);
+
+	int sock = socket(PF_INET6, SOCK_DGRAM, 0);
+	if (sock == INVALID_SOCKET) {
+		throw STRERROR("socket: ");
+	}
+
+	fcntl(sock, F_SETFL, O_NONBLOCK);
+
+	{
+		int yes = 1;
+		setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&yes, sizeof(yes));
+		setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
+	}
+
+	init_sa6(&d->sa6, nullptr, listen_port());
+	if (bind(sock, (struct sockaddr *)&d->sa6, sizeof(d->sa6)) == SOCKET_ERROR) {
+		throw STRERROR("bind: ");
+	}
+
+	d->sock6 = sock;
+}
+
 void Behind::main()
 {
 	Private::D d;
 
-	d.sock4 = socket(PF_INET, SOCK_DGRAM, 0);
-	if (d.sock4 == INVALID_SOCKET) {
-		throw STRERROR("socket: ");
-	}
+	enum Mode {
+		SELECT,
+		EPOLL,
+	};
+	const Mode mode = EPOLL;
 
-	d.sock6 = socket(PF_INET6, SOCK_DGRAM, 0);
-	if (d.sock6 == INVALID_SOCKET) {
-		throw STRERROR("socket: ");
-	}
+	init_socket4(&d);
+	init_socket6(&d);
 
-	{
-		int yes = 1;
-		setsockopt(d.sock4, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
-		setsockopt(d.sock6, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&yes, sizeof(yes));
-	}
+	if (mode == SELECT) {
 
-	init_sa4(&d.sa4, nullptr, listen_port());
-	if (bind(d.sock4, (struct sockaddr *)&d.sa4, sizeof(d.sa4)) == SOCKET_ERROR) {
-		throw STRERROR("bind: ");
-	}
+		logprintf(LOG_DEFAULT, "SELECT mode\n");
 
-	init_sa6(&d.sa6, nullptr, listen_port());
-	if (bind(d.sock6, (struct sockaddr *)&d.sa6, sizeof(d.sa6)) == SOCKET_ERROR) {
-		throw STRERROR("bind: ");
-	}
+		fd_set fds, readfds;
+		FD_ZERO(&readfds);
+		FD_SET(d.sock4, &readfds);
+		FD_SET(d.sock6, &readfds);
+		int maxfd = std::max(d.sock4, d.sock6);
 
-	fd_set fds, readfds;
-	FD_ZERO(&readfds);
-	FD_SET(d.sock4, &readfds);
-	FD_SET(d.sock6, &readfds);
-	int maxfd = std::max(d.sock4, d.sock6);
+		while (1) {
+			memcpy(&fds, &readfds, sizeof(fd_set));
+			select(maxfd + 1, &fds, NULL, NULL, NULL);
 
-	while (1) {
-		memcpy(&fds, &readfds, sizeof(fd_set));
-		select(maxfd + 1, &fds, NULL, NULL, NULL);
+			if (FD_ISSET(d.sock4, &fds)) {
+				process(&d, AF_INET);
+			}
+			if (FD_ISSET(d.sock6, &fds)) {
+				process(&d, AF_INET6);
+			}
 
-		if (FD_ISSET(d.sock4, &fds)) {
-			process(&d, AF_INET);
+			clean();
 		}
-		if (FD_ISSET(d.sock6, &fds)) {
-			process(&d, AF_INET6);
+	} else if (mode == EPOLL) {
+
+		logprintf(LOG_DEFAULT, "EPOLL mode\n");
+
+		struct epoll_event events[2];
+		struct epoll_event ev4 = {};
+		struct epoll_event ev6 = {};
+
+		int epoll_fd = epoll_create1(0);
+		if (epoll_fd == -1) {
+			throw STRERROR("epoll_create1: ");
 		}
 
-		clean();
+		auto SetupEpoll = [](int sock, int epoll_fd, struct epoll_event *e){
+			e->events = EPOLLIN;
+			e->data.fd = sock;
+			if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, e) == -1) {
+				throw STRERROR("epoll_ctl: ");
+			}
+		};
+		SetupEpoll(d.sock4, epoll_fd, &ev4);
+		SetupEpoll(d.sock6, epoll_fd, &ev6);
+
+		while (1) {
+			int nfds = epoll_wait(epoll_fd, events, 2, -1);
+			if (nfds == -1) {
+				if (errno == EINTR) {
+					continue;
+				}
+				throw STRERROR("epoll_wait: ");
+			}
+			for (int i = 0; i < nfds; i++) {
+				if (events[i].data.fd == d.sock4) {
+					process(&d, AF_INET);
+				} else if (events[i].data.fd == d.sock6) {
+					process(&d, AF_INET6);
+				}
+			}
+			clean();
+		}
 	}
 
 	closesocket(d.sock4);
+	closesocket(d.sock6);
 }
 

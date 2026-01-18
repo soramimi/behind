@@ -4,6 +4,7 @@
 #include "RandomNumber.h"
 #include "inetresolver.h"
 #include <map>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unordered_map>
 
@@ -47,7 +48,6 @@ struct Forwarder {
 };
 
 class Behind {
-	friend class Cache;
 public:
 	struct dns_header_t;
 	struct query_t;
@@ -95,10 +95,12 @@ private:
 	static std::vector<dns_record_t> make_records(const query_t &q, const std::vector<dns_record_t> &answers);
 	struct ResponseData;
 	static ResponseData make_response(void *private_d, const dns_header_t &header, const std::vector<question_t> &questions, const std::vector<dns_record_t> &rec);
-	bool send_response(void *private_d, int family, const dns_header_t &header, std::vector<question_t> const &q, std::vector<dns_record_t> const &rec);
+	bool send_response(void *private_d, int family, const dns_header_t &header, std::vector<question_t> const &q, std::vector<dns_record_t> const &rec, bool from_cache);
 
 	void process(void *private_d, int family);
 
+	void init_socket4(void *private_d);
+	void init_socket6(void *private_d);
 public:
 	Behind(Option const &opt);
 	~Behind();
