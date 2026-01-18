@@ -7,11 +7,21 @@
 #include <vector>
 #include "rwfile.h"
 #include "misc.h"
+#include <cstdlib>
+#include <climits>
 
 bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 {
+	char path[PATH_MAX];
+	if (!realpath(file, path)) {
+		logprintf(LOG_DEFAULT, "cannot resolve path: %s\n", file);
+	}
+	file = path;
+
 	std::vector<char> data;
 	if (readfile(file, &data) && !data.empty()) {
+		logprintf(LOG_DEFAULT, "loading configuration file: %s\n", file);
+
 		std::string section;
 		int line = 1;
 		char const *begin = data.data();
@@ -90,6 +100,8 @@ bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 			}
 		}
 		return true;
+	} else {
+		logprintf(LOG_DEFAULT, "cannot open configuration file: %s\n", file);
 	}
 	return false;
 }

@@ -12,10 +12,7 @@ private:
 	struct LogItem;
 	typedef std::chrono::system_clock::time_point time_point_t;
 
-	std::string log_path() const
-	{
-		return "/tmp/behind.log";
-	}
+        const std::string &log_file() const;
 	int log_file_permission() const
 	{
 		return 0644;

@@ -1,17 +1,13 @@
 #ifndef BEHIND_H
 #define BEHIND_H
 
+#include "Global.h"
 #include "RandomNumber.h"
 #include "inetresolver.h"
 #include <map>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unordered_map>
-
-struct Global {
-};
-
-extern Global *global;
 
 class Hosts {
 private:
@@ -25,8 +21,7 @@ struct Option {
 	std::string forward_addr;
 	bool case_randomize = false;
 	std::vector<std::string> nxdomain;
-	Hosts hosts;
-
+	std::map<std::string, std::string> hosts;
 };
 
 enum class DNS_TYPE : uint16_t {

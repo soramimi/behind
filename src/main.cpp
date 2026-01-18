@@ -1,5 +1,4 @@
 
-
 #include "Behind.h"
 #include "Logger.h"
 #include "ConfigParser.h"
@@ -11,8 +10,6 @@
 #include <unistd.h>
 
 InetResolver::Type parse_inet_address(std::string name, InetResolver::Addr *addr_out, int *port_out);
-
-Global *global = nullptr;
 
 bool set_option(std::string const &section, std::string const &key, std::string const &value, Option *opt)
 {
@@ -41,13 +38,7 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 			return true;
 		}
 	} else if (section == "hosts") {
-		InetResolver::Addr addr;
-		auto type = parse_inet_address(value, &addr, nullptr);
-		if (type == InetResolver::UNDEFINED) {
-			logprintf(LOG_DEFAULT, "invalid address in hosts: %s\n", value.c_str());
-			return false;
-		}
-		opt->hosts[key] = addr;
+		opt->hosts[key] = value;
 		return true;
 	} else {
 		logprintf(LOG_DEFAULT, "unknown section: [%s]\n", section.c_str());
@@ -104,6 +95,16 @@ int main2(Behind *ns)
 	return 0;
 }
 
+std::string getcwd()
+{
+	char buf[4096];
+	if (::getcwd(buf, sizeof(buf)) != nullptr) {
+		return std::string(buf);
+	} else {
+		return std::string();
+	}
+}
+
 int main(int argc, char **argv)
 {
 	Global g;
@@ -114,6 +115,10 @@ int main(int argc, char **argv)
 	Logger::start();
 
 	logprintf(LOG_DEFAULT, "=== Starting BEHIND DNS Server ===\n");
+
+	std::string cwd = getcwd();
+	logprintf(LOG_DEFAULT, "current working directory: %s\n", cwd.c_str());
+
 	for (int i = 1; i < argc; i++) {
 		logprintf(LOG_DEFAULT, "argv[%d] = %s\n", i, argv[i]);
 	}

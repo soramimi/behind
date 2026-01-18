@@ -1,5 +1,6 @@
 
 #include "Logger.h"
+#include "Global.h"
 #include <cstdio>
 #include <cctype>
 #include <cstdlib>
@@ -48,6 +49,11 @@ Logger::~Logger()
 Logger::time_point_t Logger::now()
 {
 	return std::chrono::system_clock::now();
+}
+
+std::string const &Logger::log_file() const
+{
+	return global->log_file;
 }
 
 void Logger::write(char const *ptr, size_t len)
@@ -99,11 +105,11 @@ void Logger::rotate()
 	
 	const int N = 9;
 	int i = N;
-	std::string dst = log_path() + '.' + std::to_string(i);
+	std::string dst = log_file() + '.' + std::to_string(i);
 	unlink(dst.c_str());
 	while (i > 0) {
 		i--;
-		std::string src = log_path() + '.' + std::to_string(i);
+		std::string src = log_file() + '.' + std::to_string(i);
 		rename(src.c_str(), dst.c_str());
 		dst = src;
 	}
@@ -126,9 +132,10 @@ void Logger::rotate()
 void Logger::x_start()
 {
 	m->interrupted = false;
-	m->fd_log = open(log_path().c_str(), O_RDWR | O_CREAT | O_APPEND, log_file_permission());
+	std::string path = log_file();
+	m->fd_log = open(path.c_str(), O_RDWR | O_CREAT | O_APPEND, log_file_permission());
 	if (m->fd_log == -1) {
-		logprintf(LOG_DEFAULT, "failed to open log file: %s", log_path().c_str());
+		fprintf(stderr, "failed to open log file: %s", path.c_str());
 	}
 	m->thread = std::thread([this](){
 		while (1) {

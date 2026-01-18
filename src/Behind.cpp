@@ -201,6 +201,8 @@ struct Behind::Private {
 		int sock6;
 		struct sockaddr_in sa4;
 		struct sockaddr_in6 sa6;
+
+		Hosts hosts;
 	};
 };
 
@@ -231,8 +233,6 @@ Behind::~Behind()
 {
 	delete m;
 }
-
-
 
 bool Behind::eqi(const std::string &l, const std::string &r)
 {
@@ -1028,7 +1028,7 @@ void Behind::process(void *private_d, int family)
 							state = State::FORWARD;
 							{
 								// check known hosts
-								InetResolver::Addr const *addr = m->option.hosts.find(q.name);
+								InetResolver::Addr const *addr = d->hosts.find(q.name);
 								if (addr) {
 									state = State::NONE;
 									std::vector<dns_record_t> rec;
@@ -1355,6 +1355,18 @@ void Behind::main()
 {
 	Private::D d;
 
+	for (auto pair : m->option.hosts) {
+		std::string const &name = pair.first;
+		std::string const &value = pair.second;
+		InetResolver::Addr addr;
+		auto type = parse_inet_address(value, &addr, nullptr);
+		if (type == InetResolver::UNDEFINED) {
+			logprintf(LOG_DEFAULT, "invalid address in hosts: %s\n", value.c_str());
+			continue;
+		}
+		d.hosts[name] = addr;
+	}
+
 	enum Mode {
 		SELECT,
 		EPOLL,
@@ -1366,7 +1378,7 @@ void Behind::main()
 
 	if (mode == SELECT) {
 
-		logprintf(LOG_DEFAULT, "SELECT mode\n");
+		logprintf(LOG_DEFAULT, "mode: SELECT\n");
 
 		fd_set fds, readfds;
 		FD_ZERO(&readfds);
@@ -1389,7 +1401,7 @@ void Behind::main()
 		}
 	} else if (mode == EPOLL) {
 
-		logprintf(LOG_DEFAULT, "EPOLL mode\n");
+		logprintf(LOG_DEFAULT, "mode: EPOLL\n");
 
 		struct epoll_event events[2];
 		struct epoll_event ev4 = {};
