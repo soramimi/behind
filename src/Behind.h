@@ -1,16 +1,11 @@
 #ifndef BEHIND_H
 #define BEHIND_H
 
-#include "inetresolver.h"
-#include <list>
-#include <map>
-#include <stdint.h>
-#include <string>
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
 #include "RandomNumber.h"
+#include "inetresolver.h"
+#include <map>
 #include <sys/socket.h>
+#include <unordered_map>
 
 struct Global {
 };
@@ -54,11 +49,10 @@ struct Forwarder {
 class Behind {
 	friend class Cache;
 public:
-	struct dns_record_t;
 	struct dns_header_t;
 	struct query_t;
 	struct question_t;
-	struct answer_t;
+	struct dns_record_t;
 	struct dns_cache_t;
 private:
 
@@ -71,12 +65,6 @@ private:
 		char *ptr;
 	};
 
-
-public:
-	Behind(Option const &opt);
-	~Behind();
-	void main();
-	void test();
 private:
 	static inline bool eqi(std::string const &l, std::string const &r);
 	uint16_t listen_port() const;
@@ -100,16 +88,22 @@ private:
 	bool take_query(uint16_t id, query_t *out);
 	void delete_pending_query(uint16_t id);
 	void push_query(query_t const &query);
-	static void parse_dns_packet(char const *begin, char const *end, dns_header_t *header, std::vector<question_t> *questions, std::vector<answer_t> *answers);
+	static void parse_dns_packet(char const *begin, char const *end, dns_header_t *header, std::vector<question_t> *questions, std::vector<dns_record_t> *answers);
 
 	bool is_nxdomain(const std::string &name);
 
-	static std::vector<dns_record_t> make_records(const query_t &q, const std::vector<answer_t> &answers);
+	static std::vector<dns_record_t> make_records(const query_t &q, const std::vector<dns_record_t> &answers);
 	struct ResponseData;
 	static ResponseData make_response(void *private_d, const dns_header_t &header, const std::vector<question_t> &questions, const std::vector<dns_record_t> &rec);
 	bool send_response(void *private_d, int family, const dns_header_t &header, std::vector<question_t> const &q, std::vector<dns_record_t> const &rec);
 
 	void process(void *private_d, int family);
+
+public:
+	Behind(Option const &opt);
+	~Behind();
+	void main();
+	void test();
 };
 
 #endif // BEHIND_H

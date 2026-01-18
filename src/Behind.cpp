@@ -2,27 +2,16 @@
 #include "Logger.h"
 #include "TransactionIdGenerator.h"
 #include "misc.h"
-#include "network.h"
 #include "rwfile.h"
 #include <algorithm>
 #include <arpa/inet.h>
-#include <assert.h>
-#include <errno.h>
-#include <ifaddrs.h>
-#include <limits>
+#include <cassert>
+#include <cstring>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <numeric>
 #include <regex>
-#include <stdint.h>
-#include <string.h>
-#include <string_view>
 #include <sys/socket.h>
-#include <sys/stat.h>
-#include <time.h>
 #include <unistd.h>
-#include <unordered_map>
-#include <unordered_set>
 
 #define stricmp(A, B) strcasecmp(A, B)
 #define STRERROR(S) (std::string(S) + strerror(errno))
@@ -49,7 +38,6 @@ std::string addr_to_string(int family, struct sockaddr *addr)
 	char buf[INET6_ADDRSTRLEN];
 	if (family == AF_INET) {
 		struct sockaddr_in *sa4 = (struct sockaddr_in *)addr;
-		// in_addr_t s_addr = sa4->sin_addr.s_addr;
 		if (inet_ntop(AF_INET, &sa4->sin_addr, buf, sizeof(buf))) {
 			return buf;
 		}
@@ -61,32 +49,6 @@ std::string addr_to_string(int family, struct sockaddr *addr)
 	}
 	return {};
 }
-
-
-struct Behind::dns_record_t {
-	std::string name;
-	DNS_TYPE type = DNS_TYPE::A;
-	uint16_t clas = AF_INET;
-	uint32_t ttl = 300;
-	std::vector<uint8_t> addr;
-
-	std::string to_string() const
-	{
-		if (type == DNS_TYPE::A && addr.size() == 4) {
-			struct sockaddr_in a = {};
-			a.sin_addr.s_addr = *(uint32_t *)addr.data();
-			return addr_to_string(AF_INET, (struct sockaddr *)&a);
-		} else if (type == DNS_TYPE::AAAA && addr.size() == 16) {
-			struct sockaddr_in6 a = {};
-			memcpy(&a.sin6_addr.s6_addr, addr.data(), 16);
-			return addr_to_string(AF_INET6, (struct sockaddr *)&a);
-		} else if (type == DNS_TYPE::CNAME && addr.size() < 255) {
-			std::string_view sv((char const *)addr.data(), addr.size());
-			return std::string(sv);
-		}
-		return {};
-	}
-};
 
 struct Behind::dns_header_t {
 	uint16_t id;
@@ -125,15 +87,32 @@ static inline bool operator == (const Behind::question_t &l, const Behind::quest
 	return true;
 }
 
-struct Behind::answer_t {
+struct Behind::dns_record_t {
 	std::string name;
-	DNS_TYPE type;
-	uint16_t clas;
-	uint32_t ttl;
+	DNS_TYPE type = DNS_TYPE::A;
+	uint16_t clas = AF_INET;
+	uint32_t ttl = 300;
 	std::vector<uint8_t> data;
+
+	std::string to_string() const
+	{
+		if (type == DNS_TYPE::A && data.size() == 4) {
+			struct sockaddr_in a = {};
+			a.sin_addr.s_addr = *(uint32_t *)data.data();
+			return addr_to_string(AF_INET, (struct sockaddr *)&a);
+		} else if (type == DNS_TYPE::AAAA && data.size() == 16) {
+			struct sockaddr_in6 a = {};
+			memcpy(&a.sin6_addr.s6_addr, data.data(), 16);
+			return addr_to_string(AF_INET6, (struct sockaddr *)&a);
+		} else if (type == DNS_TYPE::CNAME && data.size() < 255) {
+			std::string_view sv((char const *)data.data(), data.size());
+			return std::string(sv);
+		}
+		return {};
+	}
 };
 
-static inline bool operator == (const Behind::answer_t &l, const Behind::answer_t &r)
+static inline bool operator == (const Behind::dns_record_t &l, const Behind::dns_record_t &r)
 {
 	if (l.type != r.type) return false;
 	if (l.clas != r.clas) return false;
@@ -408,9 +387,9 @@ bool Behind::write_dns_answer_rr(std::vector<char> *out, std::map<std::string, s
 	write_ul(out, ttl);
 
 	int len = 0;
-	len = item.addr.size();
+	len = item.data.size();
 	if (item.type == DNS_TYPE::CNAME) {
-		std::string cname((char const *)item.addr.data(), item.addr.size());
+		std::string cname((char const *)item.data.data(), item.data.size());
 		size_t i = out->size();
 		write_us(out, 0);
 		write_name(out, namemap, cname);
@@ -424,7 +403,7 @@ bool Behind::write_dns_answer_rr(std::vector<char> *out, std::map<std::string, s
 			return false;
 		}
 		write_us(out, len);
-		write(out, (char const *)item.addr.data(), len);
+		write(out, (char const *)item.data.data(), len);
 	}
 	return true;
 }
@@ -647,7 +626,7 @@ void Behind::push_query(const Behind::query_t &query)
 	m->queries.push_back(query);
 }
 
-void Behind::parse_dns_packet(const char *begin, const char *end, Behind::dns_header_t *header, std::vector<Behind::question_t> *questions, std::vector<Behind::answer_t> *answers)
+void Behind::parse_dns_packet(const char *begin, const char *end, Behind::dns_header_t *header, std::vector<Behind::question_t> *questions, std::vector<Behind::dns_record_t> *answers)
 {
 	char const *ptr = begin;
 
@@ -669,7 +648,7 @@ void Behind::parse_dns_packet(const char *begin, const char *end, Behind::dns_he
 	}
 
 	for (int i = 0; i < header->ancount; i++) {
-		answer_t a;
+		dns_record_t a;
 		int n = decode_name(begin, end, ptr, &a.name);
 		if (n > 0 && !a.name.empty()) {
 			ptr += n;
@@ -685,7 +664,7 @@ void Behind::parse_dns_packet(const char *begin, const char *end, Behind::dns_he
 			uint16_t rdlen = ntohs(tmp[4]);
 			ptr += 10;
 			if (ptr + rdlen <= end) {
-				auto it = answers->insert(answers->end(), answer_t());
+				auto it = answers->insert(answers->end(), dns_record_t());
 				*it = a;
 				if ((a.type == DNS_TYPE::A && rdlen == 4) || (a.type == DNS_TYPE::AAAA && rdlen == 16)) {
 					if (rdlen > 0) {
@@ -870,15 +849,18 @@ Behind::ResponseData Behind::make_response(void *private_d, dns_header_t const &
 	std::map<std::string, size_t> namemap;
 
 	uint16_t ancount = uint16_t(std::min(rec.size(), (size_t)16));
+
 	write_dns_header(&ret.buffer, header.id, header.flags, 1, ancount, 0, 0);
 
 	for (auto it = questions.begin(); it != questions.end(); it++) {
 		question_t const &q = *it;
 		write_dns_question_rr(&ret.buffer, &namemap, q.name, q.type, q.clas);
 	}
+
 	if (!questions.empty()) {
 		ret.q = questions.front();
 	}
+
 	for (int i = 0; i < ancount; i++) {
 		dns_record_t const &r = rec[i];
 		std::string name = stricmp(ret.q.name.c_str(), r.name.c_str()) == 0 ? ret.q.name : misc::strtolower(r.name);
@@ -969,19 +951,19 @@ bool Behind::send_response(void *private_d, int family, dns_header_t const &head
 	return ok;
 }
 
-std::vector<Behind::dns_record_t> Behind::make_records(query_t const &q, std::vector<answer_t> const &answers)
+std::vector<Behind::dns_record_t> Behind::make_records(query_t const &q, std::vector<dns_record_t> const &answers)
 {
 	std::vector<dns_record_t> records;
 	records.reserve(10);
 	for (auto it = answers.begin(); it != answers.end(); it++) {
-		answer_t const &a = *it;
+		dns_record_t const &a = *it;
 		if (a.clas == DNS_CLASS_IN) {
 			auto size = a.data.size();
 			if ((a.type == DNS_TYPE::A && size == 4) || (a.type == DNS_TYPE::AAAA && size == 16) || (a.type == DNS_TYPE::CNAME && size < 255)) {
 				dns_record_t item;
 				item.name = stricmp(q.request_name.c_str(), a.name.c_str()) == 0 ? q.request_name : misc::strtolower(a.name);
 				item.type = a.type;
-				item.addr = a.data;
+				item.data = a.data;
 				item.ttl = a.ttl;
 				records.push_back(item);
 			}
@@ -994,7 +976,7 @@ void Behind::process(void *private_d, int family)
 {
 	Private::D *d = static_cast<Private::D *>(private_d);
 
-	char buf[2000];
+	char buf[1500];
 	if (family == AF_INET || family == AF_INET6) {
 		socklen_t salen = sizeof(d->sa4);
 		int len = 0;
@@ -1009,7 +991,7 @@ void Behind::process(void *private_d, int family)
 
 		dns_header_t header;
 		std::vector<question_t> questions;
-		std::vector<answer_t> answers;
+		std::vector<dns_record_t> answers;
 		parse_dns_packet(buf, buf + len, &header, &questions, &answers);
 
 		if ((header.flags & 0xf800) == 0x0000) { // standard query
@@ -1047,7 +1029,7 @@ void Behind::process(void *private_d, int family)
 										r.type = q.type;
 										r.ttl = ttl();
 										for (std::vector<uint8_t> const &a : addr->addr) {
-											r.addr = a;
+											r.data = a;
 											rec.push_back(r);
 										}
 										auto h = header;
@@ -1183,7 +1165,7 @@ void Behind::test()
 		char const *end = begin + buf.size();
 		Behind::dns_header_t header;
 		std::vector<Behind::question_t> questions;
-		std::vector<Behind::answer_t> answers;
+		std::vector<Behind::dns_record_t> answers;
 		parse_dns_packet(begin, end, &header, &questions, &answers);
 		logprintf(LOG_DEFAULT, "TEST: parsed <%s>, %d questions and %d answers\n", file, (int)questions.size(), (int)answers.size());
 
@@ -1213,7 +1195,7 @@ void Behind::test()
 
 			Behind::dns_header_t header2;
 			std::vector<Behind::question_t> questions2;
-			std::vector<Behind::answer_t> answers2;
+			std::vector<Behind::dns_record_t> answers2;
 			char const *begin = response.buffer.data();
 			char const *end = begin + response.buffer.size();
 			parse_dns_packet(begin, end, &header2, &questions2, &answers2);
@@ -1233,7 +1215,7 @@ void Behind::test()
 		char const *end = begin + buf.size();
 		Behind::dns_header_t header;
 		std::vector<Behind::question_t> questions;
-		std::vector<Behind::answer_t> answers;
+		std::vector<Behind::dns_record_t> answers;
 		parse_dns_packet(begin, end, &header, &questions, &answers);
 		logprintf(LOG_DEFAULT, "TEST: parsed <%s>, %d questions and %d answers\n", file, (int)questions.size(), (int)answers.size());
 
@@ -1275,7 +1257,7 @@ void Behind::test()
 
 			Behind::dns_header_t header2;
 			std::vector<Behind::question_t> questions2;
-			std::vector<Behind::answer_t> answers2;
+			std::vector<Behind::dns_record_t> answers2;
 			char const *begin = response.buffer.data();
 			char const *end = begin + response.buffer.size();
 			parse_dns_packet(begin, end, &header2, &questions2, &answers2);
@@ -1295,7 +1277,7 @@ void Behind::test()
 		char const *end = begin + buf.size();
 		Behind::dns_header_t header;
 		std::vector<Behind::question_t> questions;
-		std::vector<Behind::answer_t> answers;
+		std::vector<Behind::dns_record_t> answers;
 		parse_dns_packet(begin, end, &header, &questions, &answers);
 		logprintf(LOG_DEFAULT, "TEST: parsed <%s>, %d questions and %d answers\n", file, (int)questions.size(), (int)answers.size());
 
