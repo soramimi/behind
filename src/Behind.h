@@ -18,6 +18,8 @@ public:
 };
 
 struct Option {
+	std::string working_dir = "/var/lib/behind";
+	std::string log_file = "/var/log/behind/behind.log";
 	std::string forward_addr;
 	bool case_randomize = false;
 	std::vector<std::string> nxdomain;

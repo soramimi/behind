@@ -59,7 +59,7 @@ bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 							fn_assign(section, k, v, cookie);
 						}
 					} else {
-						logprintf(LOG_DEFAULT, "unexpected keyword: %s (%d)\n", file, line);
+						fprintf(stderr, "unexpected keyword: %s (%d)\n", file, line);
 					}
 				}
 				if (c == 0) break;
@@ -80,7 +80,7 @@ bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 				comment = pre;
 			} else if (c == '[') {
 				if (sec) {
-					logprintf(LOG_DEFAULT, "unexpected character: %s (%d) '%c'\n", file, line, c);
+					fprintf(stderr, "unexpected character: %s (%d) '%c'\n", file, line, c);
 				} else if (!key) {
 					sec = ptr;
 				}
@@ -89,7 +89,7 @@ bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 					section.assign(sec, comment ? comment : pre);
 					sec = nullptr;
 				} else {
-					logprintf(LOG_DEFAULT, "unexpected character: %s (%d) '%c'\n", file, line, c);
+					fprintf(stderr, "unexpected character: %s (%d) '%c'\n", file, line, c);
 				}
 			} else if (c == '=') {
 				if (key) {
@@ -101,7 +101,7 @@ bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 		}
 		return true;
 	} else {
-		logprintf(LOG_DEFAULT, "cannot open configuration file: %s\n", file);
+		fprintf(stderr, "cannot open configuration file: %s\n", file);
 	}
 	return false;
 }

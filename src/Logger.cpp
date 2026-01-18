@@ -26,6 +26,8 @@ struct Logger::LogItem {
 };
 
 struct Logger::Private {
+	std::string log_file;
+	bool paused = false;
 	int fd_log = -1;
 	std::vector<Logger::LogItem> items;
 	std::thread thread;
@@ -51,15 +53,12 @@ Logger::time_point_t Logger::now()
 	return std::chrono::system_clock::now();
 }
 
-std::string const &Logger::log_file() const
-{
-	return global->log_file;
-}
-
 void Logger::write(char const *ptr, size_t len)
 {
-	if (m->fd_log) {
+	if (m->fd_log != -1) {
 		::write(m->fd_log, ptr, len);
+	} else {
+		::write(fileno(stderr), ptr, len);
 	}
 }
 
@@ -105,16 +104,16 @@ void Logger::rotate()
 	
 	const int N = 9;
 	int i = N;
-	std::string dst = log_file() + '.' + std::to_string(i);
+	std::string dst = m->log_file + '.' + std::to_string(i);
 	unlink(dst.c_str());
 	while (i > 0) {
 		i--;
-		std::string src = log_file() + '.' + std::to_string(i);
+		std::string src = m->log_file + '.' + std::to_string(i);
 		rename(src.c_str(), dst.c_str());
 		dst = src;
 	}
 
-	int fd_dst = open(dst.c_str(), O_WRONLY | O_CREAT | O_TRUNC, log_file_permission());
+	int fd_dst = ::open(dst.c_str(), O_WRONLY | O_CREAT | O_TRUNC, log_file_permission());
 	if (fd_dst != -1) {
 		lseek(m->fd_log, 0, SEEK_SET);
 		while (1) {
@@ -123,20 +122,35 @@ void Logger::rotate()
 			if (n < 1) break;
 			if (::write(fd_dst, buf, n) != n) break;
 		}
-		close(fd_dst);
+		::close(fd_dst);
 	}
 	lseek(m->fd_log, 0, SEEK_SET);
 	ftruncate(m->fd_log, 0);
 }
 
+void Logger::x_open(std::string const &log_file)
+{
+	x_close();
+	m->log_file = log_file;
+	m->fd_log = ::open(m->log_file.c_str(), O_RDWR | O_CREAT | O_APPEND, log_file_permission());
+	if (m->fd_log == -1) {
+		fprintf(stderr, "failed to open log file: %s", m->log_file.c_str());
+	}
+}
+
+void Logger::x_close()
+{
+	if (m->fd_log != -1) {
+		close(m->fd_log);
+		m->fd_log = -1;
+	}
+}
+
 void Logger::x_start()
 {
+	m->paused = false;
 	m->interrupted = false;
-	std::string path = log_file();
-	m->fd_log = open(path.c_str(), O_RDWR | O_CREAT | O_APPEND, log_file_permission());
-	if (m->fd_log == -1) {
-		fprintf(stderr, "failed to open log file: %s", path.c_str());
-	}
+
 	m->thread = std::thread([this](){
 		while (1) {
 			std::vector<LogItem> items;
@@ -146,6 +160,7 @@ void Logger::x_start()
 					if (m->interrupted) break;
 					m->cv.wait(lock);
 				}
+				if (m->paused) continue;
 				std::swap(items, m->items);
 			}
 			{
@@ -163,12 +178,23 @@ void Logger::x_start()
 
 void Logger::x_stop()
 {
+	m->paused = false;
 	m->interrupted = true;
 	m->cv.notify_all();
 	if (m->thread.joinable()) {
 		m->thread.join();
 	}
+	x_close();
 	m->interrupted = false;
+}
+
+void Logger::x_pause(bool f)
+{
+	std::lock_guard lock(m->mutex);
+	m->paused = f;
+	if (!f) {
+		m->cv.notify_all();
+	}
 }
 
 void Logger::start()
@@ -179,6 +205,11 @@ void Logger::start()
 void Logger::stop()
 {
 	x_logger.x_stop();
+}
+
+void Logger::open(const std::string &log_file)
+{
+	x_logger.x_open(log_file);
 }
 
 void Logger::push(Logger::LogItem const &item)
@@ -210,6 +241,11 @@ void Logger::x_logprintf(char const *file, int line, int level, char const *fmt,
 		push(item);
 		m->cv.notify_all();
 	}
+}
+
+void Logger::pause(bool f)
+{
+	x_logger.x_pause(f);
 }
 
 

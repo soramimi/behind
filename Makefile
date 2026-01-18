@@ -43,3 +43,6 @@ q2:
 
 q3:
 	dig @127.0.0.1 -p 5300 www.amazon.co.jp
+
+q4:
+	dig www.google.com @127.0.0.1 +tls

@@ -22,7 +22,17 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 		return false;
 	};
 
-	if (section == "forward-zone") {
+	if (section == "options") {
+		if (key == "directory") {
+			opt->working_dir = value;
+			return true;
+		}
+	} else if (section == "logging") {
+		if (key == "file") {
+			opt->log_file = value;
+			return true;
+		}
+	} else if (section == "forward-zone") {
 		if (key == "forward-addr") {
 			opt->forward_addr = value;
 			return true;
@@ -64,15 +74,22 @@ bool parse_option(int argc, char **argv, Option *opt)
 						set_option(section, key, value, opt);
 					}, opt);
 					if (!ok) {
-						logprintf(LOG_DEFAULT, "failed to open config file: %s\n", confpath.c_str());
+						fprintf(stderr, "failed to open config file: %s\n", confpath.c_str());
 						ok = false;
 					}
 				} else {
-					logprintf(LOG_DEFAULT, "Option %s requires an argument.\n", arg);
+					fprintf(stderr, "option %s requires an argument.\n", arg);
+					ok = false;
+				}
+			} else if (strcmp(arg, "--log-file") == 0) {
+				if (argi < argc) {
+					opt->log_file = argv[argi++];
+				} else {
+					fprintf(stderr, "option %s requires an argument.\n", arg);
 					ok = false;
 				}
 			} else {
-				logprintf(LOG_DEFAULT, "Unknown option: %s\n", arg);
+				fprintf(stderr, "Unknown option: %s\n", arg);
 				ok = false;
 			}
 		}
@@ -98,11 +115,10 @@ int main2(Behind *ns)
 std::string getcwd()
 {
 	char buf[4096];
-	if (::getcwd(buf, sizeof(buf)) != nullptr) {
+	if (::getcwd(buf, sizeof(buf))) {
 		return std::string(buf);
-	} else {
-		return std::string();
 	}
+	return {};
 }
 
 int main(int argc, char **argv)
@@ -113,21 +129,27 @@ int main(int argc, char **argv)
 	misc::get_tick_count(); // dummy read for initialize
 
 	Logger::start();
-
+	Logger::pause(true);
 	logprintf(LOG_DEFAULT, "=== Starting BEHIND DNS Server ===\n");
-
-	std::string cwd = getcwd();
-	logprintf(LOG_DEFAULT, "current working directory: %s\n", cwd.c_str());
-
 	for (int i = 1; i < argc; i++) {
 		logprintf(LOG_DEFAULT, "argv[%d] = %s\n", i, argv[i]);
 	}
 
 	Option opt;
 	parse_option(argc, argv, &opt);
-	Behind ns(opt);
-	ns.test();
-	main2(&ns);
+
+	Logger::open(opt.log_file);
+	Logger::pause(false);
+
+	if (!opt.working_dir.empty()) {
+		chdir(opt.working_dir.c_str());
+	}
+	std::string cwd = getcwd();
+	logprintf(LOG_DEFAULT, "current working directory: %s\n", cwd.c_str());
+
+	Behind behind(opt);
+	behind.test();
+	main2(&behind);
 
 	Logger::stop();
 

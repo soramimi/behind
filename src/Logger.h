@@ -12,11 +12,11 @@ private:
 	struct LogItem;
 	typedef std::chrono::system_clock::time_point time_point_t;
 
-        const std::string &log_file() const;
 	int log_file_permission() const
 	{
 		return 0644;
 	}
+
 	int log_rotate_size() const
 	{
 		return 1 * 1024 * 1024;
@@ -27,14 +27,20 @@ private:
 	void write(const LogItem &item);
 	void push(const LogItem &item);
 	void rotate();
+	void x_close();
 	void x_start();
 	void x_stop();
+	void x_pause(bool f);
+	void x_open(const std::string &log_file);
 public:
 	Logger();
 	~Logger();
 	void x_logprintf(const char *file, int line, int level, const char *fmt, ...);
+	static void pause(bool f);
 	static void start();
 	static void stop();
+	static void open(std::string const &log_file);
+
 };
 
 extern Logger x_logger;
