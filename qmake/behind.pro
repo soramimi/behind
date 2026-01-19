@@ -31,3 +31,6 @@ HEADERS += \
     ../src/misc.h \
     ../src/network.h \
     ../src/rwfile.h
+
+DISTFILES += \
+	../scripts/behind.conf

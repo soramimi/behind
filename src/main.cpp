@@ -42,8 +42,8 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 			opt->case_randomize = IsTrue(value);
 			return true;
 		}
-	} else if (section == "nxdomain") {
-		if (key == "addr") {
+	} else if (section == "filter") {
+		if (key == "nxdomain") {
 			opt->nxdomain.insert(opt->nxdomain.end(), value);
 			return true;
 		}

@@ -9,6 +9,8 @@
 #include "misc.h"
 #include <cstdlib>
 #include <climits>
+#include <cstring>
+#include <libgen.h>
 
 bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 {
@@ -27,12 +29,14 @@ bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 		char const *begin = data.data();
 		char const *end = begin + data.size();
 		char const *ptr = begin;
+		char const *left;
 		char const *comment;
 		char const *sec;
 		char const *key;
 		char const *sep;
 		char quote;
 		auto Reset = [&](){
+			left = ptr;
 			comment = nullptr;
 			sec = nullptr;
 			key = nullptr;
@@ -48,8 +52,31 @@ bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 				ptr++;
 			}
 			if (c == '\n' || c == '\r' || c == 0) {
+				if (c == '\r' && ptr < end && *ptr == '\n') {
+					ptr++;
+				}
 				if (key) {
-					if (sep) {
+					if (strncmp(key, "include", 7) == 0) {
+						if (key + 7 < end && isspace((unsigned char)key[7])) {
+							std::string path = misc::trimmed(key + 7, pre);
+							char const *p = strrchr(file, '/');
+							if (p) {
+								path = std::string(file, p - file + 1) + path;
+							}
+							std::vector<char> data2;
+							if (readfile(path.c_str(), &data2)) {
+								logprintf(LOG_DEFAULT, "including configuration file: %s\n", path.c_str());
+								if (!data.empty()) {
+									size_t pos = left - begin;
+									data.erase(data.begin() + pos, data.begin() + (ptr - begin));
+									data.insert(data.begin() + pos, data2.begin(), data2.end());
+									begin = data.data();
+									end = begin + data.size();
+									ptr = begin + pos;
+								}
+							}
+						}
+					} else if (sep) {
 						if (*sep == '=') {
 							std::string k = misc::trimmed(key, sep);
 							std::string v = misc::trimmed(sep + 1, comment ? comment : pre);
@@ -63,9 +90,6 @@ bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 					}
 				}
 				if (c == 0) break;
-				if (c == '\r' && ptr < end && *ptr == '\n') {
-					ptr++;
-				}
 				Reset();
 				line++;
 			} else if (comment) {
