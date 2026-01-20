@@ -10,7 +10,9 @@ gcc:QMAKE_CXXFLAGS += -Wno-switch
 SOURCES += \
     ../src/Behind.cpp \
     ../src/ConfigParser.cpp \
+    ../src/DomainFilter.cpp \
     ../src/Global.cpp \
+    ../src/LineReader.cpp \
     ../src/Logger.cpp \
     ../src/RandomNumber.cpp \
     ../src/TransactionIdGenerator.cpp \
@@ -23,7 +25,9 @@ SOURCES += \
 HEADERS += \
     ../src/Behind.h \
     ../src/ConfigParser.h \
+    ../src/DomainFilter.h \
     ../src/Global.h \
+    ../src/LineReader.h \
     ../src/Logger.h \
     ../src/RandomNumber.h \
     ../src/TransactionIdGenerator.h \

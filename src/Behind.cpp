@@ -789,35 +789,9 @@ struct SendTo {
 	}
 };
 
-bool Behind::is_nxdomain(std::string const &name)
+bool Behind::is_nxdomain(std::string const &name) const
 {
-	std::string key = misc::strtolower(name);
-	for (std::string const &nxdomain : m->option.nxdomain) {
-		if (nxdomain.size() > 2) {
-			if (nxdomain[0] == '/' && nxdomain[nxdomain.size() - 1] == '/') {
-				std::string pattern = nxdomain.substr(1, nxdomain.size() - 2);
-				if (std::regex_match(key, std::regex(pattern))) {
-					return true;
-				}
-			} else if (nxdomain[0] == '*' || nxdomain[1] == '.') {
-				size_t n = nxdomain.size() - 1;
-				if (key.size() > n && memcmp(key.c_str() + key.size() - n, nxdomain.c_str() + 1, n) == 0) {
-					return true;
-				}
-				if (strcmp(key.c_str(), nxdomain.c_str() + 2) == 0) {
-					return true;
-				}
-			} else if (nxdomain[nxdomain.size() - 1] == '*' || nxdomain[nxdomain.size() - 2] == '.') {
-				size_t n = nxdomain.size() - 1;
-				if (key.size() > n && memcmp(key.c_str(), nxdomain.c_str(), n) == 0) {
-					return true;
-				}
-			} else if (key == nxdomain) {
-				return true;
-			}
-		}
-	}
-	return false;
+	return m->option.domain_filter.find(name) == DomainFilter::NXDOMAIN;
 }
 
 char const *dns_type_to_string(DNS_TYPE type)
@@ -1444,4 +1418,5 @@ void Behind::main()
 	closesocket(d.sock4);
 	closesocket(d.sock6);
 }
+
 

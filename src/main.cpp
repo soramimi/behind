@@ -44,7 +44,7 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 		}
 	} else if (section == "filter") {
 		if (key == "nxdomain") {
-			opt->nxdomain.insert(opt->nxdomain.end(), value);
+			opt->domain_filter.add_nxdomain(value);
 			return true;
 		}
 	} else if (section == "hosts") {
@@ -138,6 +138,7 @@ int main(int argc, char **argv)
 	Option opt;
 	parse_option(argc, argv, &opt);
 
+	fprintf(stderr, "log file: %s\n", misc::realpath(opt.log_file.c_str()).c_str());
 	Logger::open(opt.log_file);
 	Logger::pause(false);
 

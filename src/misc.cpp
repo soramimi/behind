@@ -1,5 +1,6 @@
 #include "misc.h"
-
+#include <stdlib.h>
+#include <limits.h>
 #include <chrono>
 
 uint64_t misc::get_tick_count()
@@ -31,3 +32,18 @@ std::string misc::trimmed(char const *begin, char const *end)
 	while (left < right && isspace((unsigned char)right[-1])) right--;
 	return std::string(left, right);
 }
+
+std::string misc::realpath(const char *path)
+{
+	char tmp[PATH_MAX];
+	if (::realpath(path, tmp)) {
+		return tmp;
+	}
+	return {};
+}
+
+std::string misc::realpath(std::string const &path)
+{
+	return realpath(path.c_str());
+}
+

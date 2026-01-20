@@ -1,6 +1,7 @@
 #ifndef BEHIND_H
 #define BEHIND_H
 
+#include "DomainFilter.h"
 #include "Global.h"
 #include "RandomNumber.h"
 #include "inetresolver.h"
@@ -8,6 +9,7 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unordered_map>
+
 
 class Hosts {
 private:
@@ -22,7 +24,7 @@ struct Option {
 	std::string log_file = "/var/log/behind/behind.log";
 	std::string forward_addr;
 	bool case_randomize = false;
-	std::vector<std::string> nxdomain;
+	DomainFilter domain_filter;
 	std::map<std::string, std::string> hosts;
 };
 
@@ -87,7 +89,7 @@ private:
 	void push_query(query_t const &query);
 	static void parse_dns_packet(char const *begin, char const *end, dns_header_t *header, std::vector<question_t> *questions, std::vector<dns_record_t> *answers);
 
-	bool is_nxdomain(const std::string &name);
+	bool is_nxdomain(const std::string &name) const;
 
 	static std::vector<dns_record_t> make_records(const query_t &q, const std::vector<dns_record_t> &answers);
 	struct ResponseData;
