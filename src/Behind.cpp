@@ -194,7 +194,7 @@ struct Behind::Private {
 		Behind::dns_cache_t aaaa;
 	} dns_cache;
 	std::vector<query_t> queries;
-	Forwarder forwarder;
+	std::vector<Forwarder> forwarder;
 
 	struct D {
 		int sock4;
@@ -426,7 +426,7 @@ int Behind::parse_question_section(const char *begin, const char *end, const cha
 	return 0;
 }
 
-Forwarder Behind::get_forwarder()
+std::vector<Forwarder> Behind::get_forwarder()
 {
 	return m->forwarder;
 }
@@ -560,29 +560,30 @@ InetResolver::Type parse_inet_address(std::string name, InetResolver::Addr *addr
 
 void Behind::init_forwarder()
 {
-	std::string name = m->option.forward_addr;
+	for (std::string const &name : m->option.forward_addr) {
+		InetResolver::Addr addr;
+		int port = 53;
 
-	InetResolver::Addr addr;
-	int port = 53;
+		InetResolver::Type type = parse_inet_address(name, &addr, &port);
 
-	InetResolver::Type type = parse_inet_address(name, &addr, &port);
+		m->resolver.resolve(name.c_str(), type, &addr);
 
-	m->resolver.resolve(name.c_str(), type, &addr);
-
-	Forwarder forwarder;
-	if (!addr.empty()) {
-		if (type == InetResolver::IN4) {
-			struct in_addr const *p = (struct in_addr const *)addr.to_in4(0);
-			forwarder.af_type = AF_INET;
-			memcpy(forwarder.addr, &p->s_addr, 4);
-		} else if (type == InetResolver::IN6) {
-			struct in6_addr const *p = (struct in6_addr const *)addr.to_in6(0);
-			forwarder.af_type = AF_INET6;
-			memcpy(forwarder.addr, &p->s6_addr, 16);
+		Forwarder forwarder;
+		if (!addr.empty()) {
+			if (type == InetResolver::IN4) {
+				struct in_addr const *p = (struct in_addr const *)addr.to_in4(0);
+				forwarder.af_type = AF_INET;
+				memcpy(forwarder.addr, &p->s_addr, 4);
+			} else if (type == InetResolver::IN6) {
+				struct in6_addr const *p = (struct in6_addr const *)addr.to_in6(0);
+				forwarder.af_type = AF_INET6;
+				memcpy(forwarder.addr, &p->s6_addr, 16);
+			}
 		}
+
+		m->forwarder.push_back(forwarder);
 	}
 
-	m->forwarder = forwarder;
 }
 
 void Behind::clean()
@@ -848,7 +849,7 @@ Behind::ResponseData Behind::make_response(void *private_d, dns_header_t const &
 	return ret;
 }
 
-bool Behind::send_response(void *private_d, int family, dns_header_t const &header, std::vector<question_t> const &questions, std::vector<dns_record_t> const &rec, bool from_cache)
+bool Behind::send_response(void *private_d, int family, dns_header_t const &header, std::vector<question_t> const &questions, std::vector<dns_record_t> const &rec, bool forward, bool from_cache)
 {
 	Private::D *d = static_cast<Private::D *>(private_d);
 
@@ -871,7 +872,9 @@ bool Behind::send_response(void *private_d, int family, dns_header_t const &head
 	}
 
 	char const *qtype = dns_type_to_string(response.q.type);
-	if ((header.flags & 0x000f) == 3) { // NXDOMAIN
+	if (forward) {
+		logprintf(LOG_DEFAULT, "F: %s\n", response.q.name.c_str());
+	} else if ((header.flags & 0x000f) == 3) { // NXDOMAIN
 		logprintf(LOG_DEFAULT, "R: <<%s %s NXDOMAIN>> to %s\n"
 				  , response.q.name.c_str()
 				  , qtype
@@ -1017,7 +1020,7 @@ void Behind::process(void *private_d, int family)
 										}
 										auto h = header;
 										h.flags = 0x8180;
-										send_response(d, family, h, {q}, rec, false);
+										send_response(d, family, h, {q}, rec, false, false);
 									} else {
 										state = State::NXDOMAIN;
 									}
@@ -1033,31 +1036,33 @@ void Behind::process(void *private_d, int family)
 									if (records) {
 										auto h = header;
 										h.flags = 0x8180;
-										send_response(d, family, h, {q}, *records, true);
+										send_response(d, family, h, {q}, *records, false, true);
 										state = State::NONE;
 									}
 								}
 								if (state != State::NONE) {
 									state = State::NXDOMAIN;
-									Forwarder forwarder = get_forwarder();
-									if (forwarder) {
-										uint16_t id = m->txid_gen.next();
-										delete_pending_query(id);
-										std::string query_name;
-										if (m->option.case_randomize) {
-											query_name = randomize_case(q.name);
-										} else {
-											query_name = q.name;
-										}
+									std::string query_name;
+									if (m->option.case_randomize) {
+										query_name = randomize_case(q.name);
+									} else {
+										query_name = q.name;
+									}
+									uint16_t id = m->txid_gen.next();
+									delete_pending_query(id);
+									auto Forward = [&](Forwarder const &forwarder){
 										auto h = header;
 										h.id = id;
 										h.flags = 0x0100;
 										auto q2 = q;
 										q2.name = query_name;
 										auto d2 = *d;
-										init_sa4(&d2.sa4, (in_addr const *)forwarder.addr, forwarder.port);
-										init_sa6(&d2.sa6, (in6_addr const *)forwarder.addr, forwarder.port);
-										if (send_response(&d2, forwarder.af_type, h, {q2}, {}, false)) {
+										if (forwarder.af_type == AF_INET) {
+											init_sa4(&d2.sa4, (in_addr const *)forwarder.addr, forwarder.port);
+										} else if (forwarder.af_type == AF_INET6) {
+											init_sa6(&d2.sa6, (in6_addr const *)forwarder.addr, forwarder.port);
+										}
+										if (send_response(&d2, forwarder.af_type, h, {q2}, {}, true, false)) {
 											query_t t;
 											t.time = misc::get_tick_count();
 											t.requester_id = header.id;
@@ -1073,9 +1078,24 @@ void Behind::process(void *private_d, int family)
 											t.forward_name = query_name;
 											push_query(t);
 										}
-
-										logprintf(LOG_DEFAULT, "F: %s\n", query_name.c_str());
-										state = State::NONE;
+									};
+									std::vector<Forwarder> forwarders = get_forwarder();
+									size_t n = forwarders.size();
+									if (n > 0) {
+										size_t i = rand() % n;
+										Forwarder const &forwarder1 = forwarders[i];
+										if (forwarder1) {
+											Forward(forwarder1);
+											state = State::NONE;
+										}
+										if (n > 1) {
+											size_t j = (i + 1 + rand() % (n - 1)) % n;
+											Forwarder const &forwarder2 = forwarders[j];
+											if (forwarder2) {
+												Forward(forwarder2);
+												state = State::NONE;
+											}
+										}
 									}
 								}
 							}
@@ -1085,7 +1105,7 @@ void Behind::process(void *private_d, int family)
 				if (state == State::NXDOMAIN) {
 					auto h = header;
 					h.flags = 0x8003;
-					send_response(private_d, family, h, questions, {}, false);
+					send_response(private_d, family, h, questions, {}, false, false);
 				}
 			}
 		} else if (header.flags & 0x8000) { // response
@@ -1119,7 +1139,7 @@ void Behind::process(void *private_d, int family)
 						for (question_t &q3 : questions2) {
 							q3.name = stricmp(q.request_name.c_str(), q3.name.c_str()) == 0 ? q.request_name : misc::strtolower(q3.name);
 						}
-						send_response(&d2, q.client_family, h, questions2, records, false);
+						send_response(&d2, q.client_family, h, questions2, records, false, false);
 					}
 				}
 			}

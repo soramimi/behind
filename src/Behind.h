@@ -22,7 +22,7 @@ public:
 struct Option {
 	std::string working_dir = "/var/lib/behind";
 	std::string log_file = "/var/log/behind/behind.log";
-	std::string forward_addr;
+	std::vector<std::string> forward_addr;
 	bool case_randomize = false;
 	DomainFilter domain_filter;
 	std::map<std::string, std::string> hosts;
@@ -81,7 +81,7 @@ private:
 	static void write_dns_question_rr(std::vector<char> *out, std::map<std::string, size_t> *namemap, std::string const &name, DNS_TYPE type, uint16_t clas);
 	static bool write_dns_answer_rr(std::vector<char> *out, std::map<std::string, size_t> *namemap, const std::string &name, uint16_t clas, uint32_t ttl, dns_record_t const &item);
 	static int parse_question_section(char const *begin, char const *end, char const *ptr, question_t *out);
-	Forwarder get_forwarder();
+	std::vector<Forwarder> get_forwarder();
 	void init_forwarder();
 	void clean();
 	bool take_query(uint16_t id, query_t *out);
@@ -94,7 +94,7 @@ private:
 	static std::vector<dns_record_t> make_records(const query_t &q, const std::vector<dns_record_t> &answers);
 	struct ResponseData;
 	static ResponseData make_response(void *private_d, const dns_header_t &header, const std::vector<question_t> &questions, const std::vector<dns_record_t> &rec);
-	bool send_response(void *private_d, int family, const dns_header_t &header, std::vector<question_t> const &q, std::vector<dns_record_t> const &rec, bool from_cache);
+	bool send_response(void *private_d, int family, const dns_header_t &header, std::vector<question_t> const &q, std::vector<dns_record_t> const &rec, bool forward, bool from_cache);
 
 	void process(void *private_d, int family);
 

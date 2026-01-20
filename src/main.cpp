@@ -34,7 +34,7 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 		}
 	} else if (section == "forward-zone") {
 		if (key == "forward-addr") {
-			opt->forward_addr = value;
+			opt->forward_addr.push_back(value);
 			return true;
 		}
 	} else if (section == "security") {
