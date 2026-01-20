@@ -62,6 +62,7 @@ struct Behind::dns_header_t {
 };
 
 struct Behind::query_t {
+	uint32_t local_transaction_id;
 	uint16_t upstream_id;
 	uint16_t requester_id;
 	uint64_t time;
@@ -186,6 +187,8 @@ public:
 
 struct Behind::Private {
 	Option option;
+	Hosts hosts;
+	uint32_t local_transaction_id = 0;
 	TransactionIdGenerator txid_gen;
 	InetResolver resolver;
 	int ttl = 5 * 60;
@@ -193,7 +196,7 @@ struct Behind::Private {
 		Behind::dns_cache_t a;
 		Behind::dns_cache_t aaaa;
 	} dns_cache;
-	std::vector<query_t> queries;
+	std::vector<Behind::query_t> queries;
 	std::vector<Forwarder> forwarder;
 
 	struct D {
@@ -202,7 +205,6 @@ struct Behind::Private {
 		struct sockaddr_in sa4;
 		struct sockaddr_in6 sa6;
 
-		Hosts hosts;
 	};
 };
 
@@ -598,29 +600,27 @@ void Behind::clean()
 	}
 }
 
-bool Behind::take_query(uint16_t id, Behind::query_t *out)
+void Behind::clean_transaction(uint32_t id)
 {
-	bool ok = false;
 	size_t i = m->queries.size();
 	while (i > 0) {
 		i--;
-		query_t const &q = m->queries[i];
-		if (id == q.upstream_id) {
-			if (out) {
-				*out = q;
-				out = 0;
-				ok = true;
-			}
+		if (id == m->queries[i].local_transaction_id) {
 			m->queries.erase(m->queries.begin() + i);
 		}
 	}
-	return ok;
 }
 
-void Behind::delete_pending_query(uint16_t id)
+bool Behind::take_query(uint16_t id, Behind::query_t *out)
 {
-	query_t q;
-	take_query(id, &q);
+	for (query_t const &q : m->queries) {
+		if (id == q.upstream_id) {
+			*out = q;
+			clean_transaction(q.local_transaction_id);
+			return true;
+		}
+	}
+	return false;
 }
 
 void Behind::push_query(const Behind::query_t &query)
@@ -958,6 +958,16 @@ std::vector<Behind::dns_record_t> Behind::make_records(query_t const &q, std::ve
 	return records;
 }
 
+InetResolver::Addr const *Behind::find_host(std::string const &name) const
+{
+	return m->hosts.find(name);
+}
+
+uint32_t Behind::next_local_transaction_id()
+{
+	return m->local_transaction_id++;
+}
+
 void Behind::process(void *private_d, int family)
 {
 	Private::D *d = static_cast<Private::D *>(private_d);
@@ -1005,7 +1015,7 @@ void Behind::process(void *private_d, int family)
 							state = State::FORWARD;
 							{
 								// check known hosts
-								InetResolver::Addr const *addr = d->hosts.find(q.name);
+								InetResolver::Addr const *addr = m->hosts.find(q.name);
 								if (addr) {
 									state = State::NONE;
 									std::vector<dns_record_t> rec;
@@ -1042,21 +1052,19 @@ void Behind::process(void *private_d, int family)
 								}
 								if (state != State::NONE) {
 									state = State::NXDOMAIN;
-									std::string query_name;
-									if (m->option.case_randomize) {
-										query_name = randomize_case(q.name);
-									} else {
-										query_name = q.name;
-									}
-									uint16_t id = m->txid_gen.next();
-									delete_pending_query(id);
+									const auto local_transaction_id = next_local_transaction_id();
+									clean_transaction(local_transaction_id);
 									auto Forward = [&](Forwarder const &forwarder){
-										auto h = header;
-										h.id = id;
+										std::string query_name = q.name;
+										if (m->option.case_randomize) {
+											query_name = randomize_case(query_name);
+										}
+										dns_header_t h = header;
+										h.id = m->txid_gen.next();
 										h.flags = 0x0100;
-										auto q2 = q;
+										question_t q2 = q;
 										q2.name = query_name;
-										auto d2 = *d;
+										Private::D d2 = *d;
 										if (forwarder.af_type == AF_INET) {
 											init_sa4(&d2.sa4, (in_addr const *)forwarder.addr, forwarder.port);
 										} else if (forwarder.af_type == AF_INET6) {
@@ -1064,9 +1072,10 @@ void Behind::process(void *private_d, int family)
 										}
 										if (send_response(&d2, forwarder.af_type, h, {q2}, {}, true, false)) {
 											query_t t;
+											t.local_transaction_id = local_transaction_id;
 											t.time = misc::get_tick_count();
 											t.requester_id = header.id;
-											t.upstream_id = id;
+											t.upstream_id = h.id;
 											t.type = q.type;
 											t.client_family = family;
 											if (family == AF_INET) {
@@ -1109,9 +1118,8 @@ void Behind::process(void *private_d, int family)
 				}
 			}
 		} else if (header.flags & 0x8000) { // response
-			uint16_t id = header.id;
 			query_t q;
-			if (take_query(id, &q)) {
+			if (take_query(header.id, &q)) {
 				if (q.type == DNS_TYPE::A || q.type == DNS_TYPE::AAAA) {
 					if (questions.size() == 1 && questions.front().name == q.forward_name) {
 						std::string qname = questions.front().name;
@@ -1345,11 +1353,9 @@ void Behind::init_socket6(void *private_d)
 	d->sock6 = sock;
 }
 
-void Behind::main()
+void Behind::add_hosts(std::map<std::string, std::string> const &hosts)
 {
-	Private::D d;
-
-	for (auto pair : m->option.hosts) {
+	for (auto const &pair : hosts) {
 		std::string const &name = pair.first;
 		std::string const &value = pair.second;
 		InetResolver::Addr addr;
@@ -1358,8 +1364,15 @@ void Behind::main()
 			logprintf(LOG_DEFAULT, "invalid address in hosts: %s\n", value.c_str());
 			continue;
 		}
-		d.hosts[name] = addr;
+		m->hosts[name] = addr;
 	}
+}
+
+void Behind::main()
+{
+	Private::D d;
+
+	add_hosts(m->option.hosts);
 
 	enum Mode {
 		SELECT,

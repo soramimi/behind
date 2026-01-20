@@ -84,8 +84,8 @@ private:
 	std::vector<Forwarder> get_forwarder();
 	void init_forwarder();
 	void clean();
+	void clean_transaction(uint32_t id);
 	bool take_query(uint16_t id, query_t *out);
-	void delete_pending_query(uint16_t id);
 	void push_query(query_t const &query);
 	static void parse_dns_packet(char const *begin, char const *end, dns_header_t *header, std::vector<question_t> *questions, std::vector<dns_record_t> *answers);
 
@@ -100,6 +100,9 @@ private:
 
 	void init_socket4(void *private_d);
 	void init_socket6(void *private_d);
+	const InetResolver::Addr *find_host(const std::string &name) const;
+	void add_hosts(const std::map<std::string, std::string> &hosts);
+	uint32_t next_local_transaction_id();
 public:
 	Behind(Option const &opt);
 	~Behind();
