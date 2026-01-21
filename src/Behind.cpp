@@ -1067,10 +1067,6 @@ void Behind::process(void *private_d, int family)
 								if (cache) {
 									auto entry = cache->find(q.name);
 									if (entry) {
-										// entry->ttl = std::clamp(entry->ttl, 3U, 600U);
-										// for (size_t i = 0; i < entry->records.size(); i++) {
-										// 	entry->records[i].ttl = std::min(entry->records[i].ttl, entry->ttl);
-										// }
 										auto h = header;
 										h.flags = 0x8180;
 										send_response(d, family, h, {q}, entry->records, false, true);

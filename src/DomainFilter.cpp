@@ -19,88 +19,101 @@ std::string domain_suffix_key(std::string const &name)
 	return name.substr(i);
 }
 
-DomainFilter::Kind DomainFilter::find(std::string name) const
+std::string domain_prefix_key(std::string const &name)
 {
-	name = misc::strtolower(name);
+	char const *p = strchr(name.c_str(), '.');
+	if (p) {
+		return name.substr(0, p + 1 - name.c_str());
+	}
+	return {};
+}
+
+DomainFilter::Kind DomainFilter::find(std::string const &name) const
+{
+	std::string loname = misc::strtolower(name);
 	{
-		std::string suffix = domain_suffix_key(name);
-		if (!suffix.empty()) {
-			auto it = suffix_map_.find(suffix);
+		std::string key = domain_suffix_key(loname);
+		if (!key.empty()) {
+			auto it = suffix_map_.find(key);
 			if (it != suffix_map_.end()) {
 				for (Item const &item : it->second) {
-					if (item.name == name) return item.kind;
+					if (item.name == loname) return item.kind;
 					const size_t n = item.name.size();
-					if (n < name.size()) {
-						char const *p = name.c_str() + name.size() - n;
+					if (n < loname.size()) {
+						char const *p = loname.c_str() + loname.size() - n;
 						if (memcmp(p, item.name.c_str(), n) == 0 && p[-1] == '.') {
 							return item.kind;
 						}
 					}
-					return DomainFilter::NORMAL;
 				}
 			}
 		}
 	}
-	std::string key = misc::strtolower(name);
-	for (std::string const &nxdomain : nxdomain_) {
-		if (nxdomain.size() > 2) {
-			if (nxdomain[0] == '/' && nxdomain[nxdomain.size() - 1] == '/') {
-				std::string pattern = nxdomain.substr(1, nxdomain.size() - 2);
-				if (std::regex_match(key, std::regex(pattern))) {
-					return NXDOMAIN;
+	{
+		std::string key = domain_prefix_key(loname);
+		if (!key.empty()) {
+			auto it = prefix_map_.find(key);
+			if (it != prefix_map_.end()) {
+				for (Item const &item : it->second) {
+					if (strncmp(loname.c_str(), item.name.c_str(), item.name.size()) == 0) {
+						return item.kind;
+					}
 				}
-			} else if (nxdomain[0] == '*' || nxdomain[1] == '.') {
-				size_t n = nxdomain.size() - 1;
-				if (key.size() > n && memcmp(key.c_str() + key.size() - n, nxdomain.c_str() + 1, n) == 0) {
-					return NXDOMAIN;
-				}
-				if (strcmp(key.c_str(), nxdomain.c_str() + 2) == 0) {
-					return NXDOMAIN;
-				}
-			} else if (nxdomain[nxdomain.size() - 1] == '*' || nxdomain[nxdomain.size() - 2] == '.') {
-				size_t n = nxdomain.size() - 1;
-				if (key.size() > n && memcmp(key.c_str(), nxdomain.c_str(), n) == 0) {
-					return NXDOMAIN;
-				}
-			} else if (key == nxdomain) {
-				return NXDOMAIN;
 			}
+		}
+	}
+	for (Item const &item : regex_list_) {
+		if (std::regex_match(loname, std::regex(item.name))) {
+			return item.kind;
 		}
 	}
 	return NORMAL;
 }
 
-void DomainFilter::add_nxdomain(std::string name)
+void DomainFilter::add_nxdomain(std::string const &name)
 {
-	name = misc::strtolower(name);
-	if (name.size() > 2) {
-		if (name[name.size() - 1] == '/' && name[0] == '/') {
-			// not implement yet
+	std::string loname = misc::strtolower(name);
+	if (loname.size() > 2) {
+		if (loname[0] == '/' && loname[loname.size() - 1] == '/') {
+			// regex match
+			Item item;
+			item.kind = NXDOMAIN;
+			item.name = loname.substr(1, loname.size() - 2);
+			regex_list_.push_back(item);
 			return;
 		}
-		if (name[name.size() - 2] == '.' || name[name.size() - 1] == '*') {
-			// not implement yet
-			return;
-		}
-		// suffix match
-		Item item;
-		item.kind = NXDOMAIN;
-		if (name[0] == '*' || name[1] == '.') {
-			item.name = name.substr(2);
-		} else {
-			item.name = name;
-		}
-		std::string suffix = domain_suffix_key(name);
-		if (!suffix.empty()) {
-			auto it = suffix_map_.find(suffix);
-			if (it == suffix_map_.end()) {
-				it = suffix_map_.insert(it, std::make_pair(suffix, std::vector<Item>()));
+		if (loname[loname.size() - 2] == '.' && loname[loname.size() - 1] == '*') {
+			// prefix match
+			std::string key = domain_prefix_key(loname);
+			Item item;
+			item.kind = NXDOMAIN;
+			item.name = loname.substr(0, loname.size() - 1);
+			auto it = prefix_map_.find(key);
+			if (it == prefix_map_.end()) {
+				it = prefix_map_.insert(it, std::make_pair(key, std::vector<Item>()));
 			}
 			it->second.push_back(item);
 			return;
 		}
 	}
-
-	nxdomain_.push_back(misc::strtolower(name));
+	{
+		// suffix match
+		Item item;
+		item.kind = NXDOMAIN;
+		if (loname[0] == '*' || loname[1] == '.') {
+			item.name = loname.substr(2);
+		} else {
+			item.name = loname;
+		}
+		std::string key = domain_suffix_key(loname);
+		if (!key.empty()) {
+			auto it = suffix_map_.find(key);
+			if (it == suffix_map_.end()) {
+				it = suffix_map_.insert(it, std::make_pair(key, std::vector<Item>()));
+			}
+			it->second.push_back(item);
+			return;
+		}
+	}
 }
 

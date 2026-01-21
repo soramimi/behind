@@ -17,10 +17,11 @@ private:
 		Kind kind = NORMAL;
 	};
 	std::unordered_map<std::string, std::vector<Item>> suffix_map_;
-	std::vector<std::string> nxdomain_;
+	std::unordered_map<std::string, std::vector<Item>> prefix_map_;
+	std::vector<Item> regex_list_;
 public:
-	Kind find(std::string name) const;
-	void add_nxdomain(std::string name);
+	Kind find(std::string const &name) const;
+	void add_nxdomain(std::string const &name);
 };
 
 #endif // DOMAINFILTER_H
