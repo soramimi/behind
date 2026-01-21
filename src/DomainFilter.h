@@ -3,17 +3,24 @@
 
 #include <vector>
 #include <string>
+#include <unordered_map>
 
 class DomainFilter {
-private:
-	std::vector<std::string> nxdomain_;
 public:
 	enum Kind {
 		NORMAL,
 		NXDOMAIN,
 	};
-	Kind find(const std::string &name) const;
-	void add_nxdomain(const std::string &name);
+private:
+	struct Item {
+		std::string name;
+		Kind kind = NORMAL;
+	};
+	std::unordered_map<std::string, std::vector<Item>> suffix_map_;
+	std::vector<std::string> nxdomain_;
+public:
+	Kind find(std::string name) const;
+	void add_nxdomain(std::string name);
 };
 
 #endif // DOMAINFILTER_H

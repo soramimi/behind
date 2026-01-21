@@ -121,8 +121,20 @@ std::string getcwd()
 	return {};
 }
 
+#include "DomainFilter.h"
+#include <assert.h>
+#define EXPECT_EQ(a, b) assert((a) == (b))
+
 int main(int argc, char **argv)
 {
+	{
+		DomainFilter filter;
+		filter.add_nxdomain("doubleclick.net");
+		EXPECT_EQ(filter.find("doubleclick.net"), DomainFilter::NXDOMAIN);
+		EXPECT_EQ(filter.find("ads.doubleclick.net"), DomainFilter::NXDOMAIN);
+		// return 0;
+	}
+
 	Global g;
 	global = &g;
 

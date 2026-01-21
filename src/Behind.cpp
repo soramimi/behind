@@ -14,6 +14,7 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <optional>
 
 #define stricmp(A, B) strcasecmp(A, B)
 #define STRERROR(S) (std::string(S) + strerror(errno))
@@ -95,6 +96,7 @@ struct Behind::dns_record_t {
 	DNS_TYPE type = DNS_TYPE::A;
 	uint16_t clas = AF_INET;
 	uint32_t ttl = 300;
+	uint64_t expire = 0;
 	std::vector<uint8_t> data;
 
 	std::string to_string() const
@@ -129,6 +131,7 @@ public:
 	struct Item {
 		std::string key;
 		uint64_t timestamp = 0;
+		uint64_t expire = 0;
 		std::vector<Behind::dns_record_t> records;
 	};
 private:
@@ -139,17 +142,31 @@ private:
 		return misc::strtolower(name);
 	}
 public:
-	std::vector<Behind::dns_record_t> const *find(std::string const &name)
+	struct Entry {
+		std::vector<Behind::dns_record_t> records;
+	};
+	std::optional<Entry> find(std::string const &name)
 	{
 		auto key = make_key(name);
 		auto it = index_.find(key);
 		if (it != index_.end()) {
 			auto now = misc::get_tick_count();
-			if (now - items_[it->second].timestamp < 5 * 60 * 1000) { // 5 minutes
-				return &items_[it->second].records;
+			auto expire = items_[it->second].expire;
+			if (now < expire) {
+				Entry ret;
+				ret.records = items_[it->second].records;
+				for (size_t i = 0; i < ret.records.size(); i++) {
+					auto exp = ret.records[i].expire;
+					if (now < exp) {
+						ret.records[i].ttl = (uint32_t)((exp - now) / 1000);
+					} else {
+						ret.records[i].ttl = 0;
+					}
+				}
+				return ret;
 			}
 		}
-		return nullptr;
+		return std::nullopt;
 	}
 	void insert(std::string const &name, std::vector<Behind::dns_record_t> const &records)
 	{
@@ -163,7 +180,7 @@ public:
 						return l.timestamp > r.timestamp; // newest first
 						});
 				while (n > 0) {
-					if (now - items_[n - 1].timestamp < 5 * 60 * 1000) {
+					if (now < items_[n - 1].expire) {
 						break;
 					}
 					n--;
@@ -178,10 +195,16 @@ public:
 			it = index_.insert(index_.end(), std::pair<std::string, size_t>(key, n));
 			items_.emplace_back();
 		}
+
 		Item *item = &items_[it->second];
 		item->key = key;
 		item->timestamp = now;
+		item->expire = now + 600 * 1000;
 		item->records = records;
+		for (size_t i = 0; i < item->records.size(); i++) {
+			item->records[i].expire = now + item->records[i].ttl * 1000;
+			item->expire = std::min(item->expire, item->records[i].expire);
+		}
 	}
 };
 
@@ -1042,11 +1065,15 @@ void Behind::process(void *private_d, int family)
 								state = State::NXDOMAIN;
 							} else if (state == State::FORWARD) {
 								if (cache) {
-									std::vector<dns_record_t> const *records = cache->find(q.name);
-									if (records) {
+									auto entry = cache->find(q.name);
+									if (entry) {
+										// entry->ttl = std::clamp(entry->ttl, 3U, 600U);
+										// for (size_t i = 0; i < entry->records.size(); i++) {
+										// 	entry->records[i].ttl = std::min(entry->records[i].ttl, entry->ttl);
+										// }
 										auto h = header;
 										h.flags = 0x8180;
-										send_response(d, family, h, {q}, *records, false, true);
+										send_response(d, family, h, {q}, entry->records, false, true);
 										state = State::NONE;
 									}
 								}

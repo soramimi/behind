@@ -5,6 +5,8 @@ CONFIG -= app_bundle
 CONFIG -= qt
 DESTDIR = $$PWD/../_bin
 
+INCLUDEPATH += $$PWD/../src
+
 gcc:QMAKE_CXXFLAGS += -Wno-switch
 
 SOURCES += \
