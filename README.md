@@ -2,7 +2,7 @@
 
 # BEHIND
 
-BEHIND is a lightweight DNS forwarding server - a DNS server lesser than BIND.
+a DNS server lesser than BIND - BEHIND is a lightweight DNS forwarding server.
 
 Designed for home networks and small organizations, BEHIND is typically deployed as an intermediate forwarding server between Unbound (primary DNS server) and upstream DNS providers. This architecture allows you to leverage Unbound's robust caching and security features while adding custom domain filtering, static host mappings, and flexible DNS forwarding rules through BEHIND.
 
@@ -31,6 +31,7 @@ Designed for home networks and small organizations, BEHIND is typically deployed
 
 ```bash
 # Using qmake
+cd qmake
 qmake behind.pro
 make
 
@@ -87,7 +88,7 @@ case-randomize = yes  ; Enable DNS 0x20 encoding for spoofing protection
 ```
 
 #### [filter]
-Block specific domains by returning NXDOMAIN. Supports exact match, prefix match (prefix:), suffix match (suffix:), and regex patterns (regex:):
+Block specific domains by returning NXDOMAIN. Supports exact match, prefix match, suffix match, and regex patterns:
 
 ```ini
 [filter]
@@ -183,12 +184,4 @@ BEHIND automatically manages log files:
 - The main log file is named `behind.log`
 - When rotation occurs, older logs are renamed with suffixes `.0` through `.9` (e.g., `behind.log.0`, `behind.log.1`)
 - All DNS queries and responses are logged for troubleshooting
-
-## License
-
-(Add your license information here)
-
-## Author
-
-(Add author information here)
 
