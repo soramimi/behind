@@ -31,6 +31,7 @@ struct Option {
 enum class DNS_TYPE : uint16_t {
 	A = 1,
 	CNAME = 5,
+	SOA = 6,
 	PTR = 12,
 	AAAA = 28,
 };

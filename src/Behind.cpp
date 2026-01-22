@@ -63,7 +63,7 @@ struct Behind::dns_header_t {
 };
 
 struct Behind::query_t {
-	int forward_fd;
+	// int forward_fd;
 	uint64_t timestamp;
 	uint32_t local_transaction_id;
 	uint16_t upstream_id;
@@ -92,6 +92,16 @@ static inline bool operator == (const Behind::question_t &l, const Behind::quest
 	return true;
 }
 
+struct SOA {
+	std::string nameserver;
+	std::string mailbox;
+	uint32_t serial;
+	uint32_t refresh;
+	uint32_t retry;
+	uint32_t expire;
+	uint32_t minimum;
+};
+
 struct Behind::dns_record_t {
 	std::string name;
 	DNS_TYPE type = DNS_TYPE::A;
@@ -99,6 +109,7 @@ struct Behind::dns_record_t {
 	uint32_t ttl = 300;
 	uint64_t expire = 0;
 	std::vector<uint8_t> data;
+	std::shared_ptr<SOA> soa;
 
 	std::string to_string() const
 	{
@@ -224,6 +235,7 @@ struct Behind::Private {
 	struct {
 		Behind::dns_cache_t a;
 		Behind::dns_cache_t aaaa;
+		Behind::dns_cache_t soa;
 	} dns_cache;
 	std::vector<Behind::query_t> queries;
 	std::vector<Forwarder> forwarder;
@@ -416,6 +428,19 @@ void Behind::write_dns_question_rr(std::vector<char> *out, std::map<std::string,
 	write_us(out, clas);
 }
 
+std::shared_ptr<SOA> fake_soa()
+{
+	std::shared_ptr<SOA> soa = std::make_shared<SOA>();
+	soa->nameserver = "ns.example.invalid";
+	soa->mailbox = "admin.example.invalid";
+	soa->serial = 1;
+	soa->refresh = 3600;
+	soa->retry = 600;
+	soa->expire = 1800;
+	soa->minimum = 60;
+	return soa;
+}
+
 bool Behind::write_dns_answer_rr(std::vector<char> *out, std::map<std::string, size_t> *namemap, std::string const &name, uint16_t clas, uint32_t ttl, const Behind::dns_record_t &item)
 {
 	write_name(out, namemap, name);
@@ -423,15 +448,30 @@ bool Behind::write_dns_answer_rr(std::vector<char> *out, std::map<std::string, s
 	write_us(out, clas);
 	write_ul(out, ttl);
 
-	int len = 0;
-	len = item.data.size();
 	if (item.type == DNS_TYPE::CNAME) {
 		std::string cname((char const *)item.data.data(), item.data.size());
 		size_t i = out->size();
 		write_us(out, 0);
 		write_name(out, namemap, cname);
 		write_us(&out->at(i), out->size() - i - 2);
+	} else if (item.type == DNS_TYPE::SOA) {
+		auto WriteSOA = [&](SOA const &soa){
+			size_t i = out->size();
+			write_us(out, 0);
+			write_name(out, namemap, soa.nameserver);
+			write_name(out, namemap, soa.mailbox);
+			write_ul(out, soa.serial);
+			write_ul(out, soa.refresh);
+			write_ul(out, soa.retry);
+			write_ul(out, soa.expire);
+			write_ul(out, soa.minimum);
+			write_us(&out->at(i), out->size() - i - 2);
+		};
+		if (item.soa) {
+			WriteSOA(*item.soa);
+		}
 	} else {
+		int len = item.data.size();
 		if (item.type == DNS_TYPE::A && len == 4) {
 			// len = 4;
 		} else if (item.type == DNS_TYPE::AAAA && len == 16) {
@@ -618,7 +658,6 @@ void Behind::init_forwarder()
 
 		m->forwarder.push_back(forwarder);
 	}
-
 }
 
 void Behind::clean()
@@ -694,8 +733,7 @@ void Behind::parse_dns_packet(const char *begin, const char *end, Behind::dns_he
 			memcpy(tmp, ptr, 10);
 			a.type = (DNS_TYPE)ntohs(tmp[0]);
 			a.clas = ntohs(tmp[1]);
-			// a.ttl = ntohl(*(uint32_t *)&tmp[2]); // -Wstrict-aliasing
-			memcpy(&a.ttl, tmp + 2, 4);
+			memcpy(&a.ttl, tmp + 2, 4); // a.ttl = ntohl(*(uint32_t *)&tmp[2]); // -Wstrict-aliasing
 			a.ttl = ntohl(a.ttl);
 			uint16_t rdlen = ntohs(tmp[4]);
 			ptr += 10;
@@ -718,6 +756,33 @@ void Behind::parse_dns_packet(const char *begin, const char *end, Behind::dns_he
 							memcpy(it->data.data(), name.c_str(), name.size());
 						}
 						ptr += rdlen;
+					}
+				} else if (a.type == DNS_TYPE::SOA) {
+					std::shared_ptr<SOA> soa = std::make_shared<SOA>();
+					if (rdlen > 0) {
+						int n = decode_name(begin, end, ptr, &soa->nameserver);
+						if (n > 0 && !soa->nameserver.empty()) {
+							ptr += n;
+						}
+					}
+					if (rdlen > 0) {
+						int n = decode_name(begin, end, ptr, &soa->mailbox);
+						if (n > 0 && !soa->mailbox.empty()) {
+							ptr += n;
+						}
+					}
+					if (ptr + 20 <= end) {
+						uint32_t tmp[5];
+						memcpy(tmp, ptr, 20);
+						ptr += 20;
+						soa->serial = ntohl(tmp[0]);
+						soa->refresh = ntohl(tmp[1]);
+						soa->retry = ntohl(tmp[2]);
+						soa->expire = ntohl(tmp[3]);
+						soa->minimum = ntohl(tmp[4]);
+						soa->nameserver = misc::strtolower(soa->nameserver);
+						soa->mailbox = misc::strtolower(soa->mailbox);
+						it->soa = soa;
 					}
 				}
 			}
@@ -840,6 +905,8 @@ char const *dns_type_to_string(DNS_TYPE type)
 		return "A";
 	case DNS_TYPE::CNAME:
 		return "CNAME";
+	case DNS_TYPE::SOA:
+		return "SOA";
 	case DNS_TYPE::PTR:
 		return "PTR";
 	case DNS_TYPE::AAAA:
@@ -983,12 +1050,9 @@ std::vector<Behind::dns_record_t> Behind::make_records(query_t const &q, std::ve
 		dns_record_t const &a = *it;
 		if (a.clas == DNS_CLASS_IN) {
 			auto size = a.data.size();
-			if ((a.type == DNS_TYPE::A && size == 4) || (a.type == DNS_TYPE::AAAA && size == 16) || (a.type == DNS_TYPE::CNAME && size < 255)) {
-				dns_record_t item;
+			if ((a.type == DNS_TYPE::A && size == 4) || (a.type == DNS_TYPE::AAAA && size == 16) || (a.type == DNS_TYPE::CNAME && size < 255) || a.type == DNS_TYPE::SOA) {
+				dns_record_t item = a;
 				item.name = stricmp(q.request_name.c_str(), a.name.c_str()) == 0 ? q.request_name : misc::strtolower(a.name);
-				item.type = a.type;
-				item.data = a.data;
-				item.ttl = a.ttl;
 				records.push_back(item);
 			}
 		}
@@ -1039,6 +1103,8 @@ void Behind::process(void *private_d, int family)
 					cache = &m->dns_cache.a;
 				} else if (q.type == DNS_TYPE::AAAA) {
 					cache = &m->dns_cache.aaaa;
+				} else if (q.type == DNS_TYPE::SOA) {
+					cache = &m->dns_cache.soa;
 				}
 
 				enum class State {
@@ -1050,7 +1116,7 @@ void Behind::process(void *private_d, int family)
 				State state = State::NONE;
 				if (!q.name.empty()) {
 					if (q.clas == DNS_CLASS_IN) {
-						if (q.type == DNS_TYPE::A || q.type == DNS_TYPE::AAAA) {
+						if (q.type == DNS_TYPE::A || q.type == DNS_TYPE::AAAA || q.type == DNS_TYPE::SOA) {
 							logprintf(LOG_DEFAULT, "Q: %s %s\n", q.name.c_str(), qtype_str);
 							state = State::FORWARD;
 							{
@@ -1159,13 +1225,21 @@ void Behind::process(void *private_d, int family)
 				} else if (state == State::NODATA_AAAA) {
 					auto h = header;
 					h.flags = 0x8000;
-					send_packet(private_d, family, h, questions, {}, false, false);
+					std::vector<dns_record_t> rec;
+					rec.emplace_back();
+					dns_record_t *r = &rec.back();
+					r->name = q.name;
+					r->type = DNS_TYPE::SOA;
+					r->clas = q.clas;
+					r->ttl = 300;
+					r->soa = fake_soa();
+					send_packet(private_d, family, h, questions, rec, false, false);
 				}
 			}
 		} else if (header.flags & 0x8000) { // response
 			query_t q;
 			if (take_query(header.id, &q)) {
-				if (q.type == DNS_TYPE::A || q.type == DNS_TYPE::AAAA) {
+				if (q.type == DNS_TYPE::A || q.type == DNS_TYPE::AAAA || q.type == DNS_TYPE::SOA) {
 					if (questions.size() == 1 && questions.front().name == q.forward_name) {
 						std::string qname = questions.front().name;
 						qname = stricmp(q.request_name.c_str(), qname.c_str()) == 0 ? q.request_name : misc::strtolower(qname);
@@ -1178,6 +1252,8 @@ void Behind::process(void *private_d, int family)
 								cache = &m->dns_cache.a;
 							} else if (q.type == DNS_TYPE::AAAA) {
 								cache = &m->dns_cache.aaaa;
+							} else if (q.type == DNS_TYPE::SOA) {
+								cache = &m->dns_cache.soa;
 							}
 							if (cache) {
 								cache->insert(q.forward_name, records);
