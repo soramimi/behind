@@ -58,6 +58,11 @@ private:
 	struct Private;
 	Private *m;
 
+	enum class SocketMode {
+		SELECT,
+		EPOLL,
+	};
+
 	struct Pointers {
 		char *begin;
 		char *end;
@@ -92,17 +97,19 @@ private:
 	bool is_nxdomain(const std::string &name) const;
 
 	static std::vector<dns_record_t> make_records(const query_t &q, const std::vector<dns_record_t> &answers);
-	struct ResponseData;
-	static ResponseData make_response(void *private_d, const dns_header_t &header, const std::vector<question_t> &questions, const std::vector<dns_record_t> &rec);
-	bool send_response(void *private_d, int family, const dns_header_t &header, std::vector<question_t> const &q, std::vector<dns_record_t> const &rec, bool forward, bool from_cache);
+	struct PacketData;
+	static PacketData make_packet(void *private_d, const dns_header_t &header, const std::vector<question_t> &questions, const std::vector<dns_record_t> &rec);
+	bool send_packet(void *private_d, int family, const dns_header_t &header, std::vector<question_t> const &q, std::vector<dns_record_t> const &rec, bool forward, bool from_cache);
 
 	void process(void *private_d, int family);
 
-	void init_socket4(void *private_d);
-	void init_socket6(void *private_d);
+	void init_socket4(void *private_in);
+	void init_socket6(void *private_in);
 	const InetResolver::Addr *find_host(const std::string &name) const;
 	void add_hosts(const std::map<std::string, std::string> &hosts);
 	uint32_t next_local_transaction_id();
+	int epoll_ctl_add(epoll_event *e);
+	int epoll_ctl_del(epoll_event *e);
 public:
 	Behind(Option const &opt);
 	~Behind();

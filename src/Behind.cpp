@@ -63,10 +63,11 @@ struct Behind::dns_header_t {
 };
 
 struct Behind::query_t {
+	int forward_fd;
+	uint64_t timestamp;
 	uint32_t local_transaction_id;
 	uint16_t upstream_id;
 	uint16_t requester_id;
-	uint64_t time;
 	DNS_TYPE type = DNS_TYPE::A;
 	sa_family_t client_family = AF_INET;
 	union {
@@ -214,6 +215,11 @@ struct Behind::Private {
 	uint32_t local_transaction_id = 0;
 	TransactionIdGenerator txid_gen;
 	InetResolver resolver;
+
+	Behind::SocketMode socket_mode;
+	int epoll_fd = -1;
+	std::vector<epoll_event> epoll_events{10};
+
 	int ttl = 5 * 60;
 	struct {
 		Behind::dns_cache_t a;
@@ -223,11 +229,15 @@ struct Behind::Private {
 	std::vector<Forwarder> forwarder;
 
 	struct D {
-		int sock4;
-		int sock6;
-		struct sockaddr_in sa4;
-		struct sockaddr_in6 sa6;
-
+		struct In {
+			int sock_fd;
+			int family;
+			union {
+				struct sockaddr_in sa4;
+				struct sockaddr_in6 sa6;
+			};
+			struct epoll_event ev;
+		} in4, in6;
 	};
 };
 
@@ -617,7 +627,7 @@ void Behind::clean()
 	size_t i = m->queries.size();
 	while (i > 0) {
 		i--;
-		if (now - m->queries[i].time >= 1000) { // 1 second
+		if (now - m->queries[i].timestamp >= 1000) { // 1 second
 			m->queries.erase(m->queries.begin() + i);
 		}
 	}
@@ -834,7 +844,7 @@ char const *dns_type_to_string(DNS_TYPE type)
 	}
 }
 
-struct Behind::ResponseData {
+struct Behind::PacketData {
 	Behind::question_t q;
 	std::vector<char> buffer;
 	operator bool () const
@@ -843,9 +853,9 @@ struct Behind::ResponseData {
 	}
 };
 
-Behind::ResponseData Behind::make_response(void *private_d, dns_header_t const &header, std::vector<question_t> const &questions, std::vector<dns_record_t> const &rec)
+Behind::PacketData Behind::make_packet(void *private_d, dns_header_t const &header, std::vector<question_t> const &questions, std::vector<dns_record_t> const &rec)
 {
-	ResponseData ret;
+	PacketData ret;
 	std::map<std::string, size_t> namemap;
 
 	uint16_t ancount = uint16_t(std::min(rec.size(), (size_t)16));
@@ -872,21 +882,21 @@ Behind::ResponseData Behind::make_response(void *private_d, dns_header_t const &
 	return ret;
 }
 
-bool Behind::send_response(void *private_d, int family, dns_header_t const &header, std::vector<question_t> const &questions, std::vector<dns_record_t> const &rec, bool forward, bool from_cache)
+bool Behind::send_packet(void *private_d, int family, dns_header_t const &header, std::vector<question_t> const &questions, std::vector<dns_record_t> const &rec, bool forward, bool from_cache)
 {
 	Private::D *d = static_cast<Private::D *>(private_d);
 
-	ResponseData response = make_response(private_d, header, questions, rec);
-	if (!response) return false;
+	PacketData packet = make_packet(private_d, header, questions, rec);
+	if (!packet) return false;
 
 	std::string client;
 	SendTo sender;
 	if (family == AF_INET) {
-		sender.set_sa4(d->sock4, &d->sa4);
+		sender.set_sa4(d->in4.sock_fd, &d->in4.sa4);
 	} else if (family == AF_INET6) {
-		sender.set_sa6(d->sock6, &d->sa6);
+		sender.set_sa6(d->in6.sock_fd, &d->in6.sa6);
 	}
-	bool ok = sender.sendto(&response.buffer[0], response.buffer.size()) == response.buffer.size();
+	bool ok = sender.sendto(&packet.buffer[0], packet.buffer.size()) == packet.buffer.size();
 	client = sender.addr_to_string();
 
 	char const *comment = "";
@@ -894,19 +904,19 @@ bool Behind::send_response(void *private_d, int family, dns_header_t const &head
 		comment = " (from cache)";
 	}
 
-	char const *qtype = dns_type_to_string(response.q.type);
+	char const *qtype = dns_type_to_string(packet.q.type);
 	if (forward) {
-		logprintf(LOG_DEFAULT, "F: %s\n", response.q.name.c_str());
+		logprintf(LOG_DEFAULT, "F: %s\n", packet.q.name.c_str());
 	} else if ((header.flags & 0x000f) == 3) { // NXDOMAIN
 		logprintf(LOG_DEFAULT, "R: <<%s %s NXDOMAIN>> to %s\n"
-				  , response.q.name.c_str()
+				  , packet.q.name.c_str()
 				  , qtype
 				  , client.c_str()
 				  );
 	} else if (rec.size() > 0) {
 		for (int i = 0; i < rec.size(); i++) {
 			dns_record_t const &r = rec[i];
-			std::string name = misc::strtolower(response.q.name);
+			std::string name = misc::strtolower(packet.q.name);
 			std::string addr_str = r.to_string();
 			logprintf(LOG_DEFAULT, "R: <<%s %s %s>> to %s%s\n"
 					  , name.c_str()
@@ -918,7 +928,7 @@ bool Behind::send_response(void *private_d, int family, dns_header_t const &head
 		}
 	} else {
 		logprintf(LOG_DEFAULT, "R: <<%s %s NOANSWER>> to %s%s\n"
-				  , response.q.name.c_str()
+				  , packet.q.name.c_str()
 				  , qtype
 				  , client.c_str()
 				  , comment
@@ -927,32 +937,32 @@ bool Behind::send_response(void *private_d, int family, dns_header_t const &head
 
 	if (0) {
 		if (header.flags & 0x8000) {
-			if (stricmp(response.q.name.c_str(), "www.google.com") == 0) {
-				char const *path = "testcase/google_response.bin";
-				writefile(path, &response.buffer);
-			} else if (stricmp(response.q.name.c_str(), "doubleclick.net") == 0) {
-				char const *path = "testcase/doubleclick_response.bin";
-				writefile(path, &response.buffer);
-			} else if (stricmp(response.q.name.c_str(), "www.soramimi.jp") == 0) {
-				char const *path = "testcase/soramimi_response.bin";
-				writefile(path, &response.buffer);
-			} else if (stricmp(response.q.name.c_str(), "www.amazon.co.jp") == 0) {
-				char const *path = "testcase/amazon_response.bin";
-				writefile(path, &response.buffer);
+			if (stricmp(packet.q.name.c_str(), "www.google.com") == 0) {
+				char const *path = "testcase/google_packet.bin";
+				writefile(path, &packet.buffer);
+			} else if (stricmp(packet.q.name.c_str(), "doubleclick.net") == 0) {
+				char const *path = "testcase/doubleclick_packet.bin";
+				writefile(path, &packet.buffer);
+			} else if (stricmp(packet.q.name.c_str(), "www.soramimi.jp") == 0) {
+				char const *path = "testcase/soramimi_packet.bin";
+				writefile(path, &packet.buffer);
+			} else if (stricmp(packet.q.name.c_str(), "www.amazon.co.jp") == 0) {
+				char const *path = "testcase/amazon_packet.bin";
+				writefile(path, &packet.buffer);
 			}
 		} else {
-			if (stricmp(response.q.name.c_str(), "www.google.com") == 0) {
+			if (stricmp(packet.q.name.c_str(), "www.google.com") == 0) {
 				char const *path = "testcase/google_query.bin";
-				writefile(path, &response.buffer);
-			} else if (stricmp(response.q.name.c_str(), "doubleclick.net") == 0) {
+				writefile(path, &packet.buffer);
+			} else if (stricmp(packet.q.name.c_str(), "doubleclick.net") == 0) {
 				char const *path = "testcase/doubleclick_query.bin";
-				writefile(path, &response.buffer);
-			} else if (stricmp(response.q.name.c_str(), "www.soramimi.jp") == 0) {
+				writefile(path, &packet.buffer);
+			} else if (stricmp(packet.q.name.c_str(), "www.soramimi.jp") == 0) {
 				char const *path = "testcase/soramimi_query.bin";
-				writefile(path, &response.buffer);
-			} else if (stricmp(response.q.name.c_str(), "www.amazon.co.jp") == 0) {
+				writefile(path, &packet.buffer);
+			} else if (stricmp(packet.q.name.c_str(), "www.amazon.co.jp") == 0) {
 				char const *path = "testcase/amazon_query.bin";
-				writefile(path, &response.buffer);
+				writefile(path, &packet.buffer);
 			}
 		}
 	}
@@ -997,12 +1007,13 @@ void Behind::process(void *private_d, int family)
 
 	char buf[1500];
 	if (family == AF_INET || family == AF_INET6) {
-		socklen_t salen = sizeof(d->sa4);
 		int len = 0;
 		if (family == AF_INET) {
-			len = recvfrom(d->sock4, buf, sizeof(buf), 0, (struct sockaddr *)&d->sa4, &salen);
+			socklen_t salen = sizeof(sockaddr_in);
+			len = recvfrom(d->in4.sock_fd, buf, sizeof(buf), 0, (struct sockaddr *)&d->in4.sa4, &salen);
 		} else if (family == AF_INET6) {
-			len = recvfrom(d->sock6, buf, sizeof(buf), 0, (struct sockaddr *)&d->sa6, &salen);
+			socklen_t salen = sizeof(sockaddr_in6);
+			len = recvfrom(d->in6.sock_fd, buf, sizeof(buf), 0, (struct sockaddr *)&d->in6.sa6, &salen);
 		}
 		if (len < 12 || len > (int)sizeof(buf)) {
 			return;
@@ -1013,6 +1024,7 @@ void Behind::process(void *private_d, int family)
 		std::vector<dns_record_t> answers;
 		parse_dns_packet(buf, buf + len, &header, &questions, &answers);
 
+		fprintf(stderr, "---%08x\n", (int)header.flags);
 		if ((header.flags & 0xf800) == 0x0000) { // standard query
 			for (auto it = questions.begin(); it != questions.end(); it++) {
 				question_t const &q = *it;
@@ -1053,7 +1065,7 @@ void Behind::process(void *private_d, int family)
 										}
 										auto h = header;
 										h.flags = 0x8180;
-										send_response(d, family, h, {q}, rec, false, false);
+										send_packet(d, family, h, {q}, rec, false, false);
 									} else {
 										state = State::NXDOMAIN;
 									}
@@ -1069,7 +1081,7 @@ void Behind::process(void *private_d, int family)
 									if (entry) {
 										auto h = header;
 										h.flags = 0x8180;
-										send_response(d, family, h, {q}, entry->records, false, true);
+										send_packet(d, family, h, {q}, entry->records, false, true);
 										state = State::NONE;
 									}
 								}
@@ -1089,22 +1101,21 @@ void Behind::process(void *private_d, int family)
 										q2.name = query_name;
 										Private::D d2 = *d;
 										if (forwarder.af_type == AF_INET) {
-											init_sa4(&d2.sa4, (in_addr const *)forwarder.addr, forwarder.port);
+											init_sa4(&d2.in4.sa4, (in_addr const *)forwarder.addr, forwarder.port);
 										} else if (forwarder.af_type == AF_INET6) {
-											init_sa6(&d2.sa6, (in6_addr const *)forwarder.addr, forwarder.port);
+											init_sa6(&d2.in6.sa6, (in6_addr const *)forwarder.addr, forwarder.port);
 										}
-										if (send_response(&d2, forwarder.af_type, h, {q2}, {}, true, false)) {
+										if (send_packet(&d2, forwarder.af_type, h, {q2}, {}, true, false)) {
 											query_t t;
+											t.timestamp = misc::get_tick_count();
 											t.local_transaction_id = local_transaction_id;
-											t.time = misc::get_tick_count();
 											t.requester_id = header.id;
 											t.upstream_id = h.id;
 											t.type = q.type;
-											t.client_family = family;
 											if (family == AF_INET) {
-												t.client_sa4 = d->sa4;
+												t.client_sa4 = d->in4.sa4;
 											} else if (family == AF_INET6) {
-												t.client_sa6 = d->sa6;
+												t.client_sa6 = d->in6.sa6;
 											}
 											t.request_name = q.name;
 											t.forward_name = query_name;
@@ -1137,7 +1148,7 @@ void Behind::process(void *private_d, int family)
 				if (state == State::NXDOMAIN) {
 					auto h = header;
 					h.flags = 0x8003;
-					send_response(private_d, family, h, questions, {}, false, false);
+					send_packet(private_d, family, h, questions, {}, false, false);
 				}
 			}
 		} else if (header.flags & 0x8000) { // response
@@ -1162,15 +1173,15 @@ void Behind::process(void *private_d, int family)
 							}
 						}
 						auto d2 = *d;
-						d2.sa4 = q.client_sa4;
-						d2.sa6 = q.client_sa6;
+						d2.in4.sa4 = q.client_sa4;
+						d2.in6.sa6 = q.client_sa6;
 						auto h = header;
 						h.id = q.requester_id;
 						std::vector<question_t> questions2 = questions;
 						for (question_t &q3 : questions2) {
 							q3.name = stricmp(q.request_name.c_str(), q3.name.c_str()) == 0 ? q.request_name : misc::strtolower(q3.name);
 						}
-						send_response(&d2, q.client_family, h, questions2, records, false, false);
+						send_packet(&d2, q.client_family, h, questions2, records, false, false);
 					}
 				}
 			}
@@ -1195,11 +1206,11 @@ void Behind::test()
 
 	file = "testcase/google_response.bin";
 	if (readfile(file, &buf) && !buf.empty()) {
-		char const *begin = buf.data();
-		char const *end = begin + buf.size();
 		Behind::dns_header_t header;
 		std::vector<Behind::question_t> questions;
 		std::vector<Behind::dns_record_t> answers;
+		char const *begin = buf.data();
+		char const *end = begin + buf.size();
 		parse_dns_packet(begin, end, &header, &questions, &answers);
 		logprintf(LOG_DEFAULT, "TEST: parsed <%s>, %d questions and %d answers\n", file, (int)questions.size(), (int)answers.size());
 
@@ -1225,7 +1236,7 @@ void Behind::test()
 			query_t q;
 			q.request_name = questions[0].name;
 			std::vector<dns_record_t> rec = make_records(q, answers);
-			ResponseData response = make_response(&d, header, questions, rec);
+			PacketData response = make_packet(&d, header, questions, rec);
 
 			Behind::dns_header_t header2;
 			std::vector<Behind::question_t> questions2;
@@ -1245,11 +1256,11 @@ void Behind::test()
 
 	file = "testcase/amazon_response.bin";
 	if (readfile(file, &buf) && !buf.empty()) {
-		char const *begin = buf.data();
-		char const *end = begin + buf.size();
 		Behind::dns_header_t header;
 		std::vector<Behind::question_t> questions;
 		std::vector<Behind::dns_record_t> answers;
+		char const *begin = buf.data();
+		char const *end = begin + buf.size();
 		parse_dns_packet(begin, end, &header, &questions, &answers);
 		logprintf(LOG_DEFAULT, "TEST: parsed <%s>, %d questions and %d answers\n", file, (int)questions.size(), (int)answers.size());
 
@@ -1287,7 +1298,7 @@ void Behind::test()
 			query_t q;
 			q.request_name = questions[0].name;
 			std::vector<dns_record_t> rec = make_records(q, answers);
-			ResponseData response = make_response(&d, header, questions, rec);
+			PacketData response = make_packet(&d, header, questions, rec);
 
 			Behind::dns_header_t header2;
 			std::vector<Behind::question_t> questions2;
@@ -1307,11 +1318,11 @@ void Behind::test()
 
 	file = "testcase/doubleclick_response.bin";
 	if (readfile(file, &buf) && !buf.empty()) {
-		char const *begin = buf.data();
-		char const *end = begin + buf.size();
 		Behind::dns_header_t header;
 		std::vector<Behind::question_t> questions;
 		std::vector<Behind::dns_record_t> answers;
+		char const *begin = buf.data();
+		char const *end = begin + buf.size();
 		parse_dns_packet(begin, end, &header, &questions, &answers);
 		logprintf(LOG_DEFAULT, "TEST: parsed <%s>, %d questions and %d answers\n", file, (int)questions.size(), (int)answers.size());
 
@@ -1327,9 +1338,9 @@ void Behind::test()
 	}
 }
 
-void Behind::init_socket4(void *private_d)
+void Behind::init_socket4(void *private_in)
 {
-	Private::D *d = static_cast<Private::D *>(private_d);
+	Private::D::In *in = static_cast<Private::D::In *>(private_in);
 
 	int sock = socket(PF_INET, SOCK_DGRAM, 0);
 	if (sock == INVALID_SOCKET) {
@@ -1343,17 +1354,18 @@ void Behind::init_socket4(void *private_d)
 		setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
 	}
 
-	init_sa4(&d->sa4, nullptr, listen_port());
-	if (bind(sock, (struct sockaddr *)&d->sa4, sizeof(d->sa4)) == SOCKET_ERROR) {
+	init_sa4(&in->sa4, nullptr, listen_port());
+	if (bind(sock, (struct sockaddr *)&in->sa4, sizeof(in->sa4)) == SOCKET_ERROR) {
 		throw STRERROR("bind: ");
 	}
 
-	d->sock4 = sock;
+	in->sock_fd = sock;
+	in->family = AF_INET;
 }
 
-void Behind::init_socket6(void *private_d)
+void Behind::init_socket6(void *private_in)
 {
-	Private::D *d = static_cast<Private::D *>(private_d);
+	Private::D::In *in = static_cast<Private::D::In *>(private_in);
 
 	int sock = socket(PF_INET6, SOCK_DGRAM, 0);
 	if (sock == INVALID_SOCKET) {
@@ -1364,16 +1376,17 @@ void Behind::init_socket6(void *private_d)
 
 	{
 		int yes = 1;
-		setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&yes, sizeof(yes));
 		setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
+		setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&yes, sizeof(yes));
 	}
 
-	init_sa6(&d->sa6, nullptr, listen_port());
-	if (bind(sock, (struct sockaddr *)&d->sa6, sizeof(d->sa6)) == SOCKET_ERROR) {
+	init_sa6((sockaddr_in6 *)&in->sa6, nullptr, listen_port());
+	if (bind(sock, (struct sockaddr *)&in->sa6, sizeof(in->sa6)) == SOCKET_ERROR) {
 		throw STRERROR("bind: ");
 	}
 
-	d->sock6 = sock;
+	in->sock_fd = sock;
+	in->family = AF_INET6;
 }
 
 void Behind::add_hosts(std::map<std::string, std::string> const &hosts)
@@ -1391,79 +1404,80 @@ void Behind::add_hosts(std::map<std::string, std::string> const &hosts)
 	}
 }
 
+int Behind::epoll_ctl_add(struct epoll_event *e)
+{
+	return epoll_ctl(m->epoll_fd, EPOLL_CTL_ADD, e->data.fd, e);
+}
+
+int Behind::epoll_ctl_del(struct epoll_event *e)
+{
+	return epoll_ctl(m->epoll_fd, EPOLL_CTL_DEL, e->data.fd, e);
+}
+
 void Behind::main()
 {
-	Private::D d;
-
 	add_hosts(m->option.hosts);
 
-	enum Mode {
-		SELECT,
-		EPOLL,
-	};
-	const Mode mode = EPOLL;
+	Private::D d;
+	init_socket4(&d.in4);
+	init_socket6(&d.in6);
 
-	init_socket4(&d);
-	init_socket6(&d);
+	m->socket_mode == SocketMode::EPOLL;
 
-	if (mode == SELECT) {
-
+	if (m->socket_mode == SocketMode::SELECT) {
 		logprintf(LOG_DEFAULT, "mode: SELECT\n");
 
 		fd_set fds, readfds;
 		FD_ZERO(&readfds);
-		FD_SET(d.sock4, &readfds);
-		FD_SET(d.sock6, &readfds);
-		int maxfd = std::max(d.sock4, d.sock6);
+		FD_SET(d.in4.sock_fd, &readfds);
+		FD_SET(d.in6.sock_fd, &readfds);
+		int maxfd = std::max(d.in4.sock_fd, d.in6.sock_fd);
 
 		while (1) {
 			memcpy(&fds, &readfds, sizeof(fd_set));
-			select(maxfd + 1, &fds, NULL, NULL, NULL);
+			select(maxfd + 1, &fds, nullptr, nullptr, nullptr);
 
-			if (FD_ISSET(d.sock4, &fds)) {
+			if (FD_ISSET(d.in4.sock_fd, &fds)) {
 				process(&d, AF_INET);
 			}
-			if (FD_ISSET(d.sock6, &fds)) {
+			if (FD_ISSET(d.in6.sock_fd, &fds)) {
 				process(&d, AF_INET6);
 			}
 
 			clean();
 		}
-	} else if (mode == EPOLL) {
-
+	} else if (m->socket_mode == SocketMode::EPOLL) {
 		logprintf(LOG_DEFAULT, "mode: EPOLL\n");
 
-		struct epoll_event events[2];
-		struct epoll_event ev4 = {};
-		struct epoll_event ev6 = {};
-
-		int epoll_fd = epoll_create1(0);
-		if (epoll_fd == -1) {
+		m->epoll_fd = epoll_create1(0);
+		if (m->epoll_fd == -1) {
 			throw STRERROR("epoll_create1: ");
 		}
 
-		auto SetupEpoll = [](int sock, int epoll_fd, struct epoll_event *e){
-			e->events = EPOLLIN;
-			e->data.fd = sock;
-			if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, e) == -1) {
+		auto AddEpoll = [this](Private::D::In *in){
+			in->ev = {};
+			in->ev.events = EPOLLIN;
+			in->ev.data.fd = in->sock_fd;
+			if (epoll_ctl_add(&in->ev) == -1) {
 				throw STRERROR("epoll_ctl: ");
 			}
 		};
-		SetupEpoll(d.sock4, epoll_fd, &ev4);
-		SetupEpoll(d.sock6, epoll_fd, &ev6);
+		AddEpoll(&d.in4);
+		AddEpoll(&d.in6);
 
 		while (1) {
-			int nfds = epoll_wait(epoll_fd, events, 2, -1);
-			if (nfds == -1) {
+			int n = epoll_wait(m->epoll_fd, m->epoll_events.data(), m->epoll_events.size(), -1);
+			if (n == -1) {
 				if (errno == EINTR) {
 					continue;
 				}
 				throw STRERROR("epoll_wait: ");
 			}
-			for (int i = 0; i < nfds; i++) {
-				if (events[i].data.fd == d.sock4) {
+			for (int i = 0; i < n; i++) {
+				auto fd = m->epoll_events[i].data.fd;
+				if (fd == d.in4.sock_fd) {
 					process(&d, AF_INET);
-				} else if (events[i].data.fd == d.sock6) {
+				} else if (fd == d.in6.sock_fd) {
 					process(&d, AF_INET6);
 				}
 			}
@@ -1471,8 +1485,8 @@ void Behind::main()
 		}
 	}
 
-	closesocket(d.sock4);
-	closesocket(d.sock6);
+	closesocket(d.in4.sock_fd);
+	closesocket(d.in6.sock_fd);
 }
 
 
