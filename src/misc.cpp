@@ -47,3 +47,20 @@ std::string misc::realpath(std::string const &path)
 	return realpath(path.c_str());
 }
 
+size_t misc::parse_int(char const *p, int *out)
+{
+	unsigned long int val = 0;
+	size_t i = 0;
+	while (p[i]) {
+		int c = (unsigned char)p[i];
+		if (!isdigit(c)) break;
+		val = val * 10 + (c - '0');
+		if (val > std::numeric_limits<int>::max()) {
+			return 0;
+		}
+		i++;
+	}
+	*out = (int)val;
+	return i;
+}
+

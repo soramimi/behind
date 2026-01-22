@@ -16,6 +16,8 @@ std::string trimmed(char const *begin, char const *end);
 std::string realpath(char const *path);
 std::string realpath(std::string const &path);
 
+size_t parse_int(char const *p, int *out);
+
 }
 
 #endif // MISC_H

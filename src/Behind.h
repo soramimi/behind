@@ -10,6 +10,8 @@
 #include <sys/socket.h>
 #include <unordered_map>
 
+#define DEFAUT_DNS_PORT 53
+#define DEFAUT_LISTEN_PORT 5300
 
 class Hosts {
 private:
@@ -20,6 +22,7 @@ public:
 };
 
 struct Option {
+	int listen_port = DEFAUT_LISTEN_PORT;
 	std::string working_dir = "/var/lib/behind";
 	std::string log_file = "/var/log/behind/behind.log";
 	std::vector<std::string> forward_addr;
@@ -40,7 +43,7 @@ char const *dns_type_to_string(DNS_TYPE type);
 struct Forwarder {
 	sa_family_t af_type = AF_UNSPEC;
 	uint8_t addr[16] = {0};
-	int port = 53;
+	int port = DEFAUT_DNS_PORT;
 	operator bool () const
 	{
 		return af_type != AF_UNSPEC;
@@ -93,15 +96,15 @@ private:
 	void clean_transaction(uint32_t id);
 	bool take_query(uint16_t id, query_t *out);
 	void push_query(query_t const &query);
-	static void parse_dns_packet(char const *begin, char const *end, dns_header_t *header, std::vector<question_t> *questions, std::vector<dns_record_t> *answers);
+	static void parse_dns_packet(char const *begin, char const *end, dns_header_t *header, std::vector<question_t> *questions, std::vector<dns_record_t> *answers, std::vector<Behind::dns_record_t> *authority);
 
 	bool is_nxdomain(const std::string &name) const;
 	bool is_nodata_aaaa(const std::string &name) const;
 
 	static std::vector<dns_record_t> make_records(const query_t &q, const std::vector<dns_record_t> &answers);
 	struct PacketData;
-	static PacketData make_packet(void *private_d, const dns_header_t &header, const std::vector<question_t> &questions, const std::vector<dns_record_t> &rec);
-	bool send_packet(void *private_d, int family, const dns_header_t &header, std::vector<question_t> const &q, std::vector<dns_record_t> const &rec, bool forward, bool from_cache);
+	static PacketData make_packet(void *private_d, const dns_header_t &header, const std::vector<question_t> &questions, const std::vector<dns_record_t> &answer, std::vector<dns_record_t> const &authority);
+	bool send_packet(void *private_d, int family, const dns_header_t &header, std::vector<question_t> const &q, std::vector<dns_record_t> const &rec, const std::vector<dns_record_t> &authority, bool forward, bool from_cache);
 
 	void process(void *private_d, int family);
 

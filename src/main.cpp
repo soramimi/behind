@@ -27,6 +27,14 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 			opt->working_dir = value;
 			return true;
 		}
+		if (key == "port") {
+			int port = DEFAUT_LISTEN_PORT;
+			if (misc::parse_int(value.c_str(), &port) > 0) {
+				opt->listen_port = port;
+			} else {
+				logprintf(LOG_DEFAULT, "invalid port number: %s\n", value.c_str());
+			}
+		}
 	} else if (section == "logging") {
 		if (key == "file") {
 			opt->log_file = value;

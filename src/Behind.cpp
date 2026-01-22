@@ -288,7 +288,7 @@ bool Behind::eqi(const std::string &l, const std::string &r)
 
 uint16_t Behind::listen_port() const
 {
-	return 5300;
+	return m->option.listen_port;
 }
 
 int Behind::ttl() const
@@ -517,23 +517,6 @@ size_t parse_space(char const *p)
 	return i;
 }
 
-size_t parse_int(char const *p, int *out)
-{
-	unsigned long int val = 0;
-	size_t i = 0;
-	while (p[i]) {
-		int c = (unsigned char)p[i];
-		if (!isdigit(c)) break;
-		val = val * 10 + (c - '0');
-		if (val > std::numeric_limits<int>::max()) {
-			return 0;
-		}
-		i++;
-	}
-	*out = (int)val;
-	return i;
-}
-
 InetResolver::Type parse_inet_address(std::string name, InetResolver::Addr *addr_out, int *port_out)
 {
 	char const *host_begin = name.c_str();
@@ -592,8 +575,8 @@ InetResolver::Type parse_inet_address(std::string name, InetResolver::Addr *addr
 	}
 	if (*p == ':') {
 		p++;
-		int port = 0;
-		size_t len = parse_int(p, &port);
+		int port = DEFAUT_DNS_PORT;
+		size_t len = misc::parse_int(p, &port);
 		if (len > 0) {
 			p += len;
 			if (port_out) {
@@ -637,13 +620,14 @@ void Behind::init_forwarder()
 {
 	for (std::string const &name : m->option.forward_addr) {
 		InetResolver::Addr addr;
-		int port = 53;
+		int port = DEFAUT_DNS_PORT;
 
 		InetResolver::Type type = parse_inet_address(name, &addr, &port);
 
 		m->resolver.resolve(name.c_str(), type, &addr);
 
 		Forwarder forwarder;
+		forwarder.port = port;
 		if (!addr.empty()) {
 			if (type == InetResolver::IN4) {
 				struct in_addr const *p = (struct in_addr const *)addr.to_in4(0);
@@ -701,7 +685,7 @@ void Behind::push_query(const Behind::query_t &query)
 	m->queries.push_back(query);
 }
 
-void Behind::parse_dns_packet(const char *begin, const char *end, Behind::dns_header_t *header, std::vector<Behind::question_t> *questions, std::vector<Behind::dns_record_t> *answers)
+void Behind::parse_dns_packet(const char *begin, const char *end, Behind::dns_header_t *header, std::vector<Behind::question_t> *questions, std::vector<Behind::dns_record_t> *answers, std::vector<Behind::dns_record_t> *authority)
 {
 	char const *ptr = begin;
 
@@ -722,72 +706,76 @@ void Behind::parse_dns_packet(const char *begin, const char *end, Behind::dns_he
 		}
 	}
 
-	for (int i = 0; i < header->ancount; i++) {
-		dns_record_t a;
-		int n = decode_name(begin, end, ptr, &a.name);
-		if (n > 0 && !a.name.empty()) {
-			ptr += n;
-		}
-		if (ptr + 10 <= end) {
-			uint16_t tmp[5];
-			memcpy(tmp, ptr, 10);
-			a.type = (DNS_TYPE)ntohs(tmp[0]);
-			a.clas = ntohs(tmp[1]);
-			memcpy(&a.ttl, tmp + 2, 4); // a.ttl = ntohl(*(uint32_t *)&tmp[2]); // -Wstrict-aliasing
-			a.ttl = ntohl(a.ttl);
-			uint16_t rdlen = ntohs(tmp[4]);
-			ptr += 10;
-			if (ptr + rdlen <= end) {
-				auto it = answers->insert(answers->end(), dns_record_t());
-				*it = a;
-				if ((a.type == DNS_TYPE::A && rdlen == 4) || (a.type == DNS_TYPE::AAAA && rdlen == 16)) {
-					if (rdlen > 0) {
-						it->data.resize(rdlen);
-						memcpy(it->data.data(), ptr, rdlen);
-						ptr += rdlen;
-					}
-				} else if (a.type == DNS_TYPE::CNAME && rdlen < 255) {
-					if (rdlen > 0) {
-						std::string name;
-						int n = decode_name(begin, end, ptr, &name);
-						if (n > 0 && !name.empty()) {
-							name = misc::strtolower(name);
-							it->data.resize(name.size());
-							memcpy(it->data.data(), name.c_str(), name.size());
+	auto ParseRecord = [&](int count, std::vector<Behind::dns_record_t> *answers){
+		for (int i = 0; i < count; i++) {
+			dns_record_t a;
+			int n = decode_name(begin, end, ptr, &a.name);
+			if (n > 0 && !a.name.empty()) {
+				ptr += n;
+			}
+			if (ptr + 10 <= end) {
+				uint16_t tmp[5];
+				memcpy(tmp, ptr, 10);
+				a.type = (DNS_TYPE)ntohs(tmp[0]);
+				a.clas = ntohs(tmp[1]);
+				memcpy(&a.ttl, tmp + 2, 4); // a.ttl = ntohl(*(uint32_t *)&tmp[2]); // -Wstrict-aliasing
+				a.ttl = ntohl(a.ttl);
+				uint16_t rdlen = ntohs(tmp[4]);
+				ptr += 10;
+				if (ptr + rdlen <= end) {
+					auto it = answers->insert(answers->end(), dns_record_t());
+					*it = a;
+					if ((a.type == DNS_TYPE::A && rdlen == 4) || (a.type == DNS_TYPE::AAAA && rdlen == 16)) {
+						if (rdlen > 0) {
+							it->data.resize(rdlen);
+							memcpy(it->data.data(), ptr, rdlen);
+							ptr += rdlen;
 						}
-						ptr += rdlen;
-					}
-				} else if (a.type == DNS_TYPE::SOA) {
-					std::shared_ptr<SOA> soa = std::make_shared<SOA>();
-					if (rdlen > 0) {
-						int n = decode_name(begin, end, ptr, &soa->nameserver);
-						if (n > 0 && !soa->nameserver.empty()) {
-							ptr += n;
+					} else if (a.type == DNS_TYPE::CNAME && rdlen < 255) {
+						if (rdlen > 0) {
+							std::string name;
+							int n = decode_name(begin, end, ptr, &name);
+							if (n > 0 && !name.empty()) {
+								name = misc::strtolower(name);
+								it->data.resize(name.size());
+								memcpy(it->data.data(), name.c_str(), name.size());
+							}
+							ptr += rdlen;
 						}
-					}
-					if (rdlen > 0) {
-						int n = decode_name(begin, end, ptr, &soa->mailbox);
-						if (n > 0 && !soa->mailbox.empty()) {
-							ptr += n;
+					} else if (a.type == DNS_TYPE::SOA) {
+						std::shared_ptr<SOA> soa = std::make_shared<SOA>();
+						if (rdlen > 0) {
+							int n = decode_name(begin, end, ptr, &soa->nameserver);
+							if (n > 0 && !soa->nameserver.empty()) {
+								ptr += n;
+							}
 						}
-					}
-					if (ptr + 20 <= end) {
-						uint32_t tmp[5];
-						memcpy(tmp, ptr, 20);
-						ptr += 20;
-						soa->serial = ntohl(tmp[0]);
-						soa->refresh = ntohl(tmp[1]);
-						soa->retry = ntohl(tmp[2]);
-						soa->expire = ntohl(tmp[3]);
-						soa->minimum = ntohl(tmp[4]);
-						soa->nameserver = misc::strtolower(soa->nameserver);
-						soa->mailbox = misc::strtolower(soa->mailbox);
-						it->soa = soa;
+						if (rdlen > 0) {
+							int n = decode_name(begin, end, ptr, &soa->mailbox);
+							if (n > 0 && !soa->mailbox.empty()) {
+								ptr += n;
+							}
+						}
+						if (ptr + 20 <= end) {
+							uint32_t tmp[5];
+							memcpy(tmp, ptr, 20);
+							ptr += 20;
+							soa->serial = ntohl(tmp[0]);
+							soa->refresh = ntohl(tmp[1]);
+							soa->retry = ntohl(tmp[2]);
+							soa->expire = ntohl(tmp[3]);
+							soa->minimum = ntohl(tmp[4]);
+							soa->nameserver = misc::strtolower(soa->nameserver);
+							soa->mailbox = misc::strtolower(soa->mailbox);
+							it->soa = soa;
+						}
 					}
 				}
 			}
 		}
-	}
+	};
+	ParseRecord(header->ancount, answers);
+	ParseRecord(header->nscount, authority);
 }
 
 static void init_sa4(struct sockaddr_in *sa4, in_addr const *addr, int port)
@@ -925,14 +913,15 @@ struct Behind::PacketData {
 	}
 };
 
-Behind::PacketData Behind::make_packet(void *private_d, dns_header_t const &header, std::vector<question_t> const &questions, std::vector<dns_record_t> const &rec)
+Behind::PacketData Behind::make_packet(void *private_d, dns_header_t const &header, std::vector<question_t> const &questions, std::vector<dns_record_t> const &answer, std::vector<dns_record_t> const &authority)
 {
 	PacketData ret;
 	std::map<std::string, size_t> namemap;
 
-	uint16_t ancount = uint16_t(std::min(rec.size(), (size_t)16));
+	uint16_t ancount = uint16_t(std::min(answer.size(), (size_t)16));
+	uint16_t nscount = uint16_t(std::min(authority.size(), (size_t)16));
 
-	write_dns_header(&ret.buffer, header.id, header.flags, 1, ancount, 0, 0);
+	write_dns_header(&ret.buffer, header.id, header.flags, 1, ancount, nscount, 0);
 
 	for (auto it = questions.begin(); it != questions.end(); it++) {
 		question_t const &q = *it;
@@ -944,7 +933,15 @@ Behind::PacketData Behind::make_packet(void *private_d, dns_header_t const &head
 	}
 
 	for (int i = 0; i < ancount; i++) {
-		dns_record_t const &r = rec[i];
+		dns_record_t const &r = answer[i];
+		std::string name = stricmp(ret.q.name.c_str(), r.name.c_str()) == 0 ? ret.q.name : misc::strtolower(r.name);
+		if (!write_dns_answer_rr(&ret.buffer, &namemap, name, ret.q.clas, r.ttl, r)) {
+			return {};
+		}
+	}
+
+	for (int i = 0; i < nscount; i++) {
+		dns_record_t const &r = authority[i];
 		std::string name = stricmp(ret.q.name.c_str(), r.name.c_str()) == 0 ? ret.q.name : misc::strtolower(r.name);
 		if (!write_dns_answer_rr(&ret.buffer, &namemap, name, ret.q.clas, r.ttl, r)) {
 			return {};
@@ -954,11 +951,11 @@ Behind::PacketData Behind::make_packet(void *private_d, dns_header_t const &head
 	return ret;
 }
 
-bool Behind::send_packet(void *private_d, int family, dns_header_t const &header, std::vector<question_t> const &questions, std::vector<dns_record_t> const &rec, bool forward, bool from_cache)
+bool Behind::send_packet(void *private_d, int family, dns_header_t const &header, std::vector<question_t> const &questions, std::vector<dns_record_t> const &answer, std::vector<dns_record_t> const &authority, bool forward, bool from_cache)
 {
 	Private::D *d = static_cast<Private::D *>(private_d);
 
-	PacketData packet = make_packet(private_d, header, questions, rec);
+	PacketData packet = make_packet(private_d, header, questions, answer, authority);
 	if (!packet) return false;
 
 	std::string client;
@@ -985,9 +982,9 @@ bool Behind::send_packet(void *private_d, int family, dns_header_t const &header
 				  , qtype
 				  , client.c_str()
 				  );
-	} else if (rec.size() > 0) {
-		for (int i = 0; i < rec.size(); i++) {
-			dns_record_t const &r = rec[i];
+	} else if (answer.size() > 0) {
+		for (int i = 0; i < answer.size(); i++) {
+			dns_record_t const &r = answer[i];
 			std::string name = misc::strtolower(packet.q.name);
 			std::string addr_str = r.to_string();
 			logprintf(LOG_DEFAULT, "R: <<%s %s %s>> to %s%s\n"
@@ -1091,8 +1088,10 @@ void Behind::process(void *private_d, int family)
 		dns_header_t header;
 		std::vector<question_t> questions;
 		std::vector<dns_record_t> answers;
-		parse_dns_packet(buf, buf + len, &header, &questions, &answers);
+		std::vector<dns_record_t> authority;
+		parse_dns_packet(buf, buf + len, &header, &questions, &answers, &authority);
 
+		fprintf(stderr, "--- %08x\n", int(header.flags));
 		if ((header.flags & 0xf800) == 0x0000) { // standard query
 			for (auto it = questions.begin(); it != questions.end(); it++) {
 				question_t const &q = *it;
@@ -1136,7 +1135,7 @@ void Behind::process(void *private_d, int family)
 										}
 										auto h = header;
 										h.flags = 0x8180;
-										send_packet(d, family, h, {q}, rec, false, false);
+										send_packet(d, family, h, {q}, rec, {}, false, false);
 									} else {
 										state = State::NXDOMAIN;
 									}
@@ -1154,7 +1153,7 @@ void Behind::process(void *private_d, int family)
 									if (entry) {
 										auto h = header;
 										h.flags = 0x8180;
-										send_packet(d, family, h, {q}, entry->records, false, true);
+										send_packet(d, family, h, {q}, entry->records, {}, false, true);
 										state = State::NONE;
 									}
 								}
@@ -1178,7 +1177,7 @@ void Behind::process(void *private_d, int family)
 										} else if (forwarder.af_type == AF_INET6) {
 											init_sa6(&d2.in6.sa6, (in6_addr const *)forwarder.addr, forwarder.port);
 										}
-										if (send_packet(&d2, forwarder.af_type, h, {q2}, {}, true, false)) {
+										if (send_packet(&d2, forwarder.af_type, h, {q2}, {}, {}, true, false)) {
 											query_t t;
 											t.timestamp = misc::get_tick_count();
 											t.local_transaction_id = local_transaction_id;
@@ -1221,19 +1220,19 @@ void Behind::process(void *private_d, int family)
 				if (state == State::NXDOMAIN) {
 					auto h = header;
 					h.flags = 0x8003;
-					send_packet(private_d, family, h, questions, {}, false, false);
+					send_packet(private_d, family, h, questions, {}, {}, false, false);
 				} else if (state == State::NODATA_AAAA) {
 					auto h = header;
 					h.flags = 0x8000;
-					std::vector<dns_record_t> rec;
-					rec.emplace_back();
-					dns_record_t *r = &rec.back();
+					std::vector<dns_record_t> authority;
+					authority.emplace_back();
+					dns_record_t *r = &authority.back();
 					r->name = q.name;
 					r->type = DNS_TYPE::SOA;
 					r->clas = q.clas;
 					r->ttl = 300;
 					r->soa = fake_soa();
-					send_packet(private_d, family, h, questions, rec, false, false);
+					send_packet(private_d, family, h, questions, {}, authority, false, false);
 				}
 			}
 		} else if (header.flags & 0x8000) { // response
@@ -1268,7 +1267,7 @@ void Behind::process(void *private_d, int family)
 						for (question_t &q3 : questions2) {
 							q3.name = stricmp(q.request_name.c_str(), q3.name.c_str()) == 0 ? q.request_name : misc::strtolower(q3.name);
 						}
-						send_packet(&d2, q.client_family, h, questions2, records, false, false);
+						send_packet(&d2, q.client_family, h, questions2, records, {}, false, false);
 					}
 				}
 			}
@@ -1296,9 +1295,10 @@ void Behind::test()
 		Behind::dns_header_t header;
 		std::vector<Behind::question_t> questions;
 		std::vector<Behind::dns_record_t> answers;
+		std::vector<Behind::dns_record_t> authority;
 		char const *begin = buf.data();
 		char const *end = begin + buf.size();
-		parse_dns_packet(begin, end, &header, &questions, &answers);
+		parse_dns_packet(begin, end, &header, &questions, &answers, &authority);
 		logprintf(LOG_DEFAULT, "TEST: parsed <%s>, %d questions and %d answers\n", file, (int)questions.size(), (int)answers.size());
 
 		EXPECT_EQ(header.flags, 0x8180);
@@ -1323,14 +1323,15 @@ void Behind::test()
 			query_t q;
 			q.request_name = questions[0].name;
 			std::vector<dns_record_t> rec = make_records(q, answers);
-			PacketData response = make_packet(&d, header, questions, rec);
+			PacketData response = make_packet(&d, header, questions, rec, {});
 
 			Behind::dns_header_t header2;
 			std::vector<Behind::question_t> questions2;
 			std::vector<Behind::dns_record_t> answers2;
+			std::vector<Behind::dns_record_t> authority2;
 			char const *begin = response.buffer.data();
 			char const *end = begin + response.buffer.size();
-			parse_dns_packet(begin, end, &header2, &questions2, &answers2);
+			parse_dns_packet(begin, end, &header2, &questions2, &answers2, &authority2);
 
 			EXPECT_EQ(header2.flags, 0x8180);
 			EXPECT_EQ(header2.ancount, 1);
@@ -1346,9 +1347,10 @@ void Behind::test()
 		Behind::dns_header_t header;
 		std::vector<Behind::question_t> questions;
 		std::vector<Behind::dns_record_t> answers;
+		std::vector<Behind::dns_record_t> authority;
 		char const *begin = buf.data();
 		char const *end = begin + buf.size();
-		parse_dns_packet(begin, end, &header, &questions, &answers);
+		parse_dns_packet(begin, end, &header, &questions, &answers, &authority);
 		logprintf(LOG_DEFAULT, "TEST: parsed <%s>, %d questions and %d answers\n", file, (int)questions.size(), (int)answers.size());
 
 		EXPECT_EQ(header.flags, 0x8180);
@@ -1385,14 +1387,15 @@ void Behind::test()
 			query_t q;
 			q.request_name = questions[0].name;
 			std::vector<dns_record_t> rec = make_records(q, answers);
-			PacketData response = make_packet(&d, header, questions, rec);
+			PacketData response = make_packet(&d, header, questions, rec, {});
 
 			Behind::dns_header_t header2;
 			std::vector<Behind::question_t> questions2;
 			std::vector<Behind::dns_record_t> answers2;
+			std::vector<Behind::dns_record_t> authority2;
 			char const *begin = response.buffer.data();
 			char const *end = begin + response.buffer.size();
-			parse_dns_packet(begin, end, &header2, &questions2, &answers2);
+			parse_dns_packet(begin, end, &header2, &questions2, &answers2, &authority2);
 
 			EXPECT_EQ(header2.flags, 0x8180);
 			EXPECT_EQ(header2.ancount, 3);
@@ -1408,9 +1411,10 @@ void Behind::test()
 		Behind::dns_header_t header;
 		std::vector<Behind::question_t> questions;
 		std::vector<Behind::dns_record_t> answers;
+		std::vector<Behind::dns_record_t> authority;
 		char const *begin = buf.data();
 		char const *end = begin + buf.size();
-		parse_dns_packet(begin, end, &header, &questions, &answers);
+		parse_dns_packet(begin, end, &header, &questions, &answers, &authority);
 		logprintf(LOG_DEFAULT, "TEST: parsed <%s>, %d questions and %d answers\n", file, (int)questions.size(), (int)answers.size());
 
 		EXPECT_EQ(header.flags, 0x8003); // NXDOMAIN
@@ -1509,7 +1513,7 @@ void Behind::main()
 	init_socket4(&d.in4);
 	init_socket6(&d.in6);
 
-	m->socket_mode == SocketMode::EPOLL;
+	m->socket_mode = SocketMode::EPOLL;
 
 	if (m->socket_mode == SocketMode::SELECT) {
 		logprintf(LOG_DEFAULT, "mode: SELECT\n");
