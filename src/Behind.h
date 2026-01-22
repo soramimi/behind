@@ -95,6 +95,7 @@ private:
 	static void parse_dns_packet(char const *begin, char const *end, dns_header_t *header, std::vector<question_t> *questions, std::vector<dns_record_t> *answers);
 
 	bool is_nxdomain(const std::string &name) const;
+	bool is_nodata_aaaa(const std::string &name) const;
 
 	static std::vector<dns_record_t> make_records(const query_t &q, const std::vector<dns_record_t> &answers);
 	struct PacketData;

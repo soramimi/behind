@@ -47,6 +47,10 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 			opt->domain_filter.add_nxdomain(value);
 			return true;
 		}
+		if (key == "nodata-aaaa") {
+			opt->domain_filter.add_nodata_aaaa(value);
+			return true;
+		}
 	} else if (section == "hosts") {
 		opt->hosts[key] = value;
 		return true;

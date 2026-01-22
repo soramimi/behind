@@ -70,14 +70,14 @@ DomainFilter::Kind DomainFilter::find(std::string const &name) const
 	return NORMAL;
 }
 
-void DomainFilter::add_nxdomain(std::string const &name)
+void DomainFilter::add_entry(std::string const &name, Kind kind)
 {
 	std::string loname = misc::strtolower(name);
 	if (loname.size() > 2) {
 		if (loname[0] == '/' && loname[loname.size() - 1] == '/') {
 			// regex match
 			Item item;
-			item.kind = NXDOMAIN;
+			item.kind = kind;
 			item.name = loname.substr(1, loname.size() - 2);
 			regex_list_.push_back(item);
 			return;
@@ -86,7 +86,7 @@ void DomainFilter::add_nxdomain(std::string const &name)
 			// prefix match
 			std::string key = domain_prefix_key(loname);
 			Item item;
-			item.kind = NXDOMAIN;
+			item.kind = kind;
 			item.name = loname.substr(0, loname.size() - 1);
 			auto it = prefix_map_.find(key);
 			if (it == prefix_map_.end()) {
@@ -99,7 +99,7 @@ void DomainFilter::add_nxdomain(std::string const &name)
 	{
 		// suffix match
 		Item item;
-		item.kind = NXDOMAIN;
+		item.kind = kind;
 		if (loname[0] == '*' || loname[1] == '.') {
 			item.name = loname.substr(2);
 		} else {
@@ -115,5 +115,15 @@ void DomainFilter::add_nxdomain(std::string const &name)
 			return;
 		}
 	}
+}
+
+void DomainFilter::add_nxdomain(std::string const &name)
+{
+	add_entry(name, Kind::NXDOMAIN);
+}
+
+void DomainFilter::add_nodata_aaaa(const std::string &name)
+{
+	add_entry(name, Kind::NODATA_AAAA);
 }
 

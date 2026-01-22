@@ -828,6 +828,11 @@ bool Behind::is_nxdomain(std::string const &name) const
 	return m->option.domain_filter.find(name) == DomainFilter::NXDOMAIN;
 }
 
+bool Behind::is_nodata_aaaa(std::string const &name) const
+{
+	return m->option.domain_filter.find(name) == DomainFilter::NODATA_AAAA;
+}
+
 char const *dns_type_to_string(DNS_TYPE type)
 {
 	switch (type) {
@@ -1024,7 +1029,6 @@ void Behind::process(void *private_d, int family)
 		std::vector<dns_record_t> answers;
 		parse_dns_packet(buf, buf + len, &header, &questions, &answers);
 
-		fprintf(stderr, "---%08x\n", (int)header.flags);
 		if ((header.flags & 0xf800) == 0x0000) { // standard query
 			for (auto it = questions.begin(); it != questions.end(); it++) {
 				question_t const &q = *it;
@@ -1041,6 +1045,7 @@ void Behind::process(void *private_d, int family)
 					NONE,
 					FORWARD,
 					NXDOMAIN,
+					NODATA_AAAA,
 				};
 				State state = State::NONE;
 				if (!q.name.empty()) {
@@ -1075,6 +1080,8 @@ void Behind::process(void *private_d, int family)
 								// nop
 							} else if (is_nxdomain(q.name)) {
 								state = State::NXDOMAIN;
+							} else if (q.type == DNS_TYPE::AAAA && is_nodata_aaaa(q.name)) {
+								state = State::NODATA_AAAA;
 							} else if (state == State::FORWARD) {
 								if (cache) {
 									auto entry = cache->find(q.name);
@@ -1148,6 +1155,10 @@ void Behind::process(void *private_d, int family)
 				if (state == State::NXDOMAIN) {
 					auto h = header;
 					h.flags = 0x8003;
+					send_packet(private_d, family, h, questions, {}, false, false);
+				} else if (state == State::NODATA_AAAA) {
+					auto h = header;
+					h.flags = 0x8000;
 					send_packet(private_d, family, h, questions, {}, false, false);
 				}
 			}
