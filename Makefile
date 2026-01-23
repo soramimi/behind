@@ -36,13 +36,13 @@ log:
 	tail -f /var/log/behind/behind.log
 
 q1:
-	dig @127.0.0.1 -p 5300 www.google.com
+	dig @127.0.0.1 -p 5301 www.google.com
 
 q2:
-	dig @127.0.0.1 -p 5300 doubleclick.net
+	dig @127.0.0.1 -p 5301 doubleclick.net
 
 q3:
-	dig @127.0.0.1 -p 5300 www.amazon.co.jp
+	dig @127.0.0.1 -p 5301 www.amazon.co.jp
 
 q4:
 	dig www.google.com @127.0.0.1 +tls

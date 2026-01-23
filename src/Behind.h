@@ -10,7 +10,7 @@
 #include <sys/socket.h>
 #include <unordered_map>
 
-#define DEFAUT_DNS_PORT 53
+#define STANDARD_DNS_PORT 53
 #define DEFAUT_LISTEN_PORT 5300
 
 class Hosts {
@@ -43,20 +43,24 @@ char const *dns_type_to_string(DNS_TYPE type);
 struct Forwarder {
 	sa_family_t af_type = AF_UNSPEC;
 	uint8_t addr[16] = {0};
-	int port = DEFAUT_DNS_PORT;
+	int port = STANDARD_DNS_PORT;
 	operator bool () const
 	{
 		return af_type != AF_UNSPEC;
 	}
 };
 
+namespace dns {
+struct Header;
+struct Query;
+struct Question;
+struct Record;
+struct Cache;
+struct Message;
+}
+
 class Behind {
 public:
-	struct dns_header_t;
-	struct query_t;
-	struct question_t;
-	struct dns_record_t;
-	struct dns_cache_t;
 private:
 
 	struct Private;
@@ -88,29 +92,28 @@ private:
 	static int decode_name(char const *begin, char const *end, char const *ptr, std::string *name);
 	static void write_dns_header(std::vector<char> *out, uint16_t id, uint16_t flags, uint16_t qdcount, uint16_t ancount, uint16_t nscount, uint16_t arcount);
 	static void write_dns_question_rr(std::vector<char> *out, std::map<std::string, size_t> *namemap, std::string const &name, DNS_TYPE type, uint16_t clas);
-	static bool write_dns_answer_rr(std::vector<char> *out, std::map<std::string, size_t> *namemap, const std::string &name, uint16_t clas, uint32_t ttl, dns_record_t const &item);
-	static int parse_question_section(char const *begin, char const *end, char const *ptr, question_t *out);
+	static bool write_dns_answer_rr(std::vector<char> *out, std::map<std::string, size_t> *namemap, std::string const &name, uint16_t clas, uint32_t ttl, dns::Record const &item);
+	static int parse_question_section(char const *begin, char const *end, char const *ptr, dns::Question *out);
 	std::vector<Forwarder> get_forwarder();
 	void init_forwarder();
 	void clean();
 	void clean_transaction(uint32_t id);
-	bool take_query(uint16_t id, query_t *out);
-	void push_query(query_t const &query);
-	static void parse_dns_packet(char const *begin, char const *end, dns_header_t *header, std::vector<question_t> *questions, std::vector<dns_record_t> *answers, std::vector<Behind::dns_record_t> *authority);
+	bool take_query(uint16_t id, dns::Query *out);
+	void push_query(dns::Query const &query);
+	static void parse_dns_message(char const *begin, char const *end, dns::Message *msg);
 
-	bool is_nxdomain(const std::string &name) const;
-	bool is_nodata_aaaa(const std::string &name) const;
+	bool is_nxdomain(std::string const &name) const;
+	bool is_nodata_aaaa(std::string const &name) const;
 
-	static std::vector<dns_record_t> make_records(const query_t &q, const std::vector<dns_record_t> &answers);
-	struct PacketData;
-	static PacketData make_packet(void *private_d, const dns_header_t &header, const std::vector<question_t> &questions, const std::vector<dns_record_t> &answer, std::vector<dns_record_t> const &authority);
-	bool send_packet(void *private_d, int family, const dns_header_t &header, std::vector<question_t> const &q, std::vector<dns_record_t> const &rec, const std::vector<dns_record_t> &authority, bool forward, bool from_cache);
+	struct Packet;
+	static Packet make_dns_message(void *private_d, dns::Message const &msg);
+	bool send_dns_message(void *private_d, int family, dns::Message const &msg, bool forward, bool from_cache);
 
 	void process(void *private_d, int family);
 
 	void init_socket4(void *private_in);
 	void init_socket6(void *private_in);
-	const InetResolver::Addr *find_host(const std::string &name) const;
+	const InetResolver::Addr *find_host(std::string const &name) const;
 	void add_hosts(const std::map<std::string, std::string> &hosts);
 	uint32_t next_local_transaction_id();
 	int epoll_ctl_add(epoll_event *e);

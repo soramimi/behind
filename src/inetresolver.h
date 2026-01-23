@@ -29,6 +29,8 @@ public:
 		{
 			return !empty();
 		}
+		void add_in4(_in_addr const *a);
+		void add_in6(_in6_addr const *a);
 		_in_addr const *to_in4(size_t i) const
 		{
 			return reinterpret_cast<_in_addr const *>(addr[i].data());

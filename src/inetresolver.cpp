@@ -65,6 +65,20 @@ bool InetResolver::resolve(const char *name, Type type, Addr *out)
 	return true;
 }
 
+void InetResolver::Addr::add_in4(const _in_addr *a)
+{
+	std::vector<uint8_t> vec(4);
+	memcpy(vec.data(), a, 4);
+	addr.push_back(vec);
+}
+
+void InetResolver::Addr::add_in6(const _in6_addr *a)
+{
+	std::vector<uint8_t> vec(16);
+	memcpy(vec.data(), a, 16);
+	addr.push_back(vec);
+}
+
 std::string InetResolver::Addr::to_string(size_t i) const
 {
 	if (i < addr.size()) {
