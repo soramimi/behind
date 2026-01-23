@@ -144,7 +144,8 @@ public:
 		std::string key;
 		uint64_t timestamp = 0;
 		uint64_t expire = 0;
-		std::vector<Behind::dns_record_t> records;
+		std::vector<Behind::dns_record_t> answers;
+		std::vector<Behind::dns_record_t> authority;
 	};
 private:
 	std::vector<Item> items_;
@@ -155,7 +156,8 @@ private:
 	}
 public:
 	struct Entry {
-		std::vector<Behind::dns_record_t> records;
+		std::vector<Behind::dns_record_t> answers;
+		std::vector<Behind::dns_record_t> authority;
 	};
 	std::optional<Entry> find(std::string const &name)
 	{
@@ -166,13 +168,14 @@ public:
 			auto expire = items_[it->second].expire;
 			if (now < expire) {
 				Entry ret;
-				ret.records = items_[it->second].records;
-				for (size_t i = 0; i < ret.records.size(); i++) {
-					auto exp = ret.records[i].expire;
+				ret.answers = items_[it->second].answers;
+				ret.authority = items_[it->second].authority;
+				for (size_t i = 0; i < ret.answers.size(); i++) {
+					auto exp = ret.answers[i].expire;
 					if (now < exp) {
-						ret.records[i].ttl = (uint32_t)((exp - now) / 1000);
+						ret.answers[i].ttl = (uint32_t)((exp - now) / 1000);
 					} else {
-						ret.records[i].ttl = 0;
+						ret.answers[i].ttl = 0;
 					}
 				}
 				return ret;
@@ -180,7 +183,7 @@ public:
 		}
 		return std::nullopt;
 	}
-	void insert(std::string const &name, std::vector<Behind::dns_record_t> const &records)
+	void insert(std::string const &name, std::vector<Behind::dns_record_t> const &answers, std::vector<Behind::dns_record_t> const &authority)
 	{
 		auto now = misc::get_tick_count();
 		auto key = make_key(name);
@@ -212,10 +215,11 @@ public:
 		item->key = key;
 		item->timestamp = now;
 		item->expire = now + 600 * 1000;
-		item->records = records;
-		for (size_t i = 0; i < item->records.size(); i++) {
-			item->records[i].expire = now + item->records[i].ttl * 1000;
-			item->expire = std::min(item->expire, item->records[i].expire);
+		item->answers = answers;
+		item->authority = authority;
+		for (size_t i = 0; i < item->answers.size(); i++) {
+			item->answers[i].expire = now + item->answers[i].ttl * 1000;
+			item->expire = std::min(item->expire, item->answers[i].expire);
 		}
 	}
 };
@@ -1153,7 +1157,7 @@ void Behind::process(void *private_d, int family)
 									if (entry) {
 										auto h = header;
 										h.flags = 0x8180;
-										send_packet(d, family, h, {q}, entry->records, {}, false, true);
+										send_packet(d, family, h, {q}, entry->answers, entry->authority, false, true);
 										state = State::NONE;
 									}
 								}
@@ -1255,7 +1259,7 @@ void Behind::process(void *private_d, int family)
 								cache = &m->dns_cache.soa;
 							}
 							if (cache) {
-								cache->insert(q.forward_name, records);
+								cache->insert(q.forward_name, records, authority);
 							}
 						}
 						auto d2 = *d;
@@ -1267,7 +1271,7 @@ void Behind::process(void *private_d, int family)
 						for (question_t &q3 : questions2) {
 							q3.name = stricmp(q.request_name.c_str(), q3.name.c_str()) == 0 ? q.request_name : misc::strtolower(q3.name);
 						}
-						send_packet(&d2, q.client_family, h, questions2, records, {}, false, false);
+						send_packet(&d2, q.client_family, h, questions2, records, authority, false, false);
 					}
 				}
 			}
