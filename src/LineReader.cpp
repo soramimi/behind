@@ -100,8 +100,7 @@ bool LineReader::open(const std::string &path)
 	std::string abspath = misc::realpath(path);
 	int fd = ::open(abspath.c_str(), O_RDONLY);
 	if (fd != -1) {
-		logprintf(LOG_DEFAULT, "loading configuration file: %s\n", abspath.c_str());
-		fprintf(stderr, "loading configuration file: %s\n", abspath.c_str());
+		logprintf(LOG_BOTH, "load config file: %s\n", abspath.c_str());
 		File file;
 		file.path = path;
 		file.fd = fd;

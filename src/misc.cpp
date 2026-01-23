@@ -2,6 +2,23 @@
 #include <stdlib.h>
 #include <limits.h>
 #include <chrono>
+#include <cstdio>
+#include <cstdarg>
+
+std::string misc::asprintf(char const *fmt, ...)
+{
+	std::string s;
+	va_list ap;
+	va_start(ap, fmt);
+	char *p = nullptr;
+	::vasprintf(&p, fmt, ap);
+	va_end(ap);
+	if (p) {
+		s = p;
+		free(p);
+	}
+	return s;
+}
 
 uint64_t misc::get_tick_count()
 {

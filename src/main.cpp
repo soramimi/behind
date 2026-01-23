@@ -31,9 +31,10 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 			int port = DEFAUT_LISTEN_PORT;
 			if (misc::parse_int(value.c_str(), &port) > 0) {
 				opt->listen_port = port;
-			} else {
-				logprintf(LOG_DEFAULT, "invalid port number: %s\n", value.c_str());
+				return true;
 			}
+			logprintf(LOG_DEFAULT, "invalid port number: %s\n", value.c_str());
+			return false;
 		}
 	} else if (section == "logging") {
 		if (key == "file") {
@@ -162,15 +163,15 @@ int main(int argc, char **argv)
 	Option opt;
 	parse_option(argc, argv, &opt);
 
-	fprintf(stderr, "log file: %s\n", misc::realpath(opt.log_file.c_str()).c_str());
 	Logger::open(opt.log_file);
 	Logger::pause(false);
+	logprintf(LOG_BOTH, "log file: %s\n", misc::realpath(opt.log_file.c_str()).c_str());
 
 	if (!opt.working_dir.empty()) {
 		chdir(opt.working_dir.c_str());
 	}
 	std::string cwd = getcwd();
-	logprintf(LOG_DEFAULT, "current working directory: %s\n", cwd.c_str());
+	logprintf(LOG_BOTH, "current working directory: %s\n", cwd.c_str());
 
 	Behind behind(opt);
 	behind.test();

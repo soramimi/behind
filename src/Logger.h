@@ -35,6 +35,7 @@ private:
 public:
 	Logger();
 	~Logger();
+	void x_logprint(const char *file, int line, int level, std::string_view str);
 	void x_logprintf(const char *file, int line, int level, const char *fmt, ...);
 	static void pause(bool f);
 	static void start();
@@ -46,7 +47,10 @@ public:
 extern Logger x_logger;
 
 #define LOG_RAW 0
-#define LOG_DEFAULT 1
+#define LOG_DEFAULT 0x0001
+#define LOG_STDERR 0x0002
+#define LOG_BOTH (LOG_DEFAULT | LOG_STDERR)
+#define logprint(LEVEL, STR) x_logger.x_logprint(__FILE__, __LINE__, LEVEL, STR)
 #define logprintf(LEVEL, FMT, ...) x_logger.x_logprintf(__FILE__, __LINE__, LEVEL, FMT, ##__VA_ARGS__)
 
 #endif // LOGGER_H

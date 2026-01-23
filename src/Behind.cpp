@@ -1315,6 +1315,11 @@ void Behind::init_socket4(void *private_in)
 
 	in->sock_fd = sock;
 	in->family = AF_INET;
+
+	InetResolver::Addr addr;
+	addr.add_in4(&in->sa4.sin_addr.s_addr);
+	std::string s = addr.to_string(0);
+	logprintf(LOG_BOTH, "listen port: %s@%d\n", s.c_str(), ntohs(in->sa4.sin_port));
 }
 
 void Behind::init_socket6(void *private_in)
@@ -1341,6 +1346,11 @@ void Behind::init_socket6(void *private_in)
 
 	in->sock_fd = sock;
 	in->family = AF_INET6;
+
+	InetResolver::Addr addr;
+	addr.add_in6(&in->sa6.sin6_addr);
+	std::string s = addr.to_string(0);
+	logprintf(LOG_BOTH, "listen port: %s@%d\n", s.c_str(), ntohs(in->sa6.sin6_port));
 }
 
 void Behind::add_hosts(std::map<std::string, std::string> const &hosts)

@@ -67,6 +67,7 @@ bool InetResolver::resolve(const char *name, Type type, Addr *out)
 
 void InetResolver::Addr::add_in4(const _in_addr *a)
 {
+	type = IN4;
 	std::vector<uint8_t> vec(4);
 	memcpy(vec.data(), a, 4);
 	addr.push_back(vec);
@@ -74,6 +75,7 @@ void InetResolver::Addr::add_in4(const _in_addr *a)
 
 void InetResolver::Addr::add_in6(const _in6_addr *a)
 {
+	type = IN6;
 	std::vector<uint8_t> vec(16);
 	memcpy(vec.data(), a, 16);
 	addr.push_back(vec);

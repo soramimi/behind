@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstdarg>
+#include <cstring>
 #include <ctime>
 #include <thread>
 #include <mutex>
@@ -39,7 +40,6 @@ struct Logger::Private {
 Logger::Logger()
 	: m(new Private)
 {
-	m->fd_log = 2; // stderr
 }
 
 Logger::~Logger()
@@ -92,7 +92,12 @@ void Logger::write(LogItem const &item)
 				, int(msec % 1000)
 				, msg.c_str());
 		if (text) {
-			write(text, len);
+			if (item.level & LOG_DEFAULT) {
+				write(text, len);
+			}
+			if (item.level & LOG_STDERR) {
+				fwrite(text, 1, len, stderr);
+			}
 			free(text);
 		}
 	}
@@ -218,29 +223,38 @@ void Logger::push(Logger::LogItem const &item)
 	m->items.push_back(item);
 }
 
-void Logger::x_logprintf(char const *file, int line, int level, char const *fmt, ...)
+void Logger::x_logprint(const char *file, int line, int level, std::string_view str)
 {
 	LogItem item;
 	item.tp = now();
 	item.level = level;
 	item.file = file;
 	item.line = line;
+	size_t len = str.size();
+	if (level != LOG_RAW) {
+		while (isspace((unsigned char)str[len - 1])) len--;
+		str = str.substr(0, len);
+	}
+	item.message = std::string(str);
+	push(item);
+	m->cv.notify_all();
+}
+
+void Logger::x_logprintf(char const *file, int line, int level, char const *fmt, ...)
+{
+	std::string text;
 
 	va_list ap;
 	va_start(ap, fmt);
 	char *msg = nullptr;
 	int len = vasprintf(&msg, fmt, ap);
+	if (msg) {
+		text.assign(msg, len);
+		free(msg);
+	}
 	va_end(ap);
 
-	if (msg) {
-		if (level != LOG_RAW) {
-			while (len > 0 && isspace((unsigned char)msg[len - 1])) len--;
-		}
-		item.message.assign(msg, len);
-		free(msg);
-		push(item);
-		m->cv.notify_all();
-	}
+	x_logprint(file, line, level, text);
 }
 
 void Logger::pause(bool f)

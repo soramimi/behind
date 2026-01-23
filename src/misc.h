@@ -7,6 +7,8 @@
 
 namespace misc {
 
+std::string asprintf(char const *fmt, ...);
+
 uint64_t get_tick_count();
 
 std::string strtolower(std::string_view const &s);
