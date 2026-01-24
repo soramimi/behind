@@ -94,6 +94,14 @@ DomainFilter::Kind DomainFilter::find(std::string const &name) const
 			}
 		}
 	}
+	// middle match
+	{
+		for (auto const &item: middle_map_) {
+			if (strstr(loname.c_str(), item.name.c_str())) {
+				return item.kind;
+			}
+		}
+	}
 	// regex match
 	for (Item const &item : regex_list_) {
 		if (std::regex_match(loname, std::regex(item.name))) {
@@ -113,6 +121,14 @@ void DomainFilter::add_entry(std::string const &name, Kind kind)
 			item.kind = kind;
 			item.name = loname.substr(1, loname.size() - 2);
 			regex_list_.push_back(item);
+			return;
+		}
+		if (loname[0] == '*' && loname[loname.size() - 1] == '*') {
+			// middle match
+			Item item;
+			item.kind = kind;
+			item.name = loname.substr(1, loname.size() - 2);
+			middle_map_.push_back(item);
 			return;
 		}
 		if (loname[loname.size() - 2] == '.' && loname[loname.size() - 1] == '*') {

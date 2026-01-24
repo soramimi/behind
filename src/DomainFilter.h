@@ -19,6 +19,7 @@ private:
 	};
 	std::unordered_map<std::string, std::vector<Item>> suffix_map_;
 	std::unordered_map<std::string, std::vector<Item>> prefix_map_;
+	std::vector<Item> middle_map_;
 	std::vector<Item> regex_list_;
 	void add_entry(std::string const &name, Kind kind);
 public:
