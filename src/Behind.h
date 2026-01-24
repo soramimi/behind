@@ -106,7 +106,7 @@ private:
 	bool is_nodata_aaaa(std::string const &name) const;
 
 	struct Packet;
-	static Packet make_dns_message(void *private_d, dns::Message const &msg);
+	static Packet make_dns_message(dns::Message const &msg);
 	bool send_dns_message(void *private_d, int family, dns::Message const &msg, bool forward, bool from_cache);
 
 	void process(void *private_d, int family);

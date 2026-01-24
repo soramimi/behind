@@ -697,6 +697,8 @@ void Behind::push_query(const dns::Query &query)
 
 void Behind::parse_dns_message(const char *begin, const char *end, dns::Message *msg)
 {
+	*msg = {};
+
 	char const *ptr = begin;
 
 	uint16_t tmp[6];
@@ -843,14 +845,12 @@ struct SendTo {
 	}
 	void set_sa4(in_addr const *addr, int port)
 	{
-		const int len = 4;
 		sockaddr_in sa;
 		init_sa4(&sa, addr, port);
 		set_sa4(&sa);
 	}
 	void set_sa6(in6_addr const *addr, int port)
 	{
-		const int len = 16;
 		sockaddr_in6 sa;
 		init_sa6(&sa, addr, port);
 		set_sa6(&sa);
@@ -925,15 +925,22 @@ struct Behind::Packet {
 	}
 };
 
-Behind::Packet Behind::make_dns_message(void *private_d, dns::Message const &msg)
+Behind::Packet Behind::make_dns_message(dns::Message const &msg)
 {
 	Packet ret;
 	std::map<std::string, size_t> namemap;
 
-	uint16_t ancount = uint16_t(std::min(msg.answers.size(), (size_t)100));
-	uint16_t nscount = uint16_t(std::min(msg.authorities.size(), (size_t)100));
+	auto LimitCount = [](size_t n){
+		return uint16_t(std::min(n, (size_t)100));
+	};
 
-	write_dns_header(&ret.buffer, msg.header.id, msg.header.flags, 1, ancount, nscount, 0);
+	dns::Header h = msg.header;
+	h.qdcount = LimitCount(msg.answers.size());
+	h.ancount = LimitCount(msg.answers.size());
+	h.nscount = LimitCount(msg.authorities.size());
+	h.arcount = 0;
+
+	write_dns_header(&ret.buffer, h.id, h.flags, 1, h.ancount, h.nscount, 0);
 
 	for (auto it = msg.questions.begin(); it != msg.questions.end(); it++) {
 		dns::Question const &q = *it;
@@ -944,7 +951,7 @@ Behind::Packet Behind::make_dns_message(void *private_d, dns::Message const &msg
 		ret.q = msg.questions.front();
 	}
 
-	for (int i = 0; i < ancount; i++) {
+	for (int i = 0; i < h.ancount; i++) {
 		dns::Record const &r = msg.answers[i];
 		std::string name = stricmp(ret.q.name.c_str(), r.name.c_str()) == 0 ? ret.q.name : misc::strtolower(r.name);
 		if (!write_dns_answer_rr(&ret.buffer, &namemap, name, ret.q.clas, r.ttl, r)) {
@@ -952,7 +959,7 @@ Behind::Packet Behind::make_dns_message(void *private_d, dns::Message const &msg
 		}
 	}
 
-	for (int i = 0; i < nscount; i++) {
+	for (int i = 0; i < h.nscount; i++) {
 		dns::Record const &r = msg.authorities[i];
 		std::string name = stricmp(ret.q.name.c_str(), r.name.c_str()) == 0 ? ret.q.name : misc::strtolower(r.name);
 		if (!write_dns_answer_rr(&ret.buffer, &namemap, name, ret.q.clas, r.ttl, r)) {
@@ -967,7 +974,7 @@ bool Behind::send_dns_message(void *private_d, int family, dns::Message const &m
 {
 	Private::D *d = static_cast<Private::D *>(private_d);
 
-	Packet packet = make_dns_message(private_d, msg);
+	Packet packet = make_dns_message(msg);
 	if (!packet) return false;
 
 	std::string client;
@@ -977,7 +984,7 @@ bool Behind::send_dns_message(void *private_d, int family, dns::Message const &m
 	} else if (family == AF_INET6) {
 		sender.set_sa6(d->in6.sock_fd, &d->in6.sa6);
 	}
-	bool ok = sender.sendto(&packet.buffer[0], packet.buffer.size()) == packet.buffer.size();
+	bool ok = sender.sendto(&packet.buffer[0], packet.buffer.size()) == (ssize_t)packet.buffer.size();
 	client = sender.addr_to_string();
 
 	char const *comment = "";
@@ -995,7 +1002,7 @@ bool Behind::send_dns_message(void *private_d, int family, dns::Message const &m
 				  , client.c_str()
 				  );
 	} else if (msg.answers.size() > 0) {
-		for (int i = 0; i < msg.answers.size(); i++) {
+		for (size_t i = 0; i < msg.answers.size(); i++) {
 			dns::Record const &r = msg.answers[i];
 			std::string name = misc::strtolower(packet.q.name);
 			std::string addr_str = r.to_string();
@@ -1487,9 +1494,7 @@ void Behind::test()
 		EXPECT_EQ(msg.answers[0].ttl, 300);
 
 		{
-			Private::D d;
-
-			Packet response = make_dns_message(&d, msg);
+			Packet response = make_dns_message(msg);
 
 			dns::Message msg2;
 			char const *begin = response.buffer.data();
@@ -1544,7 +1549,7 @@ void Behind::test()
 		{
 			Private::D d;
 
-			Packet response = make_dns_message(&d, msg);
+			Packet response = make_dns_message(msg);
 
 			dns::Message msg2;
 			char const *begin = response.buffer.data();

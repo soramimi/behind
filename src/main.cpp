@@ -142,7 +142,9 @@ int main(int argc, char **argv)
 {
 	{
 		DomainFilter filter;
+		filter.add_nxdomain("*.lan");
 		filter.add_nxdomain("doubleclick.net");
+		EXPECT_EQ(filter.find("hoge.lan"), DomainFilter::NXDOMAIN);
 		EXPECT_EQ(filter.find("doubleclick.net"), DomainFilter::NXDOMAIN);
 		EXPECT_EQ(filter.find("ads.doubleclick.net"), DomainFilter::NXDOMAIN);
 		// return 0;

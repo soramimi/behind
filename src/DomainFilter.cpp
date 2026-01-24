@@ -5,18 +5,36 @@
 
 std::string domain_suffix_key(std::string const &name)
 {
-	size_t n = 0;
-	size_t i = name.size();
-	while (i > 0) {
-		char c = name[i - 1];
-		if (c == '*') return {};
-		if (c == '.') {
-			n++;
-			if (n == 2) break;
+	std::vector<std::string_view> parts;
+	{
+		size_t i = 0;
+		size_t j = 0;
+		while (1) {
+			char c = name[j];
+			if (c == '.' || c == 0) {
+				parts.push_back(std::string_view(name.c_str() + i, j - i));
+				if (c == 0) break;
+				i = j + 1;
+			}
+			j++;
 		}
-		i--;
+		if (parts.size() == 1) {
+			parts.insert(parts.begin(), "*");
+		}
 	}
-	return name.substr(i);
+	std::string key;
+	{
+		size_t i = parts.size();
+		while (i > 0) {
+			i--;
+			if (!key.empty()) {
+				key = '.' + key;
+			}
+			key = std::string(parts[i]) + key;
+			if (i + 2 == parts.size()) break;
+		}
+	}
+	return key;
 }
 
 std::string domain_prefix_key(std::string const &name)
@@ -31,24 +49,38 @@ std::string domain_prefix_key(std::string const &name)
 DomainFilter::Kind DomainFilter::find(std::string const &name) const
 {
 	std::string loname = misc::strtolower(name);
+	// suffix match
 	{
-		std::string key = domain_suffix_key(loname);
-		if (!key.empty()) {
-			auto it = suffix_map_.find(key);
-			if (it != suffix_map_.end()) {
-				for (Item const &item : it->second) {
-					if (item.name == loname) return item.kind;
-					const size_t n = item.name.size();
-					if (n < loname.size()) {
-						char const *p = loname.c_str() + loname.size() - n;
-						if (memcmp(p, item.name.c_str(), n) == 0 && p[-1] == '.') {
-							return item.kind;
+		auto Find = [&](std::string const &name){
+			std::string key = domain_suffix_key(name);
+			if (!key.empty()) {
+				auto it = suffix_map_.find(key);
+				if (it != suffix_map_.end()) {
+					for (Item const &item : it->second) {
+						if (item.name == name) return item.kind;
+						const size_t n = item.name.size();
+						if (n < name.size()) {
+							char const *p = name.c_str() + name.size() - n;
+							if (memcmp(p, item.name.c_str(), n) == 0 && p[-1] == '.') {
+								return item.kind;
+							}
 						}
 					}
 				}
 			}
+			return NORMAL;
+		};
+		auto k = Find(loname);
+		if (k != NORMAL) return k;
+		char const *p = strchr(loname.c_str(), '.');
+		if (p) {
+			std::string tmpname = "*";
+			tmpname += p;
+			k = Find(tmpname);
+			if (k != NORMAL) return k;
 		}
 	}
+	// prefix match
 	{
 		std::string key = domain_prefix_key(loname);
 		if (!key.empty()) {
@@ -62,6 +94,7 @@ DomainFilter::Kind DomainFilter::find(std::string const &name) const
 			}
 		}
 	}
+	// regex match
 	for (Item const &item : regex_list_) {
 		if (std::regex_match(loname, std::regex(item.name))) {
 			return item.kind;
