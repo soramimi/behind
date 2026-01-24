@@ -33,9 +33,11 @@ struct Option {
 
 enum class DNS_TYPE : uint16_t {
 	A = 1,
+	NS = 2,
 	CNAME = 5,
 	SOA = 6,
 	PTR = 12,
+	MX = 15,
 	AAAA = 28,
 };
 char const *dns_type_to_string(DNS_TYPE type);
@@ -118,6 +120,7 @@ private:
 	uint32_t next_local_transaction_id();
 	int epoll_ctl_add(epoll_event *e);
 	int epoll_ctl_del(epoll_event *e);
+	bool accept_dns_type(DNS_TYPE t);
 public:
 	Behind(Option const &opt);
 	~Behind();

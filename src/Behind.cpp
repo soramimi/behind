@@ -93,9 +93,22 @@ static inline bool operator == (const Question &l, const Question &r)
 	return true;
 }
 
+struct CNAME {
+	std::string cname;
+};
+
+struct NS {
+	std::string nsname;
+};
+
+struct MX {
+	uint16_t preference;
+	std::string exchange;
+};
+
 struct SOA {
-	std::string nameserver;
-	std::string mailbox;
+	std::string nname; // name server
+	std::string rname; // responsible mail addr
 	uint32_t serial;
 	uint32_t refresh;
 	uint32_t retry;
@@ -109,22 +122,98 @@ struct Record {
 	uint16_t clas = AF_INET;
 	uint32_t ttl = 300;
 	uint64_t expire = 0;
-	std::vector<uint8_t> data;
-	std::shared_ptr<SOA> soa;
+	std::vector<uint8_t> bin;
+	std::shared_ptr<void> sp;
+
+	// soa
+
+	void set_soa(std::shared_ptr<SOA> soa)
+	{
+		sp = soa;
+	}
+	SOA *soa()
+	{
+		if (type == DNS_TYPE::SOA && sp) {
+			return std::static_pointer_cast<SOA>(sp).get();
+		}
+		return nullptr;
+	}
+	SOA const *soa() const
+	{
+		return const_cast<Record *>(this)->soa();
+	}
+
+	// cname
+
+	void set_cname(std::shared_ptr<CNAME> cname)
+	{
+		sp = cname;
+	}
+	CNAME *cname()
+	{
+		if (type == DNS_TYPE::CNAME && sp) {
+			return std::static_pointer_cast<CNAME>(sp).get();
+		}
+		return nullptr;
+	}
+	CNAME const *cname() const
+	{
+		return const_cast<Record *>(this)->cname();
+	}
+
+	// ns
+
+	void set_ns(std::shared_ptr<NS> ns)
+	{
+		sp = ns;
+	}
+	NS *ns()
+	{
+		if (type == DNS_TYPE::NS && sp) {
+			return std::static_pointer_cast<NS>(sp).get();
+		}
+		return nullptr;
+	}
+	NS const *ns() const
+	{
+		return const_cast<Record *>(this)->ns();
+	}
+
+	// mx
+
+	void set_mx(std::shared_ptr<MX> mx)
+	{
+		sp = mx;
+	}
+	MX *mx()
+	{
+		if (type == DNS_TYPE::MX && sp) {
+			return std::static_pointer_cast<MX>(sp).get();
+		}
+		return nullptr;
+	}
+	MX const *mx() const
+	{
+		return const_cast<Record *>(this)->mx();
+	}
+
+	//
 
 	std::string to_string() const
 	{
-		if (type == DNS_TYPE::A && data.size() == 4) {
+		if (type == DNS_TYPE::A && bin.size() == 4) {
 			struct sockaddr_in a = {};
-			a.sin_addr.s_addr = *(uint32_t *)data.data();
+			a.sin_addr.s_addr = *(uint32_t *)bin.data();
 			return addr_to_string(AF_INET, (struct sockaddr *)&a);
-		} else if (type == DNS_TYPE::AAAA && data.size() == 16) {
+		} else if (type == DNS_TYPE::AAAA && bin.size() == 16) {
 			struct sockaddr_in6 a = {};
-			memcpy(&a.sin6_addr.s6_addr, data.data(), 16);
+			memcpy(&a.sin6_addr.s6_addr, bin.data(), 16);
 			return addr_to_string(AF_INET6, (struct sockaddr *)&a);
-		} else if (type == DNS_TYPE::CNAME && data.size() < 256) {
-			std::string_view sv((char const *)data.data(), data.size());
-			return std::string(sv);
+		} else if (type == DNS_TYPE::CNAME && cname()) {
+			CNAME const *p = cname();
+			if (p) {
+				return p->cname;
+			}
 		}
 		return {};
 	}
@@ -134,8 +223,8 @@ static inline bool operator == (const Record &l, const Record &r)
 {
 	if (l.type != r.type) return false;
 	if (l.clas != r.clas) return false;
-	if (l.data.size() != r.data.size()) return false;
-	if (memcmp(l.data.data(), r.data.data(), l.data.size()) != 0) return false;
+	if (l.bin.size() != r.bin.size()) return false;
+	if (memcmp(l.bin.data(), r.bin.data(), l.bin.size()) != 0) return false;
 	return true;
 }
 
@@ -445,8 +534,8 @@ void Behind::write_dns_question_rr(std::vector<char> *out, std::map<std::string,
 std::shared_ptr<dns::SOA> fake_soa()
 {
 	std::shared_ptr<dns::SOA> soa = std::make_shared<dns::SOA>();
-	soa->nameserver = "ns.example.invalid";
-	soa->mailbox = "admin.example.invalid";
+	soa->nname = "ns.example.invalid";
+	soa->rname = "admin.example.invalid";
 	soa->serial = 1;
 	soa->refresh = 3600;
 	soa->retry = 600;
@@ -463,17 +552,33 @@ bool Behind::write_dns_answer_rr(std::vector<char> *out, std::map<std::string, s
 	write_ul(out, ttl);
 
 	if (item.type == DNS_TYPE::CNAME) {
-		std::string cname((char const *)item.data.data(), item.data.size());
+		dns::CNAME const *cname = item.cname();
+		if (!cname) return false;
 		size_t i = out->size();
 		write_us(out, 0);
-		write_name(out, namemap, cname);
+		write_name(out, namemap, cname->cname);
+		write_us(&out->at(i), out->size() - i - 2);
+	} else if (item.type == DNS_TYPE::NS) {
+		dns::NS const *ns = item.ns();
+		if (!ns) return false;
+		size_t i = out->size();
+		write_us(out, 0);
+		write_name(out, namemap, ns->nsname);
+		write_us(&out->at(i), out->size() - i - 2);
+	} else if (item.type == DNS_TYPE::MX) {
+		dns::MX const *mx = item.mx();
+		if (!mx) return false;
+		size_t i = out->size();
+		write_us(out, 0);
+		write_us(out, mx->preference);
+		write_name(out, namemap, mx->exchange);
 		write_us(&out->at(i), out->size() - i - 2);
 	} else if (item.type == DNS_TYPE::SOA) {
 		auto WriteSOA = [&](dns::SOA const &soa){
 			size_t i = out->size();
 			write_us(out, 0);
-			write_name(out, namemap, soa.nameserver);
-			write_name(out, namemap, soa.mailbox);
+			write_name(out, namemap, soa.nname);
+			write_name(out, namemap, soa.rname);
 			write_ul(out, soa.serial);
 			write_ul(out, soa.refresh);
 			write_ul(out, soa.retry);
@@ -481,11 +586,11 @@ bool Behind::write_dns_answer_rr(std::vector<char> *out, std::map<std::string, s
 			write_ul(out, soa.minimum);
 			write_us(&out->at(i), out->size() - i - 2);
 		};
-		if (item.soa) {
-			WriteSOA(*item.soa);
+		if (item.soa()) {
+			WriteSOA(*item.soa());
 		}
 	} else {
-		int len = item.data.size();
+		int len = item.bin.size();
 		if (item.type == DNS_TYPE::A && len == 4) {
 			// len = 4;
 		} else if (item.type == DNS_TYPE::AAAA && len == 16) {
@@ -494,7 +599,7 @@ bool Behind::write_dns_answer_rr(std::vector<char> *out, std::map<std::string, s
 			return false;
 		}
 		write_us(out, len);
-		write(out, (char const *)item.data.data(), len);
+		write(out, (char const *)item.bin.data(), len);
 	}
 	return true;
 }
@@ -741,32 +846,55 @@ void Behind::parse_dns_message(const char *begin, const char *end, dns::Message 
 					*it = a;
 					if ((a.type == DNS_TYPE::A && rdlen == 4) || (a.type == DNS_TYPE::AAAA && rdlen == 16)) {
 						if (rdlen > 0) {
-							it->data.resize(rdlen);
-							memcpy(it->data.data(), ptr, rdlen);
+							it->bin.resize(rdlen);
+							memcpy(it->bin.data(), ptr, rdlen);
 							ptr += rdlen;
 						}
 					} else if (a.type == DNS_TYPE::CNAME && rdlen < 256) {
 						if (rdlen > 0) {
-							std::string name;
-							int n = decode_name(begin, end, ptr, &name);
-							if (n > 0 && !name.empty()) {
-								name = misc::strtolower(name);
-								it->data.resize(name.size());
-								memcpy(it->data.data(), name.c_str(), name.size());
+							std::shared_ptr<dns::CNAME> cname = std::make_shared<dns::CNAME>();
+							int n = decode_name(begin, end, ptr, &cname->cname);
+							if (n > 0 && !cname->cname.empty()) {
+								cname->cname = misc::strtolower(cname->cname);
+								it->set_cname(cname);
+							}
+							ptr += rdlen;
+						}
+					} else if (a.type == DNS_TYPE::NS && rdlen < 256) {
+						if (rdlen > 0) {
+							std::shared_ptr<dns::NS> ns = std::make_shared<dns::NS>();
+							int n = decode_name(begin, end, ptr, &ns->nsname);
+							if (n > 0 && !ns->nsname.empty()) {
+								ns->nsname = misc::strtolower(ns->nsname);
+								it->set_ns(ns);
+							}
+							ptr += rdlen;
+						}
+					} else if (a.type == DNS_TYPE::MX) {
+						if (rdlen > 0) {
+							std::shared_ptr<dns::MX> mx = std::make_shared<dns::MX>();
+							if (rdlen >= 2) {
+								mx->preference = ntohs(*(uint16_t *)ptr);
+								ptr += 2;
+							}
+							int n = decode_name(begin, end, ptr, &mx->exchange);
+							if (n > 0 && !mx->exchange.empty()) {
+								mx->exchange = misc::strtolower(mx->exchange);
+								it->set_mx(mx);
 							}
 							ptr += rdlen;
 						}
 					} else if (a.type == DNS_TYPE::SOA) {
 						std::shared_ptr<dns::SOA> soa = std::make_shared<dns::SOA>();
 						if (rdlen > 0) {
-							int n = decode_name(begin, end, ptr, &soa->nameserver);
-							if (n > 0 && !soa->nameserver.empty()) {
+							int n = decode_name(begin, end, ptr, &soa->nname);
+							if (n > 0 && !soa->nname.empty()) {
 								ptr += n;
 							}
 						}
 						if (rdlen > 0) {
-							int n = decode_name(begin, end, ptr, &soa->mailbox);
-							if (n > 0 && !soa->mailbox.empty()) {
+							int n = decode_name(begin, end, ptr, &soa->rname);
+							if (n > 0 && !soa->rname.empty()) {
 								ptr += n;
 							}
 						}
@@ -779,9 +907,9 @@ void Behind::parse_dns_message(const char *begin, const char *end, dns::Message 
 							soa->retry = ntohl(tmp[2]);
 							soa->expire = ntohl(tmp[3]);
 							soa->minimum = ntohl(tmp[4]);
-							soa->nameserver = misc::strtolower(soa->nameserver);
-							soa->mailbox = misc::strtolower(soa->mailbox);
-							it->soa = soa;
+							soa->nname = misc::strtolower(soa->nname);
+							soa->rname = misc::strtolower(soa->rname);
+							it->set_soa(soa);
 						}
 					}
 				}
@@ -903,6 +1031,8 @@ char const *dns_type_to_string(DNS_TYPE type)
 	switch (type) {
 	case DNS_TYPE::A:
 		return "A";
+	case DNS_TYPE::NS:
+		return "NS";
 	case DNS_TYPE::CNAME:
 		return "CNAME";
 	case DNS_TYPE::SOA:
@@ -1068,6 +1198,20 @@ uint32_t Behind::next_local_transaction_id()
 	return m->local_transaction_id++;
 }
 
+bool Behind::accept_dns_type(DNS_TYPE t)
+{
+	switch (t) {
+	case DNS_TYPE::A:
+	case DNS_TYPE::NS:
+	case DNS_TYPE::AAAA:
+	case DNS_TYPE::CNAME:
+	case DNS_TYPE::SOA:
+	case DNS_TYPE::MX:
+		return true;
+	}
+	return false;
+}
+
 void Behind::process(void *private_d, int family)
 {
 	Private::D *d = static_cast<Private::D *>(private_d);
@@ -1106,12 +1250,12 @@ void Behind::process(void *private_d, int family)
 					NONE,
 					FORWARD,
 					NXDOMAIN,
-					NODATA_AAAA,
+					NODATA,
 				};
 				State state = State::NONE;
 				if (!q.name.empty()) {
 					if (q.clas == DNS_CLASS_IN) {
-						if (q.type == DNS_TYPE::A || q.type == DNS_TYPE::AAAA || q.type == DNS_TYPE::SOA) {
+						if (accept_dns_type(q.type)) {
 							logprintf(LOG_DEFAULT, "Q: %s %s\n", q.name.c_str(), dns_type_to_string(q.type));
 							state = State::FORWARD;
 							{
@@ -1126,7 +1270,7 @@ void Behind::process(void *private_d, int family)
 										r.type = q.type;
 										r.ttl = ttl();
 										for (std::vector<uint8_t> const &a : addr->addr) {
-											r.data = a;
+											r.bin = a;
 											rec.push_back(r);
 										}
 										dns::Message sending;
@@ -1145,7 +1289,7 @@ void Behind::process(void *private_d, int family)
 							} else if (is_nxdomain(q.name)) {
 								state = State::NXDOMAIN;
 							} else if (q.type == DNS_TYPE::AAAA && is_nodata_aaaa(q.name)) {
-								state = State::NODATA_AAAA;
+								state = State::NODATA;
 							} else if (state == State::FORWARD) {
 								dns::Cache *cache = Cache(q.type);
 								if (cache) {
@@ -1219,6 +1363,8 @@ void Behind::process(void *private_d, int family)
 									}
 								}
 							}
+						} else {
+							state = State::NODATA;
 						}
 					}
 				}
@@ -1229,7 +1375,7 @@ void Behind::process(void *private_d, int family)
 					sending.answers.clear();
 					sending.authorities.clear();
 					send_dns_message(private_d, family, sending, false, false);
-				} else if (state == State::NODATA_AAAA) {
+				} else if (state == State::NODATA) {
 					dns::Message sending = received;
 					sending.header.flags = 0x8000;
 					sending.answers.clear();
@@ -1239,14 +1385,14 @@ void Behind::process(void *private_d, int family)
 					r->type = DNS_TYPE::SOA;
 					r->clas = q.clas;
 					r->ttl = 60;
-					r->soa = fake_soa();
+					r->set_soa(fake_soa());
 					send_dns_message(private_d, family, sending, false, false);
 				}
 			}
 		} else if (received.header.flags & 0x8000) { // response
 			dns::Query q;
 			if (take_query(received.header.id, &q)) {
-				if (q.type == DNS_TYPE::A || q.type == DNS_TYPE::AAAA || q.type == DNS_TYPE::SOA) {
+				if (accept_dns_type(q.type)) {
 					if (received.questions.size() == 1 && received.questions.front().name == q.forward_name) {
 						auto AmendName = [&q](std::string const &name){
 							if (stricmp(q.request_name.c_str(), name.c_str()) == 0) {
@@ -1264,13 +1410,14 @@ void Behind::process(void *private_d, int family)
 						// answers
 						for (dns::Record &a : sending.answers) {
 							if (a.clas == DNS_CLASS_IN) {
-								auto size = a.data.size();
-								if ((a.type == DNS_TYPE::A && size == 4) || (a.type == DNS_TYPE::AAAA && size == 16) || (a.type == DNS_TYPE::CNAME && size < 256) || a.type == DNS_TYPE::SOA) {
+								if (accept_dns_type(a.type)) {
 									a.name = AmendName(a.name);
 								}
-								if (a.type == DNS_TYPE::SOA && a.soa) {
-									a.soa->nameserver = AmendName(a.soa->nameserver);
-									a.soa->mailbox = AmendName(a.soa->mailbox);
+								if (a.type == DNS_TYPE::CNAME && a.cname()) {
+									a.cname()->cname = AmendName(a.cname()->cname);
+								} else if (a.type == DNS_TYPE::SOA && a.soa()) {
+									a.soa()->nname = AmendName(a.soa()->nname);
+									a.soa()->rname = AmendName(a.soa()->rname);
 								}
 							}
 						}
@@ -1490,7 +1637,7 @@ void Behind::test()
 		EXPECT_EQ(msg.answers[0].clas, DNS_CLASS_IN);
 		EXPECT_EQ(msg.answers[0].type, DNS_TYPE::A);
 		EXPECT_EQ(msg.answers[0].name, "www.google.com");
-		EXPECT_EQ(to_string(msg.answers[0].data), std::string("\x8e\xfa\xc2\xc4", 4));
+		EXPECT_EQ(to_string(msg.answers[0].bin), std::string("\x8e\xfa\xc2\xc4", 4));
 		EXPECT_EQ(msg.answers[0].ttl, 300);
 
 		{
@@ -1531,24 +1678,22 @@ void Behind::test()
 		EXPECT_EQ(msg.answers[0].clas, DNS_CLASS_IN);
 		EXPECT_EQ(msg.answers[0].type, DNS_TYPE::CNAME);
 		EXPECT_EQ(msg.answers[0].name, "www.amazon.co.jp");
-		EXPECT_EQ(to_string(msg.answers[0].data), "tp.4d5ad1d2b-frontier.amazon.co.jp");
+		EXPECT_EQ(msg.answers[0].cname()->cname, "tp.4d5ad1d2b-frontier.amazon.co.jp");
 		EXPECT_EQ(msg.answers[0].ttl, 300);
 
 		EXPECT_EQ(msg.answers[1].clas, DNS_CLASS_IN);
 		EXPECT_EQ(msg.answers[1].type, DNS_TYPE::CNAME);
 		EXPECT_EQ(msg.answers[1].name, "tp.4d5ad1d2b-frontier.amazon.co.jp");
-		EXPECT_EQ(to_string(msg.answers[1].data), "cf.4d5ad1d2b-frontier.amazon.co.jp");
+		EXPECT_EQ(msg.answers[1].cname()->cname, "cf.4d5ad1d2b-frontier.amazon.co.jp");
 		EXPECT_EQ(msg.answers[1].ttl, 300);
 
 		EXPECT_EQ(msg.answers[2].clas, DNS_CLASS_IN);
 		EXPECT_EQ(msg.answers[2].type, DNS_TYPE::A);
 		EXPECT_EQ(msg.answers[2].name, "cf.4d5ad1d2b-frontier.amazon.co.jp");
-		EXPECT_EQ(to_string(msg.answers[2].data), std::string("\x03\xa8\xfb\x86", 4));
+		EXPECT_EQ(to_string(msg.answers[2].bin), std::string("\x03\xa8\xfb\x86", 4));
 		EXPECT_EQ(msg.answers[2].ttl, 300);
 
 		{
-			Private::D d;
-
 			Packet response = make_dns_message(msg);
 
 			dns::Message msg2;
