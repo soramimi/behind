@@ -1,8 +1,8 @@
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/soramimi/behind)
 
-# BEHIND
+# BEHIND - a DNS server lesser than BIND
 
-a DNS server lesser than BIND - BEHIND is a lightweight DNS forwarding server.
+BEHIND is a lightweight DNS forwarding server.
 
 Designed for home networks and small organizations, BEHIND is typically deployed as an intermediate forwarding server between Unbound (primary DNS server) and upstream DNS providers. This architecture allows you to leverage Unbound's robust caching and security features while adding custom domain filtering, static host mappings, and flexible DNS forwarding rules through BEHIND.
 
@@ -96,7 +96,12 @@ nxdomain = doubleclick.net        ; Exact match and sub domains
 nxdomain = ads.example.com         ; Exact match and sub domains
 nxdomain = ad.*              ; Prefix match (e.g., ad.network.com)
 nxdomain = *.tracking.com    ; Suffix match (e.g., tracker.tracking.com)
+nxdomain  = *html-load*      ; Middle match (e.g., html-load.com, html-load.cc)
 nxdomain = /^ad[0-9]+\..*/         ; Regex pattern (enclosed in slashes)
+
+; Return NODATA for AAAA records only (useful for forcing IPv4)
+nodata-aaaa = youtube.com          ; Force YouTube to use IPv4
+nodata-aaaa = googlevideo.com      ; Force Google Video to use IPv4
 
 ; You can also include external filter files
 include nxdomain.conf
