@@ -109,12 +109,15 @@ private:
 
 	struct Packet;
 	static Packet make_dns_message(dns::Message const &msg);
-	bool send_dns_message(void *private_d, int family, dns::Message const &msg, bool forward, bool from_cache);
+	bool send_dns_message(void *private_d, int family, int socktype, dns::Message const &msg, bool forward, bool from_cache);
 
-	void process(void *private_d, int family);
+	void process(void *private_d, int family, int socktype);
 
 	void init_socket4(void *private_in);
 	void init_socket6(void *private_in);
+	void init_socket4_tcp(void *private_in);
+	void init_socket6_tcp(void *private_in);
+
 	const InetResolver::Addr *find_host(std::string const &name) const;
 	void add_hosts(const std::map<std::string, std::string> &hosts);
 	uint32_t next_local_transaction_id();

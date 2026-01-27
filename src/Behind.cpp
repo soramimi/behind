@@ -343,16 +343,21 @@ struct Behind::Private {
 	std::vector<dns::Query> queries;
 	std::vector<Forwarder> forwarder;
 
+	struct In {
+		int dgram_fd = -1;
+		int listen_fd = -1;
+		int stream_fd = -1;
+		int family = -1;
+		union {
+			struct sockaddr_in sa4;
+			struct sockaddr_in6 sa6;
+		};
+		struct epoll_event ev;
+	};
+
 	struct D {
-		struct In {
-			int sock_fd;
-			int family;
-			union {
-				struct sockaddr_in sa4;
-				struct sockaddr_in6 sa6;
-			};
-			struct epoll_event ev;
-		} in4, in6;
+		In in4, in6;
+		In in4_tcp, in6_tcp; // wip: experimental: tcp support
 	};
 };
 
@@ -1100,7 +1105,7 @@ Behind::Packet Behind::make_dns_message(dns::Message const &msg)
 	return ret;
 }
 
-bool Behind::send_dns_message(void *private_d, int family, dns::Message const &msg, bool forward, bool from_cache)
+bool Behind::send_dns_message(void *private_d, int family, int socktype, dns::Message const &msg, bool forward, bool from_cache)
 {
 	Private::D *d = static_cast<Private::D *>(private_d);
 
@@ -1109,10 +1114,12 @@ bool Behind::send_dns_message(void *private_d, int family, dns::Message const &m
 
 	std::string client;
 	SendTo sender;
-	if (family == AF_INET) {
-		sender.set_sa4(d->in4.sock_fd, &d->in4.sa4);
-	} else if (family == AF_INET6) {
-		sender.set_sa6(d->in6.sock_fd, &d->in6.sa6);
+	if (socktype == SOCK_DGRAM) {
+		if (family == AF_INET) {
+			sender.set_sa4(d->in4.dgram_fd, &d->in4.sa4);
+		} else if (family == AF_INET6) {
+			sender.set_sa6(d->in6.dgram_fd, &d->in6.sa6);
+		}
 	}
 	bool ok = sender.sendto(&packet.buffer[0], packet.buffer.size()) == (ssize_t)packet.buffer.size();
 	client = sender.addr_to_string();
@@ -1212,26 +1219,44 @@ bool Behind::accept_dns_type(DNS_TYPE t)
 	return false;
 }
 
-void Behind::process(void *private_d, int family)
+void Behind::process(void *private_d, int family, int socktype)
 {
 	Private::D *d = static_cast<Private::D *>(private_d);
 
-	char buf[1500];
+	std::vector<char> buf(1500);
 	if (family == AF_INET || family == AF_INET6) {
 		int len = 0;
-		if (family == AF_INET) {
-			socklen_t salen = sizeof(sockaddr_in);
-			len = recvfrom(d->in4.sock_fd, buf, sizeof(buf), 0, (struct sockaddr *)&d->in4.sa4, &salen);
-		} else if (family == AF_INET6) {
-			socklen_t salen = sizeof(sockaddr_in6);
-			len = recvfrom(d->in6.sock_fd, buf, sizeof(buf), 0, (struct sockaddr *)&d->in6.sa6, &salen);
+		if (socktype == SOCK_DGRAM) {
+			if (family == AF_INET) {
+				socklen_t salen = sizeof(sockaddr_in);
+				len = recvfrom(d->in4.dgram_fd, buf.data(), buf.size(), 0, (struct sockaddr *)&d->in4.sa4, &salen);
+			} else if (family == AF_INET6) {
+				socklen_t salen = sizeof(sockaddr_in6);
+				len = recvfrom(d->in6.dgram_fd, buf.data(), buf.size(), 0, (struct sockaddr *)&d->in6.sa6, &salen);
+			}
+		} else if (socktype == SOCK_STREAM) {
+			if (family == AF_INET) {
+				if (read(d->in4_tcp.stream_fd, buf.data(), 2) == 2) {
+					len = ntohs(*(uint16_t *)buf.data());
+					if (len > 0) {
+						buf.resize(len);
+						len = read(d->in4_tcp.stream_fd, buf.data(), buf.size());
+					}
+				}
+			} else if (family == AF_INET6) {
+				if (read(d->in6_tcp.stream_fd, buf.data(), 2) == 2) {
+					len = ntohs(*(uint16_t *)buf.data());
+					if (len > 0) {
+						buf.resize(len);
+						len = read(d->in6_tcp.stream_fd, buf.data(), buf.size());
+					}
+				}
+			}
 		}
-		if (len < 12 || len > (int)sizeof(buf)) {
-			return;
-		}
+		if (len < 12) return;
 
 		dns::Message received;
-		parse_dns_message(buf, buf + len, &received);
+		parse_dns_message(buf.data(), buf.data() + len, &received);
 
 		auto Cache = [&](DNS_TYPE type)-> dns::Cache * {
 			switch (type) {
@@ -1278,7 +1303,7 @@ void Behind::process(void *private_d, int family)
 										sending.header.flags = 0x8180;
 										sending.questions = {q};
 										sending.answers = rec;
-										send_dns_message(d, family, sending, false, false);
+										send_dns_message(d, family, socktype, sending, false, false);
 									} else {
 										state = State::NXDOMAIN;
 									}
@@ -1301,7 +1326,7 @@ void Behind::process(void *private_d, int family)
 										sending.questions = {q};
 										sending.answers = entry->answers;
 										sending.authorities = entry->authorities;
-										send_dns_message(d, family, sending, false, true);
+										send_dns_message(d, family, socktype, sending, false, true);
 										state = State::NONE;
 									}
 								}
@@ -1326,7 +1351,7 @@ void Behind::process(void *private_d, int family)
 										} else if (forwarder.af_type == AF_INET6) {
 											init_sa6(&d2.in6.sa6, (in6_addr const *)forwarder.addr, forwarder.port);
 										}
-										if (send_dns_message(&d2, forwarder.af_type, sending, true, false)) {
+										if (send_dns_message(&d2, forwarder.af_type, socktype, sending, true, false)) {
 											dns::Query t;
 											t.timestamp = misc::get_tick_count();
 											t.local_transaction_id = local_transaction_id;
@@ -1374,7 +1399,7 @@ void Behind::process(void *private_d, int family)
 					sending.questions = received.questions;
 					sending.answers.clear();
 					sending.authorities.clear();
-					send_dns_message(private_d, family, sending, false, false);
+					send_dns_message(private_d, family, socktype, sending, false, false);
 				} else if (state == State::NODATA) {
 					dns::Message sending = received;
 					sending.header.flags = 0x8000;
@@ -1386,7 +1411,7 @@ void Behind::process(void *private_d, int family)
 					r->clas = q.clas;
 					r->ttl = 60;
 					r->set_soa(fake_soa());
-					send_dns_message(private_d, family, sending, false, false);
+					send_dns_message(private_d, family, socktype, sending, false, false);
 				}
 			}
 		} else if (received.header.flags & 0x8000) { // response
@@ -1425,7 +1450,7 @@ void Behind::process(void *private_d, int family)
 						auto d2 = *d;
 						d2.in4.sa4 = q.client_sa4;
 						d2.in6.sa6 = q.client_sa6;
-						send_dns_message(&d2, q.client_family, sending, false, false);
+						send_dns_message(&d2, q.client_family, socktype, sending, false, false);
 						// cahce
 						dns::Cache *cache = Cache(q.type);
 						if (cache) {
@@ -1448,7 +1473,7 @@ std::string to_string(std::vector<uint8_t> const &buf)
 
 void Behind::init_socket4(void *private_in)
 {
-	Private::D::In *in = static_cast<Private::D::In *>(private_in);
+	Private::In *in = static_cast<Private::In *>(private_in);
 
 	int sock = socket(PF_INET, SOCK_DGRAM, 0);
 	if (sock == INVALID_SOCKET) {
@@ -1467,7 +1492,41 @@ void Behind::init_socket4(void *private_in)
 		throw STRERROR("bind: ");
 	}
 
-	in->sock_fd = sock;
+	in->dgram_fd = sock;
+	in->family = AF_INET;
+
+	InetResolver::Addr addr;
+	addr.add_in4(&in->sa4.sin_addr.s_addr);
+	std::string s = addr.to_string(0);
+	logprintf(LOG_BOTH, "listen port: %s@%d\n", s.c_str(), ntohs(in->sa4.sin_port));
+}
+
+void Behind::init_socket4_tcp(void *private_in)
+{
+	Private::In *in = static_cast<Private::In *>(private_in);
+
+	int sock = socket(PF_INET, SOCK_STREAM, 0);
+	if (sock == INVALID_SOCKET) {
+		throw STRERROR("socket: ");
+	}
+
+	// fcntl(sock, F_SETFL, O_NONBLOCK);
+
+	{
+		int yes = 1;
+		setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
+	}
+
+	init_sa4(&in->sa4, nullptr, listen_port());
+	if (bind(sock, (struct sockaddr *)&in->sa4, sizeof(in->sa4)) == SOCKET_ERROR) {
+		throw STRERROR("bind: ");
+	}
+
+	if (listen(sock, 5) == SOCKET_ERROR) {
+		throw STRERROR("listen: ");
+	}
+
+	in->listen_fd = sock;
 	in->family = AF_INET;
 
 	InetResolver::Addr addr;
@@ -1478,7 +1537,7 @@ void Behind::init_socket4(void *private_in)
 
 void Behind::init_socket6(void *private_in)
 {
-	Private::D::In *in = static_cast<Private::D::In *>(private_in);
+	Private::In *in = static_cast<Private::In *>(private_in);
 
 	int sock = socket(PF_INET6, SOCK_DGRAM, 0);
 	if (sock == INVALID_SOCKET) {
@@ -1498,7 +1557,42 @@ void Behind::init_socket6(void *private_in)
 		throw STRERROR("bind: ");
 	}
 
-	in->sock_fd = sock;
+	in->dgram_fd = sock;
+	in->family = AF_INET6;
+
+	InetResolver::Addr addr;
+	addr.add_in6(&in->sa6.sin6_addr);
+	std::string s = addr.to_string(0);
+	logprintf(LOG_BOTH, "listen port: %s@%d\n", s.c_str(), ntohs(in->sa6.sin6_port));
+}
+
+void Behind::init_socket6_tcp(void *private_in)
+{
+	Private::In *in = static_cast<Private::In *>(private_in);
+
+	int sock = socket(PF_INET6, SOCK_STREAM, 0);
+	if (sock == INVALID_SOCKET) {
+		throw STRERROR("socket: ");
+	}
+
+	// fcntl(sock, F_SETFL, O_NONBLOCK);
+
+	{
+		int yes = 1;
+		setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
+		setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&yes, sizeof(yes));
+	}
+
+	init_sa6((sockaddr_in6 *)&in->sa6, nullptr, listen_port());
+	if (bind(sock, (struct sockaddr *)&in->sa6, sizeof(in->sa6)) == SOCKET_ERROR) {
+		throw STRERROR("bind: ");
+	}
+
+	if (listen(sock, 5) == SOCKET_ERROR) {
+		throw STRERROR("listen: ");
+	}
+
+	in->listen_fd = sock;
 	in->family = AF_INET6;
 
 	InetResolver::Addr addr;
@@ -1539,6 +1633,8 @@ void Behind::main()
 	Private::D d;
 	init_socket4(&d.in4);
 	init_socket6(&d.in6);
+	init_socket4_tcp(&d.in4_tcp);
+	init_socket6_tcp(&d.in6_tcp);
 
 	m->socket_mode = SocketMode::EPOLL;
 
@@ -1547,19 +1643,19 @@ void Behind::main()
 
 		fd_set fds, readfds;
 		FD_ZERO(&readfds);
-		FD_SET(d.in4.sock_fd, &readfds);
-		FD_SET(d.in6.sock_fd, &readfds);
-		int maxfd = std::max(d.in4.sock_fd, d.in6.sock_fd);
+		FD_SET(d.in4.dgram_fd, &readfds);
+		FD_SET(d.in6.dgram_fd, &readfds);
+		int maxfd = std::max(d.in4.dgram_fd, d.in6.dgram_fd);
 
 		while (1) {
 			memcpy(&fds, &readfds, sizeof(fd_set));
 			select(maxfd + 1, &fds, nullptr, nullptr, nullptr);
 
-			if (FD_ISSET(d.in4.sock_fd, &fds)) {
-				process(&d, AF_INET);
+			if (FD_ISSET(d.in4.dgram_fd, &fds)) {
+				process(&d, AF_INET, SOCK_DGRAM);
 			}
-			if (FD_ISSET(d.in6.sock_fd, &fds)) {
-				process(&d, AF_INET6);
+			if (FD_ISSET(d.in6.dgram_fd, &fds)) {
+				process(&d, AF_INET6, SOCK_DGRAM);
 			}
 
 			clean();
@@ -1572,16 +1668,22 @@ void Behind::main()
 			throw STRERROR("epoll_create1: ");
 		}
 
-		auto AddEpoll = [this](Private::D::In *in){
+		auto AddEpoll = [this](Private::In *in, int socktype){
 			in->ev = {};
 			in->ev.events = EPOLLIN;
-			in->ev.data.fd = in->sock_fd;
+			if (socktype == SOCK_DGRAM) {
+				in->ev.data.fd = in->dgram_fd;
+			} else if (socktype == SOCK_STREAM) {
+				in->ev.data.fd = in->listen_fd;
+			}
 			if (epoll_ctl_add(&in->ev) == -1) {
 				throw STRERROR("epoll_ctl: ");
 			}
 		};
-		AddEpoll(&d.in4);
-		AddEpoll(&d.in6);
+		AddEpoll(&d.in4, SOCK_DGRAM);
+		AddEpoll(&d.in6, SOCK_DGRAM);
+		AddEpoll(&d.in4_tcp, SOCK_STREAM);
+		AddEpoll(&d.in6_tcp, SOCK_STREAM);
 
 		while (1) {
 			int n = epoll_wait(m->epoll_fd, m->epoll_events.data(), m->epoll_events.size(), -1);
@@ -1593,18 +1695,26 @@ void Behind::main()
 			}
 			for (int i = 0; i < n; i++) {
 				auto fd = m->epoll_events[i].data.fd;
-				if (fd == d.in4.sock_fd) {
-					process(&d, AF_INET);
-				} else if (fd == d.in6.sock_fd) {
-					process(&d, AF_INET6);
+				if (fd == d.in4.dgram_fd) {
+					process(&d, AF_INET, SOCK_DGRAM);
+				} else if (fd == d.in6.dgram_fd) {
+					process(&d, AF_INET6, SOCK_DGRAM);
+				} else if (fd == d.in4_tcp.listen_fd) {
+					socklen_t len = sizeof(d.in4_tcp.sa4);
+					d.in4_tcp.stream_fd = accept(d.in4_tcp.listen_fd, (sockaddr *)&d.in4_tcp.sa4, &len);
+					process(&d, AF_INET, SOCK_STREAM);
+				} else if (fd == d.in6_tcp.listen_fd) {
+					socklen_t len = sizeof(d.in6_tcp.sa6);
+					d.in6_tcp.stream_fd = accept(d.in6_tcp.listen_fd, (sockaddr *)&d.in6_tcp.sa6, &len);
+					process(&d, AF_INET6, SOCK_STREAM);
 				}
 			}
 			clean();
 		}
 	}
 
-	closesocket(d.in4.sock_fd);
-	closesocket(d.in6.sock_fd);
+	closesocket(d.in4.dgram_fd);
+	closesocket(d.in6.dgram_fd);
 }
 
 // test
