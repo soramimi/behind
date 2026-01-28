@@ -68,6 +68,8 @@ private:
 	struct Private;
 	Private *m;
 
+	struct InternalData;
+
 	enum class SocketMode {
 		SELECT,
 		EPOLL,
@@ -108,10 +110,10 @@ private:
 	bool is_nodata_aaaa(std::string const &name) const;
 
 	struct Packet;
-	static Packet make_dns_message(dns::Message const &msg);
-	bool send_dns_message(void *private_d, int family, int socktype, dns::Message const &msg, bool forward, bool from_cache);
+	static Packet make_dns_message(dns::Message const &msg, bool tcp);
+	bool send_dns_message(InternalData *d, int family, int socktype, dns::Message const &msg, bool forward, bool from_cache);
 
-	void process(void *private_d, int family, int socktype);
+	void process(InternalData *d, int family, int socktype);
 
 	void init_socket4(void *private_in);
 	void init_socket6(void *private_in);
@@ -124,6 +126,8 @@ private:
 	int epoll_ctl_add(epoll_event *e);
 	int epoll_ctl_del(epoll_event *e);
 	bool accept_dns_type(DNS_TYPE t);
+
+        bool _experimental_forward_tcp(dns::Message *msg_out);
 public:
 	Behind(Option const &opt);
 	~Behind();

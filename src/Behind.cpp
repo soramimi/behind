@@ -342,7 +342,9 @@ struct Behind::Private {
 	} dns_cache;
 	std::vector<dns::Query> queries;
 	std::vector<Forwarder> forwarder;
+};
 
+struct Behind::InternalData {
 	struct In {
 		int dgram_fd = -1;
 		int listen_fd = -1;
@@ -354,11 +356,8 @@ struct Behind::Private {
 		};
 		struct epoll_event ev;
 	};
-
-	struct D {
-		In in4, in6;
-		In in4_tcp, in6_tcp; // wip: experimental: tcp support
-	};
+	In in4, in6;
+	In in4_tcp, in6_tcp; // wip: experimental: tcp support
 };
 
 const InetResolver::Addr *Hosts::find(const std::string &name)
@@ -959,12 +958,20 @@ struct SendTo {
 	void set_sa4(struct sockaddr_in const *sa)
 	{
 		family = AF_INET;
-		memcpy(&to.sa4, sa, sizeof(sockaddr_in));
+		if (sa) {
+			memcpy(&to.sa4, sa, sizeof(sockaddr_in));
+		} else {
+			memset(&to.sa4, 0, sizeof(sockaddr_in));
+		}
 	}
 	void set_sa6(struct sockaddr_in6 const *sa)
 	{
 		family = AF_INET6;
-		memcpy(&to.sa6, sa, sizeof(sockaddr_in6));
+		if (sa) {
+			memcpy(&to.sa6, sa, sizeof(sockaddr_in6));
+		} else {
+			memset(&to.sa6, 0, sizeof(sockaddr_in6));
+		}
 	}
 	void set_sa4(int sock, struct sockaddr_in const *sa)
 	{
@@ -1019,6 +1026,17 @@ struct SendTo {
 		}
 		return -1;
 	}
+	ssize_t send(void const *buf, size_t len)
+	{
+		int flags = 0;
+		if (family == AF_INET) {
+			return ::send(sock, buf, len, flags);
+		}
+		if (family == AF_INET6) {
+			return ::send(sock, buf, len, flags);
+		}
+		return -1;
+	}
 };
 
 bool Behind::is_nxdomain(std::string const &name) const
@@ -1060,7 +1078,7 @@ struct Behind::Packet {
 	}
 };
 
-Behind::Packet Behind::make_dns_message(dns::Message const &msg)
+Behind::Packet Behind::make_dns_message(dns::Message const &msg, bool tcp)
 {
 	Packet ret;
 	std::map<std::string, size_t> namemap;
@@ -1102,16 +1120,21 @@ Behind::Packet Behind::make_dns_message(dns::Message const &msg)
 		}
 	}
 
+	if (tcp) {
+		uint16_t len = htons((uint16_t)ret.buffer.size());
+		ret.buffer.insert(ret.buffer.begin(), (char const *)&len, (char const *)&len + 2);
+	}
+
 	return ret;
 }
 
-bool Behind::send_dns_message(void *private_d, int family, int socktype, dns::Message const &msg, bool forward, bool from_cache)
+bool Behind::send_dns_message(InternalData *d, int family, int socktype, dns::Message const &msg, bool forward, bool from_cache)
 {
-	Private::D *d = static_cast<Private::D *>(private_d);
-
-	Packet packet = make_dns_message(msg);
+	bool tcp = socktype == SOCK_STREAM;
+	Packet packet = make_dns_message(msg, tcp);
 	if (!packet) return false;
 
+	bool ok = false;
 	std::string client;
 	SendTo sender;
 	if (socktype == SOCK_DGRAM) {
@@ -1120,8 +1143,17 @@ bool Behind::send_dns_message(void *private_d, int family, int socktype, dns::Me
 		} else if (family == AF_INET6) {
 			sender.set_sa6(d->in6.dgram_fd, &d->in6.sa6);
 		}
+		ok = sender.sendto(&packet.buffer[0], packet.buffer.size()) == (ssize_t)packet.buffer.size();
+	} else if (socktype == SOCK_STREAM) {
+		if (family == AF_INET) {
+			sender.set_sa4(d->in4_tcp.stream_fd, nullptr);
+		} else if (family == AF_INET6) {
+			sender.set_sa6(d->in6_tcp.stream_fd, nullptr);
+		}
+		ssize_t len = sender.send(&packet.buffer[0], packet.buffer.size());
+		logprintf(LOG_DEFAULT, "---%d\n", (int)len);
+		// ok = sender.send(&packet.buffer[0], packet.buffer.size()) == (ssize_t)packet.buffer.size();
 	}
-	bool ok = sender.sendto(&packet.buffer[0], packet.buffer.size()) == (ssize_t)packet.buffer.size();
 	client = sender.addr_to_string();
 
 	char const *comment = "";
@@ -1219,10 +1251,50 @@ bool Behind::accept_dns_type(DNS_TYPE t)
 	return false;
 }
 
-void Behind::process(void *private_d, int family, int socktype)
+bool Behind::_experimental_forward_tcp(dns::Message *msg_out)
 {
-	Private::D *d = static_cast<Private::D *>(private_d);
+	InetResolver::Addr addr;
+	InetResolver resolver;
+	resolver.resolve("192.168.1.1", InetResolver::IN4, &addr);
+	void const *a = addr.to_in4(0);
+	sockaddr_in sa = {};
+	sa.sin_family = AF_INET;
+	memcpy(&sa.sin_addr.s_addr, a, 4);
+	sa.sin_port = htons(53);
 
+	int sock = socket(PF_INET, SOCK_STREAM, 0);
+	if (sock == INVALID_SOCKET) {
+		logprintf(LOG_DEFAULT, "socket: %s\n", strerror(errno));
+		return false;
+	}
+
+	bool ok = false;
+	if (connect(sock, (sockaddr *)&sa, sizeof(sa)) == SOCKET_ERROR) {
+		logprintf(LOG_DEFAULT, "connect: %s\n", strerror(errno));
+	} else {
+		dns::Message msg = {};
+		msg.header.id = 1;
+		msg.header.flags = 0x0100;
+		msg.questions.push_back({});
+		msg.questions.back().name = "www.google.com";
+		msg.questions.back().type = DNS_TYPE::A;
+		msg.questions.back().clas = DNS_CLASS_IN;
+		Packet packet = make_dns_message(msg, false);
+		uint16_t len = htons((uint16_t)packet.buffer.size());
+		send(sock, (char *)&len, 2, 0);
+		send(sock, packet.buffer.data(), packet.buffer.size(), 0);
+		char tmp[4096];
+		int n = recv(sock, tmp, sizeof(tmp), 0);
+		parse_dns_message(tmp + 2, tmp + n, msg_out);
+		ok = true;
+	}
+
+	closesocket(sock);
+	return ok;
+}
+
+void Behind::process(InternalData *d, int family, int socktype)
+{
 	std::vector<char> buf(1500);
 	if (family == AF_INET || family == AF_INET6) {
 		int len = 0;
@@ -1268,6 +1340,22 @@ void Behind::process(void *private_d, int family, int socktype)
 		};
 
 		if ((received.header.flags & 0xf800) == 0x0000) { // standard query
+
+			{ // experimental
+				if (socktype == SOCK_STREAM) {
+					if (family == AF_INET) {
+						dns::Message msg;
+						if (_experimental_forward_tcp(&msg)) {
+							msg.header.id = received.header.id;
+							// send
+							InternalData d2 = *d;
+							send_dns_message(&d2, family, socktype, msg, false, false);
+						}
+						return;
+					}
+				}
+			}
+
 			for (auto it = received.questions.begin(); it != received.questions.end(); it++) {
 				dns::Question const &q = *it;
 
@@ -1345,7 +1433,7 @@ void Behind::process(void *private_d, int family, int socktype)
 										sending.header.flags = 0x0100;
 										sending.questions = {q};
 										sending.questions.front().name = query_name;
-										Private::D d2 = *d;
+										InternalData d2 = *d;
 										if (forwarder.af_type == AF_INET) {
 											init_sa4(&d2.in4.sa4, (in_addr const *)forwarder.addr, forwarder.port);
 										} else if (forwarder.af_type == AF_INET6) {
@@ -1358,6 +1446,7 @@ void Behind::process(void *private_d, int family, int socktype)
 											t.requester_id = received.header.id;
 											t.upstream_id = sending.header.id;
 											t.type = q.type;
+											t.client_family = family;
 											if (family == AF_INET) {
 												t.client_sa4 = d->in4.sa4;
 											} else if (family == AF_INET6) {
@@ -1399,7 +1488,7 @@ void Behind::process(void *private_d, int family, int socktype)
 					sending.questions = received.questions;
 					sending.answers.clear();
 					sending.authorities.clear();
-					send_dns_message(private_d, family, socktype, sending, false, false);
+					send_dns_message(d, family, socktype, sending, false, false);
 				} else if (state == State::NODATA) {
 					dns::Message sending = received;
 					sending.header.flags = 0x8000;
@@ -1411,7 +1500,7 @@ void Behind::process(void *private_d, int family, int socktype)
 					r->clas = q.clas;
 					r->ttl = 60;
 					r->set_soa(fake_soa());
-					send_dns_message(private_d, family, socktype, sending, false, false);
+					send_dns_message(d, family, socktype, sending, false, false);
 				}
 			}
 		} else if (received.header.flags & 0x8000) { // response
@@ -1463,17 +1552,9 @@ void Behind::process(void *private_d, int family, int socktype)
 	}
 }
 
-std::string to_string(std::vector<uint8_t> const &buf)
-{
-	if (buf.empty()) {
-		return std::string();
-	}
-	return std::string((char const *)buf.data(), buf.size());
-}
-
 void Behind::init_socket4(void *private_in)
 {
-	Private::In *in = static_cast<Private::In *>(private_in);
+	Behind::InternalData::In *in = static_cast<Behind::InternalData::In *>(private_in);
 
 	int sock = socket(PF_INET, SOCK_DGRAM, 0);
 	if (sock == INVALID_SOCKET) {
@@ -1503,14 +1584,14 @@ void Behind::init_socket4(void *private_in)
 
 void Behind::init_socket4_tcp(void *private_in)
 {
-	Private::In *in = static_cast<Private::In *>(private_in);
+	Behind::InternalData::In *in = static_cast<Behind::InternalData::In *>(private_in);
 
 	int sock = socket(PF_INET, SOCK_STREAM, 0);
 	if (sock == INVALID_SOCKET) {
 		throw STRERROR("socket: ");
 	}
 
-	// fcntl(sock, F_SETFL, O_NONBLOCK);
+	fcntl(sock, F_SETFL, O_NONBLOCK);
 
 	{
 		int yes = 1;
@@ -1537,7 +1618,7 @@ void Behind::init_socket4_tcp(void *private_in)
 
 void Behind::init_socket6(void *private_in)
 {
-	Private::In *in = static_cast<Private::In *>(private_in);
+	Behind::InternalData::In *in = static_cast<Behind::InternalData::In *>(private_in);
 
 	int sock = socket(PF_INET6, SOCK_DGRAM, 0);
 	if (sock == INVALID_SOCKET) {
@@ -1568,14 +1649,14 @@ void Behind::init_socket6(void *private_in)
 
 void Behind::init_socket6_tcp(void *private_in)
 {
-	Private::In *in = static_cast<Private::In *>(private_in);
+	Behind::InternalData::In *in = static_cast<Behind::InternalData::In *>(private_in);
 
 	int sock = socket(PF_INET6, SOCK_STREAM, 0);
 	if (sock == INVALID_SOCKET) {
 		throw STRERROR("socket: ");
 	}
 
-	// fcntl(sock, F_SETFL, O_NONBLOCK);
+	fcntl(sock, F_SETFL, O_NONBLOCK);
 
 	{
 		int yes = 1;
@@ -1630,7 +1711,7 @@ void Behind::main()
 {
 	add_hosts(m->option.hosts);
 
-	Private::D d;
+	InternalData d;
 	init_socket4(&d.in4);
 	init_socket6(&d.in6);
 	init_socket4_tcp(&d.in4_tcp);
@@ -1668,7 +1749,7 @@ void Behind::main()
 			throw STRERROR("epoll_create1: ");
 		}
 
-		auto AddEpoll = [this](Private::In *in, int socktype){
+		auto AddEpoll = [this](Behind::InternalData::In *in, int socktype){
 			in->ev = {};
 			in->ev.events = EPOLLIN;
 			if (socktype == SOCK_DGRAM) {
@@ -1703,6 +1784,7 @@ void Behind::main()
 					socklen_t len = sizeof(d.in4_tcp.sa4);
 					d.in4_tcp.stream_fd = accept(d.in4_tcp.listen_fd, (sockaddr *)&d.in4_tcp.sa4, &len);
 					process(&d, AF_INET, SOCK_STREAM);
+					closesocket(d.in4_tcp.stream_fd);
 				} else if (fd == d.in6_tcp.listen_fd) {
 					socklen_t len = sizeof(d.in6_tcp.sa6);
 					d.in6_tcp.stream_fd = accept(d.in6_tcp.listen_fd, (sockaddr *)&d.in6_tcp.sa6, &len);
@@ -1715,11 +1797,21 @@ void Behind::main()
 
 	closesocket(d.in4.dgram_fd);
 	closesocket(d.in6.dgram_fd);
+	closesocket(d.in4.listen_fd);
+	closesocket(d.in6.listen_fd);
 }
 
 // test
 
 #define EXPECT_EQ(a, b) assert((a) == (b))
+
+std::string to_string(std::vector<uint8_t> const &buf)
+{
+	if (buf.empty()) {
+		return std::string();
+	}
+	return std::string((char const *)buf.data(), buf.size());
+}
 
 void Behind::test()
 {
@@ -1751,7 +1843,7 @@ void Behind::test()
 		EXPECT_EQ(msg.answers[0].ttl, 300);
 
 		{
-			Packet response = make_dns_message(msg);
+			Packet response = make_dns_message(msg, false);
 
 			dns::Message msg2;
 			char const *begin = response.buffer.data();
@@ -1804,7 +1896,7 @@ void Behind::test()
 		EXPECT_EQ(msg.answers[2].ttl, 300);
 
 		{
-			Packet response = make_dns_message(msg);
+			Packet response = make_dns_message(msg, false);
 
 			dns::Message msg2;
 			char const *begin = response.buffer.data();
