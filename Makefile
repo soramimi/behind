@@ -45,4 +45,4 @@ q3:
 	dig @127.0.0.1 -p 5301 www.amazon.co.jp
 
 q4:
-	dig www.google.com @127.0.0.1 +tls
+	dig @127.0.0.1 -p 5301 www.google.com +tcp

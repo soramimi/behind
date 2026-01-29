@@ -13,6 +13,37 @@
 #define STANDARD_DNS_PORT 53
 #define DEFAUT_LISTEN_PORT 5300
 
+class ProtocolFamilyType {
+private:
+	int family_ = AF_UNSPEC;
+	int type_ = SOCK_DGRAM;
+private:
+public:
+	ProtocolFamilyType() = default;
+	ProtocolFamilyType(int family, int type)
+		: family_(family), type_(type)
+	{}
+	int family() const
+	{
+		return family_;
+	}
+	int type() const
+	{
+		return type_;
+	}
+	int pfamily() const
+	{
+		switch (family()) {
+		case AF_INET:
+			return PF_INET;
+		case AF_INET6:
+			return PF_INET6;
+		}
+		return PF_UNSPEC;
+	}
+};
+
+
 class Hosts {
 private:
 	std::unordered_map<std::string, InetResolver::Addr> map_;
@@ -111,14 +142,11 @@ private:
 
 	struct Packet;
 	static Packet make_dns_message(dns::Message const &msg, bool tcp);
-	bool send_dns_message(InternalData *d, int family, int socktype, dns::Message const &msg, bool forward, bool from_cache);
+	bool send_dns_message(InternalData *d, const ProtocolFamilyType &proto, dns::Message const &msg, bool forward, bool from_cache);
 
-	void process(InternalData *d, int family, int socktype);
+	void process(InternalData *d, const ProtocolFamilyType &proto);
 
-	void init_socket4(void *private_in);
-	void init_socket6(void *private_in);
-	void init_socket4_tcp(void *private_in);
-	void init_socket6_tcp(void *private_in);
+	void init_socket(void *private_in, ProtocolFamilyType proto);
 
 	const InetResolver::Addr *find_host(std::string const &name) const;
 	void add_hosts(const std::map<std::string, std::string> &hosts);
@@ -127,7 +155,8 @@ private:
 	int epoll_ctl_del(epoll_event *e);
 	bool accept_dns_type(DNS_TYPE t);
 
-        bool _experimental_forward_tcp(dns::Message *msg_out);
+	bool _experimental_forward_tcp(std::vector<dns::Question> const &questions, dns::Message *msg_out);
+	std::vector<char> read(InternalData *d, const ProtocolFamilyType &proto);
 public:
 	Behind(Option const &opt);
 	~Behind();
