@@ -15,29 +15,26 @@
 
 class ProtocolFamilyType {
 private:
-	int family_ = AF_UNSPEC;
-	int type_ = SOCK_DGRAM;
-private:
+	int af_family_ = AF_UNSPEC;
+	int sock_type_ = SOCK_DGRAM;
 public:
 	ProtocolFamilyType() = default;
-	ProtocolFamilyType(int family, int type)
-		: family_(family), type_(type)
+	ProtocolFamilyType(int af_family, int sock_type)
+		: af_family_(af_family), sock_type_(sock_type)
 	{}
 	int family() const
 	{
-		return family_;
+		return af_family_;
 	}
-	int type() const
+	int socktype() const
 	{
-		return type_;
+		return sock_type_;
 	}
 	int pfamily() const
 	{
 		switch (family()) {
-		case AF_INET:
-			return PF_INET;
-		case AF_INET6:
-			return PF_INET6;
+		case AF_INET:  return PF_INET;
+		case AF_INET6: return PF_INET6;
 		}
 		return PF_UNSPEC;
 	}
@@ -94,12 +91,11 @@ struct Message;
 
 class Behind {
 public:
+	struct InternalData;
 private:
 
 	struct Private;
 	Private *m;
-
-	struct InternalData;
 
 	enum class SocketMode {
 		SELECT,
@@ -122,12 +118,38 @@ private:
 	static void write_ul(std::vector<char> *out, uint32_t v);
 	static void write_us(void *out, uint16_t v);
 	static void write_ul(void *out, uint32_t v);
-	static bool write_name(std::vector<char> *out, std::map<std::string, size_t> *namemap, std::string const &name);
+	class NameMap {
+	private:
+		size_t offset_ = 0;
+		std::map<std::string, size_t> map_;
+	public:
+		void set_offset(size_t offset)
+		{
+			offset_ = offset;
+		}
+		size_t offset() const
+		{
+			return offset_;
+		}
+		std::map<std::string, size_t>::iterator find(std::string const &name)
+		{
+			return map_.find(name);
+		}
+		std::map<std::string, size_t>::iterator end()
+		{
+			return map_.end();
+		}
+		void set(std::string const &key, size_t val)
+		{
+			map_[key] = val > offset_ ? val - offset_ : 0;
+		}
+	};
+	static bool write_name(std::vector<char> *out, NameMap *namemap, std::string const &name);
 	static int decode_name(char const *begin, char const *end, char const *ptr, std::vector<char> *out);
 	static int decode_name(char const *begin, char const *end, char const *ptr, std::string *name);
 	static void write_dns_header(std::vector<char> *out, uint16_t id, uint16_t flags, uint16_t qdcount, uint16_t ancount, uint16_t nscount, uint16_t arcount);
-	static void write_dns_question_rr(std::vector<char> *out, std::map<std::string, size_t> *namemap, std::string const &name, DNS_TYPE type, uint16_t clas);
-	static bool write_dns_answer_rr(std::vector<char> *out, std::map<std::string, size_t> *namemap, std::string const &name, uint16_t clas, uint32_t ttl, dns::Record const &item);
+	static void write_dns_question_rr(std::vector<char> *out, NameMap *namemap, std::string const &name, DNS_TYPE type, uint16_t clas);
+	static bool write_dns_answer_rr(std::vector<char> *out, NameMap *namemap, std::string const &name, uint16_t clas, uint32_t ttl, dns::Record const &item);
 	static int parse_question_section(char const *begin, char const *end, char const *ptr, dns::Question *out);
 	std::vector<Forwarder> get_forwarder();
 	void init_forwarder();
