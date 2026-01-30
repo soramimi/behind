@@ -340,7 +340,7 @@ struct Behind::Private {
 		dns::Cache soa;
 	} dns_cache;
 	std::vector<dns::Task> queries;
-	std::vector<Forwarder> forwarder;
+	std::vector<Forwarder> forwarders;
 };
 
 struct Behind::InternalData {
@@ -621,9 +621,23 @@ int Behind::parse_question_section(const char *begin, const char *end, const cha
 	return 0;
 }
 
-std::vector<Forwarder> Behind::get_forwarder()
+std::vector<Forwarder const *> Behind::get_forwarder() const
 {
-	return m->forwarder;
+	const size_t race_max = 2;
+	std::vector<Forwarder const *> ret;
+	for (Forwarder const &f : m->forwarders) {
+		if (f) {
+			ret.push_back(&f);
+		}
+	}
+	size_t n = ret.size();
+	size_t m = std::min(race_max, n);
+	for (size_t i = 0; i < m; i++) {
+		size_t j = i + rand() % (n - i);
+		std::swap(ret[i], ret[j]);
+	}
+	ret.resize(m);
+	return ret;
 }
 
 uint16_t Behind::next_txid()
@@ -761,7 +775,7 @@ void Behind::init_forwarder()
 			}
 		}
 
-		m->forwarder.push_back(forwarder);
+		m->forwarders.push_back(forwarder);
 	}
 }
 
@@ -1186,7 +1200,7 @@ bool Behind::accept_dns_type(DNS_TYPE t)
 	return false;
 }
 
-std::optional<dns::Message> Behind::_experimental_forward_tcp(InternalData *d, dns::Header const &header, std::vector<dns::Question> const &questions, Forwarder const &forwarder)
+std::optional<dns::Message> Behind::_experimental_forward_tcp(InternalData *d, dns::Header const &header, dns::Question const &question, Forwarder const &forwarder)
 {
 	ProtocolFamilyType proto = {forwarder.af_type, SOCK_STREAM};
 
@@ -1221,7 +1235,7 @@ std::optional<dns::Message> Behind::_experimental_forward_tcp(InternalData *d, d
 		dns::Message msg;
 		msg.header.id = header.id;
 		msg.header.flags = 0x0100;
-		msg.questions = questions;
+		msg.questions = {question};
 
 		InternalData d2 =*d;
 		if (proto.is_inet4()) {
@@ -1258,11 +1272,13 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &proto,
 	if (m->option.case_randomize) {
 		query_name = randomize_case(query_name);
 	}
+
 	dns::Message sending;
 	sending.header.id = next_txid();
 	sending.header.flags = 0x0100;
 	sending.questions = {q};
 	sending.questions.front().name = query_name;
+
 	InternalData d2 = d;
 	if (forwarder.is_inet4()) {
 		init_sa4(&d2.in4_udp.sa4, (in_addr const *)forwarder.addr, forwarder.port);
@@ -1347,7 +1363,7 @@ dns::Cache *Behind::get_cache(DNS_TYPE type)
 	return nullptr;
 }
 
-void Behind::process_query(InternalData *d, ProtocolFamilyType const &proto, dns::Header const &header, dns::Question const &q)
+void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &proto, dns::Header const &header, dns::Question const &q)
 {
 	enum class State {
 		NONE,
@@ -1412,23 +1428,14 @@ void Behind::process_query(InternalData *d, ProtocolFamilyType const &proto, dns
 						state = State::NXDOMAIN;
 						const uint32_t local_transaction_id = next_local_transaction_id();
 						clean_transaction(local_transaction_id);
-						std::vector<Forwarder> forwarders = get_forwarder();
-						size_t n = forwarders.size();
-						if (n > 0) {
-							size_t i = rand() % n;
-							Forwarder const &forwarder1 = forwarders[i];
-							if (forwarder1) {
-								forward_udp(*d, proto, header,q, local_transaction_id, forwarder1);
-								state = State::NONE;
+						std::vector<Forwarder const *> forwarders = get_forwarder();
+						if (!forwarders.empty()) {
+							for (Forwarder const *f : forwarders) {
+								forward_udp(*d, proto, header,q, local_transaction_id, *f);
 							}
-							if (n > 1) {
-								size_t j = (i + 1 + rand() % (n - 1)) % n;
-								Forwarder const &forwarder2 = forwarders[j];
-								if (forwarder2) {
-									forward_udp(*d, proto, header,q, local_transaction_id, forwarder2);
-									state = State::NONE;
-								}
-							}
+							state = State::NONE;
+						} else {
+							logprintf(LOG_DEFAULT, "No forwarder configured.\n");
 						}
 					}
 				}
@@ -1456,6 +1463,22 @@ void Behind::process_query(InternalData *d, ProtocolFamilyType const &proto, dns
 		r->ttl = 60;
 		r->set_soa(fake_soa());
 		send_dns_message(d, proto, sending, false, false);
+	}
+}
+
+void Behind::process_query_tcp(InternalData *d, ProtocolFamilyType const &proto, dns::Header const &header, dns::Question const &q)
+{
+	std::vector<Forwarder const *> forwarders = get_forwarder();
+	if (!forwarders.empty()) {
+		Forwarder const *f = forwarders.front();
+		auto opt = _experimental_forward_tcp(d, header, q, *f);
+		if (opt) {
+			dns::Message *msg = &*opt;
+			msg->header.id = header.id;
+			send_dns_message(d, proto, *msg, false, false);
+		}
+	} else {
+		logprintf(LOG_DEFAULT, "No forwarder configured for TCP.\n");
 	}
 }
 
@@ -1524,21 +1547,11 @@ void Behind::process(InternalData *d, ProtocolFamilyType const &proto)
 
 		if ((received.header.flags & 0xf800) == 0x0000) { // standard query
 			for (auto it = received.questions.begin(); it != received.questions.end(); it++) {
+				dns::Question const &q = *it;
 				if (proto.is_dgram()) {
-					dns::Question const &q = *it;
-					process_query(d, proto, received.header, q);
+					process_query_udp(d, proto, received.header, q);
 				} else if (proto.is_stream()) { // experimental
-					std::vector<Forwarder> forwarders = get_forwarder();
-					size_t n = forwarders.size();
-					if (n > 0) {
-						Forwarder const &forwarder = forwarders[0];
-						auto opt = _experimental_forward_tcp(d, received.header, received.questions, forwarder);
-						if (opt) {
-							dns::Message *msg = &*opt;
-							msg->header.id = received.header.id;
-							send_dns_message(d, proto, *msg, false, false);
-						}
-					}
+					process_query_tcp(d, proto, received.header, q);
 				}
 			}
 		} else if (received.header.flags & 0x8000) { // response

@@ -176,7 +176,7 @@ private:
 	static void write_dns_question_rr(std::vector<char> *out, NameMap *namemap, std::string const &name, DNS_TYPE type, uint16_t clas);
 	static bool write_dns_answer_rr(std::vector<char> *out, NameMap *namemap, std::string const &name, uint16_t clas, uint32_t ttl, dns::Record const &item);
 	static int parse_question_section(char const *begin, char const *end, char const *ptr, dns::Question *out);
-	std::vector<Forwarder> get_forwarder();
+        std::vector<const Forwarder *> get_forwarder() const;
 	void init_forwarder();
 	void clean();
 	void clean_transaction(uint32_t id);
@@ -202,12 +202,13 @@ private:
 	int epoll_ctl_del(epoll_event *e);
 	bool accept_dns_type(DNS_TYPE t);
 
-	std::optional<dns::Message> _experimental_forward_tcp(InternalData *d, dns::Header const &header, std::vector<dns::Question> const &questions, Forwarder const &forwarder);
+        std::optional<dns::Message> _experimental_forward_tcp(InternalData *d, dns::Header const &header, const dns::Question &question, Forwarder const &forwarder);
 	void forward_udp(const InternalData &d, const ProtocolFamilyType &proto, const dns::Header &header, const dns::Question &q, uint32_t local_transaction_id, const Forwarder &forwarder);
 
 	std::vector<char> read(InternalData *d, const ProtocolFamilyType &proto);
 	dns::Cache *get_cache(DNS_TYPE type);
-	void process_query(InternalData *d, const ProtocolFamilyType &proto, const dns::Header &header, const dns::Question &q);
+	void process_query_udp(InternalData *d, const ProtocolFamilyType &proto, const dns::Header &header, const dns::Question &q);
+	void process_query_tcp(InternalData *d, const ProtocolFamilyType &proto, const dns::Header &header, const dns::Question &q);
 	void process_response(InternalData *d, const dns::Message &received);
 	uint16_t next_txid();
 public:
