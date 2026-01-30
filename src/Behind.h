@@ -15,14 +15,14 @@
 
 class ProtocolFamilyType {
 private:
-	int af_family_ = AF_UNSPEC;
+	sa_family_t af_family_ = AF_UNSPEC;
 	int sock_type_ = SOCK_DGRAM;
 public:
 	ProtocolFamilyType() = default;
-	ProtocolFamilyType(int af_family, int sock_type)
+	ProtocolFamilyType(sa_family_t af_family, int sock_type)
 		: af_family_(af_family), sock_type_(sock_type)
 	{}
-	int family() const
+	sa_family_t family() const
 	{
 		return af_family_;
 	}
@@ -179,6 +179,9 @@ private:
 
 	bool _experimental_forward_tcp(std::vector<dns::Question> const &questions, dns::Message *msg_out);
 	std::vector<char> read(InternalData *d, const ProtocolFamilyType &proto);
+	dns::Cache *get_cache(DNS_TYPE type);
+	void process_query(InternalData *d, const ProtocolFamilyType &proto, const dns::Header &header, const dns::Question &q);
+	void process_response(InternalData *d, const dns::Message &received);
 public:
 	Behind(Option const &opt);
 	~Behind();

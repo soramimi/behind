@@ -10,11 +10,11 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <optional>
 #include <regex>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <optional>
 
 #define stricmp(A, B) strcasecmp(A, B)
 #define STRERROR(S) (std::string(S) + strerror(errno))
@@ -56,22 +56,20 @@ std::string addr_to_string(int family, struct sockaddr *addr)
 namespace dns {
 
 struct Header {
-	uint16_t id;
+	uint16_t id = 0;
 	uint16_t flags = 0x8180;
-	uint16_t qdcount;
-	uint16_t ancount;
-	uint16_t nscount;
-	uint16_t arcount;
+	uint16_t qdcount = 0;
+	uint16_t ancount = 0;
+	uint16_t nscount = 0;
+	uint16_t arcount = 0;
 };
 
 struct Query {
-	// int forward_fd;
 	uint64_t timestamp;
 	uint32_t local_transaction_id;
 	uint16_t upstream_id;
 	uint16_t requester_id;
 	DNS_TYPE type = DNS_TYPE::A;
-	// sa_family_t client_family = AF_INET;
 	ProtocolFamilyType proto;
 	union {
 		sockaddr_in client_sa4;
@@ -1039,7 +1037,7 @@ Behind::Packet Behind::make_dns_message(dns::Message const &msg, bool tcp)
 	};
 
 	dns::Header h = msg.header;
-	h.qdcount = LimitCount(msg.answers.size());
+	h.qdcount = LimitCount(msg.questions.size());
 	h.ancount = LimitCount(msg.answers.size());
 	h.nscount = LimitCount(msg.authorities.size());
 	h.arcount = 0;
@@ -1208,14 +1206,19 @@ bool Behind::_experimental_forward_tcp(std::vector<dns::Question> const &questio
 		msg.header.id = 1;
 		msg.header.flags = 0x0100;
 		msg.questions = questions;
-		Packet packet = make_dns_message(msg, false);
-		uint16_t len = htons((uint16_t)packet.buffer.size());
-		send(sock, (char *)&len, 2, 0);
+		Packet packet = make_dns_message(msg, true);
 		send(sock, packet.buffer.data(), packet.buffer.size(), 0);
+
 		char tmp[4096];
 		int n = recv(sock, tmp, sizeof(tmp), 0);
-		parse_dns_message(tmp + 2, tmp + n, msg_out);
-		ok = true;
+		if (n > 2) {
+			n -= 2;
+			n = std::min(n, (int)ntohs(*(uint16_t *)tmp));
+			char const *begin = tmp + 2;
+			char const *end = begin + n;
+			parse_dns_message(begin, end, msg_out);
+			ok = true;
+		}
 	}
 
 	closesocket(sock);
@@ -1249,13 +1252,10 @@ std::vector<char> Behind::read(InternalData *d, ProtocolFamilyType const &proto)
 		}
 	} else if (proto.socktype() == SOCK_STREAM) {
 		int sock = INVALID_SOCKET;
-		struct sockaddr *sa = nullptr;
 		if (proto.family() == AF_INET) {
 			sock = d->in4_tcp.fd;
-			sa = (struct sockaddr *)&d->in4_tcp.sa4;
 		} else if (proto.family() == AF_INET6) {
 			sock = d->in6_tcp.fd;
-			sa = (struct sockaddr *)&d->in6_tcp.sa6;
 		} else {
 			return {};
 		}
@@ -1273,6 +1273,214 @@ std::vector<char> Behind::read(InternalData *d, ProtocolFamilyType const &proto)
 	return {};
 }
 
+dns::Cache *Behind::get_cache(DNS_TYPE type)
+{
+	switch (type) {
+	case DNS_TYPE::A:    return &m->dns_cache.a;
+	case DNS_TYPE::AAAA: return &m->dns_cache.aaaa;
+	case DNS_TYPE::SOA:  return &m->dns_cache.soa;
+	}
+	return nullptr;
+}
+
+void Behind::process_query(InternalData *d, ProtocolFamilyType const &proto, dns::Header const &header, dns::Question const &q)
+{
+	enum class State {
+		NONE,
+		FORWARD,
+		NXDOMAIN,
+		NODATA,
+	};
+	State state = State::NONE;
+	if (!q.name.empty()) {
+		if (q.clas == DNS_CLASS_IN) {
+			if (accept_dns_type(q.type)) {
+				logprintf(LOG_DEFAULT, "Q: %s %s\n", q.name.c_str(), dns_type_to_string(q.type));
+				state = State::FORWARD;
+				{
+					// check known hosts
+					InetResolver::Addr const *addr = m->hosts.find(q.name);
+					if (addr) {
+						state = State::NONE;
+						std::vector<dns::Record> rec;
+						if ((q.type == DNS_TYPE::A && addr->type == InetResolver::IN4) || (q.type == DNS_TYPE::AAAA && addr->type == InetResolver::IN6)) {
+							dns::Record r;
+							r.name = q.name;
+							r.type = q.type;
+							r.ttl = ttl();
+							for (std::vector<uint8_t> const &a : addr->addr) {
+								r.bin = a;
+								rec.push_back(r);
+							}
+							dns::Message sending;
+							sending.header.id = header.id;
+							sending.header.flags = 0x8180;
+							sending.questions = {q};
+							sending.answers = rec;
+							send_dns_message(d, proto, sending, false, false);
+						} else {
+							state = State::NXDOMAIN;
+						}
+					}
+				}
+				if (state == State::NXDOMAIN) {
+					// nop
+				} else if (is_nxdomain(q.name)) {
+					state = State::NXDOMAIN;
+				} else if (q.type == DNS_TYPE::AAAA && is_nodata_aaaa(q.name)) {
+					state = State::NODATA;
+				} else if (state == State::FORWARD) {
+					dns::Cache *cache = get_cache(q.type);
+					if (cache) {
+						auto entry = cache->find(q.name);
+						if (entry) {
+							dns::Message sending;
+							sending.header.id = header.id;
+							sending.header.flags = 0x8180;
+							sending.questions = {q};
+							sending.answers = entry->answers;
+							sending.authorities = entry->authorities;
+							send_dns_message(d, proto, sending, false, true);
+							state = State::NONE;
+						}
+					}
+					if (state != State::NONE) {
+						state = State::NXDOMAIN;
+						const auto local_transaction_id = next_local_transaction_id();
+						clean_transaction(local_transaction_id);
+						auto Forward = [&](Forwarder const &forwarder){
+							std::string query_name = q.name;
+							if (m->option.case_randomize) {
+								query_name = randomize_case(query_name);
+							}
+							dns::Message sending;
+							sending.header.id = m->txid_gen.next();
+							sending.header.flags = 0x0100;
+							sending.questions = {q};
+							sending.questions.front().name = query_name;
+							InternalData d2 = *d;
+							if (forwarder.af_type == AF_INET) {
+								init_sa4(&d2.in4_udp.sa4, (in_addr const *)forwarder.addr, forwarder.port);
+							} else if (forwarder.af_type == AF_INET6) {
+								init_sa6(&d2.in6_udp.sa6, (in6_addr const *)forwarder.addr, forwarder.port);
+							}
+							if (send_dns_message(&d2, {forwarder.af_type, SOCK_DGRAM}, sending, true, false)) {
+								dns::Query t;
+								t.timestamp = misc::get_tick_count();
+								t.local_transaction_id = local_transaction_id;
+								t.requester_id = header.id;
+								t.upstream_id = sending.header.id;
+								t.type = q.type;
+								t.proto = proto;
+								if (proto.family() == AF_INET) {
+									t.client_sa4 = d->in4_udp.sa4;
+								} else if (proto.family() == AF_INET6) {
+									t.client_sa6 = d->in6_udp.sa6;
+								}
+								t.request_name = q.name;
+								t.forward_name = query_name;
+								push_query(t);
+							}
+						};
+						std::vector<Forwarder> forwarders = get_forwarder();
+						size_t n = forwarders.size();
+						if (n > 0) {
+							size_t i = rand() % n;
+							Forwarder const &forwarder1 = forwarders[i];
+							if (forwarder1) {
+								Forward(forwarder1);
+								state = State::NONE;
+							}
+							if (n > 1) {
+								size_t j = (i + 1 + rand() % (n - 1)) % n;
+								Forwarder const &forwarder2 = forwarders[j];
+								if (forwarder2) {
+									Forward(forwarder2);
+									state = State::NONE;
+								}
+							}
+						}
+					}
+				}
+			} else {
+				state = State::NODATA;
+			}
+		}
+	}
+	if (state == State::NXDOMAIN) {
+		dns::Message sending;
+		sending.header.id = header.id;
+		sending.header.flags = 0x8003;
+		sending.questions = {q};
+		send_dns_message(d, proto, sending, false, false);
+	} else if (state == State::NODATA) {
+		dns::Message sending;
+		sending.header.id = header.id;
+		sending.header.flags = 0x8000;
+		sending.questions = {q};
+		sending.authorities = {dns::Record()};
+		dns::Record *r = &sending.authorities.back();
+		r->name = q.name;
+		r->type = DNS_TYPE::SOA;
+		r->clas = q.clas;
+		r->ttl = 60;
+		r->set_soa(fake_soa());
+		send_dns_message(d, proto, sending, false, false);
+	}
+}
+
+void Behind::process_response(InternalData *d, dns::Message const &received)
+{
+	dns::Query query;
+	if (take_query(received.header.id, &query)) {
+		if (accept_dns_type(query.type)) {
+			if (received.questions.size() == 1 && received.questions.front().name == query.forward_name) {
+				auto AmendName = [&query](std::string const &name){
+					if (stricmp(query.request_name.c_str(), name.c_str()) == 0) {
+						return query.request_name;
+					} else {
+						return misc::strtolower(name);
+					}
+				};
+				dns::Message sending;
+				sending.header.id = query.requester_id;
+				sending.header.flags = received.header.flags;
+				// questions
+				for (dns::Question const &q1 : received.questions) {
+					dns::Question q2 = q1;
+					q2.name = AmendName(q2.name);
+					sending.questions.push_back(q2);
+				}
+				// answers
+				for (dns::Record const &a1 : received.answers) {
+					dns::Record a2 = a1;
+					if (a2.clas == DNS_CLASS_IN) {
+						if (accept_dns_type(a2.type)) {
+							a2.name = AmendName(a2.name);
+						}
+						if (a2.type == DNS_TYPE::CNAME && a2.cname()) {
+							a2.cname()->cname = AmendName(a2.cname()->cname);
+						} else if (a2.type == DNS_TYPE::SOA && a2.soa()) {
+							a2.soa()->nname = AmendName(a2.soa()->nname);
+							a2.soa()->rname = AmendName(a2.soa()->rname);
+						}
+						sending.answers.push_back(a2);
+					}
+				}
+				// send
+				auto d2 = *d;
+				d2.in4_udp.sa4 = query.client_sa4;
+				d2.in6_udp.sa6 = query.client_sa6;
+				send_dns_message(&d2, query.proto, sending, false, false);
+				// cahce
+				dns::Cache *cache = get_cache(query.type);
+				if (cache) {
+					cache->insert(query.forward_name, sending);
+				}
+			}
+		}
+	}
+}
 
 void Behind::process(InternalData *d, ProtocolFamilyType const &proto)
 {
@@ -1284,224 +1492,21 @@ void Behind::process(InternalData *d, ProtocolFamilyType const &proto)
 		dns::Message received;
 		parse_dns_message(buf.data(), buf.data() + buf.size(), &received);
 
-		auto Cache = [&](DNS_TYPE type)-> dns::Cache * {
-			switch (type) {
-			case DNS_TYPE::A:    return &m->dns_cache.a;
-			case DNS_TYPE::AAAA: return &m->dns_cache.aaaa;
-			case DNS_TYPE::SOA:  return &m->dns_cache.soa;
-			}
-			return nullptr;
-		};
-
 		if ((received.header.flags & 0xf800) == 0x0000) { // standard query
-
-			{ // experimental
-				if (proto.socktype() == SOCK_STREAM) {
-					if (proto.family() == AF_INET) {
-						dns::Message msg;
-						if (_experimental_forward_tcp(received.questions, &msg)) {
-							msg.header.id = received.header.id;
-							// send
-							InternalData d2 = *d;
-							send_dns_message(&d2, proto, msg, false, false);
-						}
-						return;
-					}
-				}
-			}
-
 			for (auto it = received.questions.begin(); it != received.questions.end(); it++) {
-				dns::Question const &q = *it;
-
-				enum class State {
-					NONE,
-					FORWARD,
-					NXDOMAIN,
-					NODATA,
-				};
-				State state = State::NONE;
-				if (!q.name.empty()) {
-					if (q.clas == DNS_CLASS_IN) {
-						if (accept_dns_type(q.type)) {
-							logprintf(LOG_DEFAULT, "Q: %s %s\n", q.name.c_str(), dns_type_to_string(q.type));
-							state = State::FORWARD;
-							{
-								// check known hosts
-								InetResolver::Addr const *addr = m->hosts.find(q.name);
-								if (addr) {
-									state = State::NONE;
-									std::vector<dns::Record> rec;
-									if ((q.type == DNS_TYPE::A && addr->type == InetResolver::IN4) || (q.type == DNS_TYPE::AAAA && addr->type == InetResolver::IN6)) {
-										dns::Record r;
-										r.name = q.name;
-										r.type = q.type;
-										r.ttl = ttl();
-										for (std::vector<uint8_t> const &a : addr->addr) {
-											r.bin = a;
-											rec.push_back(r);
-										}
-										dns::Message sending;
-										sending.header = received.header;
-										sending.header.flags = 0x8180;
-										sending.questions = {q};
-										sending.answers = rec;
-										send_dns_message(d, proto, sending, false, false);
-									} else {
-										state = State::NXDOMAIN;
-									}
-								}
-							}
-							if (state == State::NXDOMAIN) {
-								// nop
-							} else if (is_nxdomain(q.name)) {
-								state = State::NXDOMAIN;
-							} else if (q.type == DNS_TYPE::AAAA && is_nodata_aaaa(q.name)) {
-								state = State::NODATA;
-							} else if (state == State::FORWARD) {
-								dns::Cache *cache = Cache(q.type);
-								if (cache) {
-									auto entry = cache->find(q.name);
-									if (entry) {
-										dns::Message sending;
-										sending.header = received.header;
-										sending.header.flags = 0x8180;
-										sending.questions = {q};
-										sending.answers = entry->answers;
-										sending.authorities = entry->authorities;
-										send_dns_message(d, proto, sending, false, true);
-										state = State::NONE;
-									}
-								}
-								if (state != State::NONE) {
-									state = State::NXDOMAIN;
-									const auto local_transaction_id = next_local_transaction_id();
-									clean_transaction(local_transaction_id);
-									auto Forward = [&](Forwarder const &forwarder){
-										std::string query_name = q.name;
-										if (m->option.case_randomize) {
-											query_name = randomize_case(query_name);
-										}
-										dns::Message sending;
-										sending.header = received.header;
-										sending.header.id = m->txid_gen.next();
-										sending.header.flags = 0x0100;
-										sending.questions = {q};
-										sending.questions.front().name = query_name;
-										InternalData d2 = *d;
-										if (forwarder.af_type == AF_INET) {
-											init_sa4(&d2.in4_udp.sa4, (in_addr const *)forwarder.addr, forwarder.port);
-										} else if (forwarder.af_type == AF_INET6) {
-											init_sa6(&d2.in6_udp.sa6, (in6_addr const *)forwarder.addr, forwarder.port);
-										}
-										if (send_dns_message(&d2, {forwarder.af_type, SOCK_DGRAM}, sending, true, false)) {
-											dns::Query t;
-											t.timestamp = misc::get_tick_count();
-											t.local_transaction_id = local_transaction_id;
-											t.requester_id = received.header.id;
-											t.upstream_id = sending.header.id;
-											t.type = q.type;
-											t.proto = proto;
-											if (proto.family() == AF_INET) {
-												t.client_sa4 = d->in4_udp.sa4;
-											} else if (proto.family() == AF_INET6) {
-												t.client_sa6 = d->in6_udp.sa6;
-											}
-											t.request_name = q.name;
-											t.forward_name = query_name;
-											push_query(t);
-										}
-									};
-									std::vector<Forwarder> forwarders = get_forwarder();
-									size_t n = forwarders.size();
-									if (n > 0) {
-										size_t i = rand() % n;
-										Forwarder const &forwarder1 = forwarders[i];
-										if (forwarder1) {
-											Forward(forwarder1);
-											state = State::NONE;
-										}
-										if (n > 1) {
-											size_t j = (i + 1 + rand() % (n - 1)) % n;
-											Forwarder const &forwarder2 = forwarders[j];
-											if (forwarder2) {
-												Forward(forwarder2);
-												state = State::NONE;
-											}
-										}
-									}
-								}
-							}
-						} else {
-							state = State::NODATA;
-						}
+				if (proto.socktype() == SOCK_DGRAM) {
+					dns::Question const &q = *it;
+					process_query(d, proto, received.header, q);
+				} else if (proto.socktype() == SOCK_STREAM) { // experimental
+					dns::Message msg;
+					if (_experimental_forward_tcp(received.questions, &msg)) {
+						msg.header.id = received.header.id;
+						send_dns_message(d, proto, msg, false, false);
 					}
-				}
-				if (state == State::NXDOMAIN) {
-					dns::Message sending = received;
-					sending.header.flags = 0x8003;
-					sending.questions = received.questions;
-					sending.answers.clear();
-					sending.authorities.clear();
-					send_dns_message(d, proto, sending, false, false);
-				} else if (state == State::NODATA) {
-					dns::Message sending = received;
-					sending.header.flags = 0x8000;
-					sending.answers.clear();
-					sending.authorities = {dns::Record()};
-					dns::Record *r = &sending.authorities.back();
-					r->name = q.name;
-					r->type = DNS_TYPE::SOA;
-					r->clas = q.clas;
-					r->ttl = 60;
-					r->set_soa(fake_soa());
-					send_dns_message(d, proto, sending, false, false);
 				}
 			}
 		} else if (received.header.flags & 0x8000) { // response
-			dns::Query q;
-			if (take_query(received.header.id, &q)) {
-				if (accept_dns_type(q.type)) {
-					if (received.questions.size() == 1 && received.questions.front().name == q.forward_name) {
-						auto AmendName = [&q](std::string const &name){
-							if (stricmp(q.request_name.c_str(), name.c_str()) == 0) {
-								return q.request_name;
-							} else {
-								return misc::strtolower(name);
-							}
-						};
-						dns::Message sending = received;
-						sending.header.id = q.requester_id;
-						// questions
-						for (dns::Question &q3 : sending.questions) {
-							q3.name = AmendName(q3.name);
-						}
-						// answers
-						for (dns::Record &a : sending.answers) {
-							if (a.clas == DNS_CLASS_IN) {
-								if (accept_dns_type(a.type)) {
-									a.name = AmendName(a.name);
-								}
-								if (a.type == DNS_TYPE::CNAME && a.cname()) {
-									a.cname()->cname = AmendName(a.cname()->cname);
-								} else if (a.type == DNS_TYPE::SOA && a.soa()) {
-									a.soa()->nname = AmendName(a.soa()->nname);
-									a.soa()->rname = AmendName(a.soa()->rname);
-								}
-							}
-						}
-						// send
-						auto d2 = *d;
-						d2.in4_udp.sa4 = q.client_sa4;
-						d2.in6_udp.sa6 = q.client_sa6;
-						send_dns_message(&d2, q.proto, sending, false, false);
-						// cahce
-						dns::Cache *cache = Cache(q.type);
-						if (cache) {
-							cache->insert(q.forward_name, sending);
-						}
-					}
-				}
-			}
+			process_response(d, received);
 		}
 	}
 }
