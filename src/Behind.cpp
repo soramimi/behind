@@ -64,21 +64,6 @@ struct Header {
 	uint16_t arcount = 0;
 };
 
-struct Task {
-	uint64_t timestamp;
-	uint32_t local_transaction_id;
-	uint16_t upstream_id;
-	uint16_t requester_id;
-	DNS_TYPE type = DNS_TYPE::A;
-	ProtocolFamilyType proto;
-	union {
-		sockaddr_in client_sa4;
-		sockaddr_in6 client_sa6;
-	};
-	std::string request_name;
-	std::string forward_name;
-};
-
 struct Question {
 	std::string name;
 	DNS_TYPE type;
@@ -322,6 +307,22 @@ public:
 
 } // namespace dns
 
+struct Behind::Task {
+	Operation op = Operation::NONE;
+	uint64_t timestamp;
+	uint32_t local_transaction_id;
+	uint16_t upstream_id;
+	uint16_t requester_id;
+	DNS_TYPE type = DNS_TYPE::A;
+	ProtocolFamilyType proto;
+	union {
+		sockaddr_in client_sa4;
+		sockaddr_in6 client_sa6;
+	};
+	std::string request_name;
+	std::string forward_name;
+};
+
 struct Behind::Private {
 	Option option;
 	Hosts hosts;
@@ -339,7 +340,7 @@ struct Behind::Private {
 		dns::Cache aaaa;
 		dns::Cache soa;
 	} dns_cache;
-	std::vector<dns::Task> queries;
+	std::vector<Task> queries;
 	std::vector<Forwarder> forwarders;
 };
 
@@ -621,17 +622,17 @@ int Behind::parse_question_section(const char *begin, const char *end, const cha
 	return 0;
 }
 
-std::vector<Forwarder const *> Behind::get_forwarder() const
+std::vector<Forwarder const *> Behind::choose_forwarder(int max) const
 {
-	const size_t race_max = 2;
 	std::vector<Forwarder const *> ret;
 	for (Forwarder const &f : m->forwarders) {
 		if (f) {
 			ret.push_back(&f);
 		}
 	}
+	if (max < 0) return ret;
 	size_t n = ret.size();
-	size_t m = std::min(race_max, n);
+	size_t m = std::min((size_t)max, n);
 	for (size_t i = 0; i < m; i++) {
 		size_t j = i + rand() % (n - i);
 		std::swap(ret[i], ret[j]);
@@ -802,21 +803,21 @@ void Behind::clean_transaction(uint32_t id)
 	}
 }
 
-bool Behind::take_task(uint16_t id, dns::Task *out)
+std::optional<Behind::Task> Behind::take_task(uint16_t upstream_id)
 {
-	for (dns::Task const &q : m->queries) {
-		if (id == q.upstream_id) {
-			*out = q;
+	for (Task const &q : m->queries) {
+		if (upstream_id == q.upstream_id) {
+			std::optional<Task> ret = q;
 			clean_transaction(q.local_transaction_id);
-			return true;
+			return ret;
 		}
 	}
-	return false;
+	return std::nullopt;
 }
 
-void Behind::push_task(const dns::Task &task)
+void Behind::push_task(const Task &task)
 {
-	take_task(task.upstream_id, 0);
+	take_task(task.upstream_id);
 	m->queries.push_back(task);
 }
 
@@ -1287,7 +1288,8 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &proto,
 	}
 
 	if (send_dns_message(&d2, {forwarder.af_type, SOCK_DGRAM}, sending, true, false)) {
-		dns::Task t;
+		Task t;
+		t.op = Operation::REPLY_TO_CLIENT;
 		t.timestamp = misc::get_tick_count();
 		t.local_transaction_id = local_transaction_id;
 		t.requester_id = header.id;
@@ -1428,7 +1430,7 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &proto,
 						state = State::NXDOMAIN;
 						const uint32_t local_transaction_id = next_local_transaction_id();
 						clean_transaction(local_transaction_id);
-						std::vector<Forwarder const *> forwarders = get_forwarder();
+						std::vector<Forwarder const *> forwarders = choose_forwarder(2);
 						if (!forwarders.empty()) {
 							for (Forwarder const *f : forwarders) {
 								forward_udp(*d, proto, header,q, local_transaction_id, *f);
@@ -1468,7 +1470,7 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &proto,
 
 void Behind::process_query_tcp(InternalData *d, ProtocolFamilyType const &proto, dns::Header const &header, dns::Question const &q)
 {
-	std::vector<Forwarder const *> forwarders = get_forwarder();
+	std::vector<Forwarder const *> forwarders = choose_forwarder(1);
 	if (!forwarders.empty()) {
 		Forwarder const *f = forwarders.front();
 		auto opt = _experimental_forward_tcp(d, header, q, *f);
@@ -1484,8 +1486,12 @@ void Behind::process_query_tcp(InternalData *d, ProtocolFamilyType const &proto,
 
 void Behind::process_response(InternalData *d, dns::Message const &received)
 {
-	dns::Task task;
-	if (take_task(received.header.id, &task)) {
+	auto opt = take_task(received.header.id);
+	auto IsTask = [&](Operation op){
+		return opt && opt->op == op;
+	};
+	if (IsTask(Operation::REPLY_TO_CLIENT)) {
+		Task const &task = *opt;
 		if (accept_dns_type(task.type)) {
 			if (received.questions.size() == 1 && received.questions.front().name == task.forward_name) {
 				auto AmendName = [&task](std::string const &name){

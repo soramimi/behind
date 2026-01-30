@@ -107,7 +107,6 @@ struct Forwarder {
 
 namespace dns {
 struct Header;
-struct Task;
 struct Question;
 struct Record;
 struct Cache;
@@ -121,6 +120,13 @@ private:
 
 	struct Private;
 	Private *m;
+
+	enum class Operation {
+		NONE,
+		REPLY_TO_CLIENT,
+	};
+
+	struct Task;
 
 	enum class SocketMode {
 		SELECT,
@@ -176,12 +182,12 @@ private:
 	static void write_dns_question_rr(std::vector<char> *out, NameMap *namemap, std::string const &name, DNS_TYPE type, uint16_t clas);
 	static bool write_dns_answer_rr(std::vector<char> *out, NameMap *namemap, std::string const &name, uint16_t clas, uint32_t ttl, dns::Record const &item);
 	static int parse_question_section(char const *begin, char const *end, char const *ptr, dns::Question *out);
-        std::vector<const Forwarder *> get_forwarder() const;
+	std::vector<const Forwarder *> choose_forwarder(int max) const;
 	void init_forwarder();
 	void clean();
 	void clean_transaction(uint32_t id);
-	bool take_task(uint16_t id, dns::Task *out);
-	void push_task(dns::Task const &task);
+	std::optional<Task> take_task(uint16_t upstream_id);
+	void push_task(Task const &task);
 	static void parse_dns_message(char const *begin, char const *end, dns::Message *msg);
 
 	bool is_nxdomain(std::string const &name) const;
