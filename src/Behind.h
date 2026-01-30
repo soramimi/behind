@@ -9,6 +9,7 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unordered_map>
+#include <optional>
 
 #define STANDARD_DNS_PORT 53
 #define DEFAUT_LISTEN_PORT 5300
@@ -37,6 +38,22 @@ public:
 		case AF_INET6: return PF_INET6;
 		}
 		return PF_UNSPEC;
+	}
+	bool is_inet4() const
+	{
+		return af_family_ == AF_INET;
+	}
+	bool is_inet6() const
+	{
+		return af_family_ == AF_INET6;
+	}
+	bool is_dgram() const
+	{
+		return sock_type_ == SOCK_DGRAM;
+	}
+	bool is_stream() const
+	{
+		return sock_type_ == SOCK_STREAM;
 	}
 };
 
@@ -78,11 +95,19 @@ struct Forwarder {
 	{
 		return af_type != AF_UNSPEC;
 	}
+	bool is_inet4() const
+	{
+		return af_type == AF_INET;
+	}
+	bool is_inet6() const
+	{
+		return af_type == AF_INET6;
+	}
 };
 
 namespace dns {
 struct Header;
-struct Query;
+struct Task;
 struct Question;
 struct Record;
 struct Cache;
@@ -155,8 +180,8 @@ private:
 	void init_forwarder();
 	void clean();
 	void clean_transaction(uint32_t id);
-	bool take_query(uint16_t id, dns::Query *out);
-	void push_query(dns::Query const &query);
+	bool take_task(uint16_t id, dns::Task *out);
+	void push_task(dns::Task const &task);
 	static void parse_dns_message(char const *begin, char const *end, dns::Message *msg);
 
 	bool is_nxdomain(std::string const &name) const;
@@ -177,11 +202,14 @@ private:
 	int epoll_ctl_del(epoll_event *e);
 	bool accept_dns_type(DNS_TYPE t);
 
-	bool _experimental_forward_tcp(std::vector<dns::Question> const &questions, dns::Message *msg_out);
+	std::optional<dns::Message> _experimental_forward_tcp(InternalData *d, dns::Header const &header, std::vector<dns::Question> const &questions, Forwarder const &forwarder);
+	void forward_udp(const InternalData &d, const ProtocolFamilyType &proto, const dns::Header &header, const dns::Question &q, uint32_t local_transaction_id, const Forwarder &forwarder);
+
 	std::vector<char> read(InternalData *d, const ProtocolFamilyType &proto);
 	dns::Cache *get_cache(DNS_TYPE type);
 	void process_query(InternalData *d, const ProtocolFamilyType &proto, const dns::Header &header, const dns::Question &q);
 	void process_response(InternalData *d, const dns::Message &received);
+	uint16_t next_txid();
 public:
 	Behind(Option const &opt);
 	~Behind();
