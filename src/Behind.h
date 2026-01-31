@@ -209,9 +209,9 @@ private:
 	const InetResolver::Addr *find_host(std::string const &name) const;
 	void add_hosts(const std::map<std::string, std::string> &hosts);
 	uint32_t next_local_transaction_id();
-	int epoll_ctl_add(epoll_event *e);
-	int epoll_ctl_del(epoll_event *e);
-	int epoll_ctl_del(int fd);
+	int ctl_add(int fd, epoll_event *e);
+	int ctl_del(int fd, epoll_event *e);
+	int ctl_del(int fd);
 	bool accept_dns_type(DNS_TYPE t);
 
 	bool forward_tcp(InternalData *d, const ProtocolFamilyType &client_proto, uint16_t client_request_id, dns::Header const &header, const dns::Question &question, uint32_t local_transaction_id, const Forwarder &forwarder);

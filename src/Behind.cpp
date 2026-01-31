@@ -334,7 +334,9 @@ struct Behind::Private {
 	InetResolver resolver;
 
 	Behind::SocketMode socket_mode;
+	fd_set readfds;
 	int epoll_fd = -1;
+	std::vector<int> poll_fds;
 	std::vector<epoll_event> epoll_events{10};
 
 	int ttl = 5 * 60;
@@ -1392,7 +1394,7 @@ bool Behind::forward_tcp(InternalData *d, ProtocolFamilyType const &client_proto
 			t.ev.data.fd = sock;
 			push_task(t);
 
-			epoll_ctl_add(&t.ev);
+			ctl_add(sock, &t.ev);
 			ok = true;
 		}
 	}
@@ -1608,7 +1610,7 @@ bool Behind::process_tcp_receive(InternalData *d, int fd)
 			msg.header.id = task->requester_id;
 			send_dns_message(d, task->client_proto, msg, false, false);
 		}
-		epoll_ctl_del(&task->ev);
+		ctl_del(task->tcp_fd, &task->ev);
 		closesocket(task->tcp_fd);
 		return true;
 	}
@@ -1705,19 +1707,30 @@ void Behind::add_hosts(std::map<std::string, std::string> const &hosts)
 	}
 }
 
-int Behind::epoll_ctl_add(struct epoll_event *e)
+int Behind::ctl_add(int fd, struct epoll_event *e)
 {
-	return epoll_ctl(m->epoll_fd, EPOLL_CTL_ADD, e->data.fd, e);
+	m->poll_fds.push_back(fd);
+	int ret = 0;
+	if (e) {
+		ret = epoll_ctl(m->epoll_fd, EPOLL_CTL_ADD, e->data.fd, e);
+	}
+	return ret;
 }
 
-int Behind::epoll_ctl_del(struct epoll_event *e)
+int Behind::ctl_del(int fd, struct epoll_event *e)
 {
-	return epoll_ctl(m->epoll_fd, EPOLL_CTL_DEL, e->data.fd, e);
+	auto it = std::remove(m->poll_fds.begin(), m->poll_fds.end(), fd);
+	m->poll_fds.erase(it, m->poll_fds.end());
+	int ret = 0;
+	if (e) {
+		ret = epoll_ctl(m->epoll_fd, EPOLL_CTL_DEL, e->data.fd, e);
+	}
+	return ret;
 }
 
-int Behind::epoll_ctl_del(int fd)
+int Behind::ctl_del(int fd)
 {
-	return epoll_ctl(m->epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+	ctl_del(fd, nullptr);
 }
 
 void Behind::main()
@@ -1732,17 +1745,27 @@ void Behind::main()
 
 	m->socket_mode = SocketMode::EPOLL;
 
+	struct TCP {
+		int fd;
+	};
+
 	if (m->socket_mode == SocketMode::SELECT) {
 		logprintf(LOG_DEFAULT, "mode: SELECT\n");
 
-		fd_set fds, readfds;
-		FD_ZERO(&readfds);
-		FD_SET(d.in4_udp.fd, &readfds);
-		FD_SET(d.in6_udp.fd, &readfds);
-		int maxfd = std::max(d.in4_udp.fd, d.in6_udp.fd);
+		ctl_add(d.in4_udp.fd, nullptr);
+		ctl_add(d.in6_udp.fd, nullptr);
+		ctl_add(d.in4_tcp.listener_fd, nullptr);
+		ctl_add(d.in6_tcp.listener_fd, nullptr);
+
 
 		while (1) {
-			memcpy(&fds, &readfds, sizeof(fd_set));
+			fd_set fds;
+			FD_ZERO(&fds);
+			int maxfd = -1;
+			for (int fd : m->poll_fds) {
+				FD_SET(fd, &fds);
+				maxfd = std::max(maxfd, fd);
+			}
 			select(maxfd + 1, &fds, nullptr, nullptr, nullptr);
 
 			if (FD_ISSET(d.in4_udp.fd, &fds)) {
@@ -1750,6 +1773,25 @@ void Behind::main()
 			}
 			if (FD_ISSET(d.in6_udp.fd, &fds)) {
 				process(&d, {AF_INET6, SOCK_DGRAM});
+			}
+			if (FD_ISSET(d.in4_tcp.listener_fd, &fds)) {
+				TCP client;
+				socklen_t len = sizeof(d.in4_tcp.sa4);
+				client.fd = accept(d.in4_tcp.listener_fd, (sockaddr *)&d.in4_tcp.sa4, &len);
+				d.in4_tcp.fd = client.fd;
+				process(&d, {AF_INET, SOCK_STREAM});
+			}
+			if (FD_ISSET(d.in6_tcp.listener_fd, &fds)) {
+				TCP client;
+				socklen_t len = sizeof(d.in6_tcp.sa6);
+				client.fd = accept(d.in6_tcp.listener_fd, (sockaddr *)&d.in6_tcp.sa6, &len);
+				d.in6_tcp.fd = client.fd;
+				process(&d, {AF_INET6, SOCK_STREAM});
+			}
+			for (int fd : m->poll_fds) {
+				if (FD_ISSET(fd, &fds)) {
+					process_tcp_receive(&d, fd);
+				}
 			}
 
 			clean();
@@ -1770,7 +1812,7 @@ void Behind::main()
 			} else if (socktype == SOCK_STREAM) {
 				in->ev.data.fd = in->listener_fd;
 			}
-			if (epoll_ctl_add(&in->ev) == -1) {
+			if (ctl_add(in->fd, &in->ev) == -1) {
 				throw STRERROR("epoll_ctl: ");
 			}
 		};
@@ -1778,11 +1820,6 @@ void Behind::main()
 		AddEpoll(&d.in6_udp, SOCK_DGRAM);
 		AddEpoll(&d.in4_tcp, SOCK_STREAM);
 		AddEpoll(&d.in6_tcp, SOCK_STREAM);
-
-		struct TCP {
-			int fd;
-		};
-		std::vector<TCP> tcp_clients;
 
 		while (1) {
 			int n = epoll_wait(m->epoll_fd, m->epoll_events.data(), m->epoll_events.size(), -1);
@@ -1813,7 +1850,7 @@ void Behind::main()
 				} else {
 					if (!process_tcp_receive(&d, fd)) {
 						fprintf(stderr, "unknown fd: %d\n", fd);
-						epoll_ctl_del(fd);
+						ctl_del(fd);
 						closesocket(fd);
 					}
 				}
