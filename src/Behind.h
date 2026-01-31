@@ -55,8 +55,12 @@ public:
 	{
 		return sock_type_ == SOCK_STREAM;
 	}
+	friend bool operator == (const ProtocolFamilyType &l, const ProtocolFamilyType &r);
 };
-
+inline bool operator == (const ProtocolFamilyType &l, const ProtocolFamilyType &r)
+{
+	return l.af_family_ == r.af_family_ && l.sock_type_ == r.sock_type_;
+}
 
 class Hosts {
 private:
@@ -123,7 +127,8 @@ private:
 
 	enum class Operation {
 		NONE,
-		REPLY_TO_CLIENT,
+		REPLY_TO_CLIENT_UDP,
+		REPLY_TO_CLIENT_TCP,
 	};
 
 	struct Task;
@@ -186,7 +191,7 @@ private:
 	void init_forwarder();
 	void clean();
 	void clean_transaction(uint32_t id);
-	std::optional<Task> take_task(uint16_t upstream_id);
+	std::optional<Task> take_task_by_id(uint16_t upstream_id);
 	void push_task(Task const &task);
 	static void parse_dns_message(char const *begin, char const *end, dns::Message *msg);
 
@@ -206,17 +211,20 @@ private:
 	uint32_t next_local_transaction_id();
 	int epoll_ctl_add(epoll_event *e);
 	int epoll_ctl_del(epoll_event *e);
+	int epoll_ctl_del(int fd);
 	bool accept_dns_type(DNS_TYPE t);
 
-        std::optional<dns::Message> _experimental_forward_tcp(InternalData *d, dns::Header const &header, const dns::Question &question, Forwarder const &forwarder);
+	bool forward_tcp(InternalData *d, const ProtocolFamilyType &client_proto, uint16_t client_request_id, dns::Header const &header, const dns::Question &question, uint32_t local_transaction_id, const Forwarder &forwarder);
 	void forward_udp(const InternalData &d, const ProtocolFamilyType &proto, const dns::Header &header, const dns::Question &q, uint32_t local_transaction_id, const Forwarder &forwarder);
 
 	std::vector<char> read(InternalData *d, const ProtocolFamilyType &proto);
 	dns::Cache *get_cache(DNS_TYPE type);
-	void process_query_udp(InternalData *d, const ProtocolFamilyType &proto, const dns::Header &header, const dns::Question &q);
-	void process_query_tcp(InternalData *d, const ProtocolFamilyType &proto, const dns::Header &header, const dns::Question &q);
-	void process_response(InternalData *d, const dns::Message &received);
+	void process_query_udp(InternalData *d, const ProtocolFamilyType &proto, const dns::Header &header, const dns::Question &question);
+	void process_query_tcp(InternalData *d, const ProtocolFamilyType &client_proto, const dns::Header &header, const dns::Question &q);
+	void process_response(InternalData *d, const ProtocolFamilyType &upstream_proto, const dns::Message &received);
 	uint16_t next_txid();
+	bool process_tcp_receive(InternalData *d, int fd);
+	std::optional<Behind::Task> take_task_by_fd(int fd);
 public:
 	Behind(Option const &opt);
 	~Behind();
