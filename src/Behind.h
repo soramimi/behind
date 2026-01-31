@@ -225,6 +225,7 @@ private:
 	uint16_t next_txid();
 	bool process_tcp_receive(InternalData *d, int fd);
 	std::optional<Behind::Task> take_task_by_fd(int fd);
+	bool bind(void *private_in, const ProtocolFamilyType &proto, int sock);
 public:
 	Behind(Option const &opt);
 	~Behind();

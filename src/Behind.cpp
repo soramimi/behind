@@ -1404,93 +1404,15 @@ bool Behind::forward_tcp(InternalData *d, ProtocolFamilyType const &client_proto
 
 void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client_proto, dns::Header const &header, dns::Question const &q)
 {
-	enum class State {
-		NONE,
-		FORWARD,
-		NXDOMAIN,
-		NODATA,
-	};
-	State state = State::NONE;
-	if (!q.name.empty()) {
-		if (q.clas == DNS_CLASS_IN) {
-			if (accept_dns_type(q.type)) {
-				logprintf(LOG_DEFAULT, "Q: %s %s\n", q.name.c_str(), dns_type_to_string(q.type));
-				state = State::FORWARD;
-				{
-					// check known hosts
-					InetResolver::Addr const *addr = m->hosts.find(q.name);
-					if (addr) {
-						state = State::NONE;
-						std::vector<dns::Record> rec;
-						if ((q.type == DNS_TYPE::A && addr->type == InetResolver::IN4) || (q.type == DNS_TYPE::AAAA && addr->type == InetResolver::IN6)) {
-							dns::Record r;
-							r.name = q.name;
-							r.type = q.type;
-							r.ttl = ttl();
-							for (std::vector<uint8_t> const &a : addr->addr) {
-								r.bin = a;
-								rec.push_back(r);
-							}
-							dns::Message sending;
-							sending.header.id = header.id;
-							sending.header.flags = 0x8180;
-							sending.questions = {q};
-							sending.answers = rec;
-							send_dns_message(d, client_proto, sending, false, false);
-						} else {
-							state = State::NXDOMAIN;
-						}
-					}
-				}
-				if (state == State::NXDOMAIN) {
-					// nop
-				} else if (is_nxdomain(q.name)) {
-					state = State::NXDOMAIN;
-				} else if (q.type == DNS_TYPE::AAAA && is_nodata_aaaa(q.name)) {
-					state = State::NODATA;
-				} else if (state == State::FORWARD) {
-					dns::Cache *cache = get_cache(q.type);
-					if (cache) {
-						auto entry = cache->find(q.name);
-						if (entry) {
-							dns::Message sending;
-							sending.header.id = header.id;
-							sending.header.flags = 0x8180;
-							sending.questions = {q};
-							sending.answers = entry->answers;
-							sending.authorities = entry->authorities;
-							send_dns_message(d, client_proto, sending, false, true);
-							state = State::NONE;
-						}
-					}
-					if (state != State::NONE) {
-						state = State::NXDOMAIN;
-						const uint32_t local_transaction_id = next_local_transaction_id();
-						clean_transaction(local_transaction_id);
-
-						std::vector<Forwarder const *> forwarders = choose_forwarder(2);
-						if (!forwarders.empty()) {
-							for (Forwarder const *f : forwarders) {
-								forward_udp(*d, client_proto, header, q, local_transaction_id, *f);
-							}
-							state = State::NONE;
-						} else {
-							logprintf(LOG_DEFAULT, "No forwarder configured.\n");
-						}
-					}
-				}
-			} else {
-				state = State::NODATA;
-			}
-		}
-	}
-	if (state == State::NXDOMAIN) {
+	auto SendNXDOMAIN = [&](){
 		dns::Message sending;
 		sending.header.id = header.id;
 		sending.header.flags = 0x8003;
 		sending.questions = {q};
 		send_dns_message(d, client_proto, sending, false, false);
-	} else if (state == State::NODATA) {
+	};
+
+	auto SendNODATA = [&](){
 		dns::Message sending;
 		sending.header.id = header.id;
 		sending.header.flags = 0x8000;
@@ -1503,6 +1425,74 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 		r->ttl = 60;
 		r->set_soa(fake_soa());
 		send_dns_message(d, client_proto, sending, false, false);
+	};
+
+	if (q.clas == DNS_CLASS_IN && !q.name.empty()) {
+		if (!accept_dns_type(q.type)) {
+			SendNODATA();
+			return;
+		}
+		logprintf(LOG_DEFAULT, "Q: %s %s\n", q.name.c_str(), dns_type_to_string(q.type));
+		// check known hosts
+		InetResolver::Addr const *addr = m->hosts.find(q.name);
+		if (addr) {
+			std::vector<dns::Record> rec;
+			if ((q.type == DNS_TYPE::A && addr->type == InetResolver::IN4) || (q.type == DNS_TYPE::AAAA && addr->type == InetResolver::IN6)) {
+				dns::Record r;
+				r.name = q.name;
+				r.type = q.type;
+				r.ttl = ttl();
+				for (std::vector<uint8_t> const &a : addr->addr) {
+					r.bin = a;
+					rec.push_back(r);
+				}
+				dns::Message sending;
+				sending.header.id = header.id;
+				sending.header.flags = 0x8180;
+				sending.questions = {q};
+				sending.answers = rec;
+				send_dns_message(d, client_proto, sending, false, false);
+				return;
+			}
+			SendNXDOMAIN();
+			return;
+		}
+		if (is_nxdomain(q.name)) {
+			SendNXDOMAIN();
+			return;
+		}
+		if (q.type == DNS_TYPE::AAAA && is_nodata_aaaa(q.name)) {
+			SendNODATA();
+			return;
+		}
+		dns::Cache *cache = get_cache(q.type);
+		if (cache) {
+			auto entry = cache->find(q.name);
+			if (entry) {
+				dns::Message sending;
+				sending.header.id = header.id;
+				sending.header.flags = 0x8180;
+				sending.questions = {q};
+				sending.answers = entry->answers;
+				sending.authorities = entry->authorities;
+				send_dns_message(d, client_proto, sending, false, true);
+				return;
+			}
+		}
+
+		const uint32_t local_transaction_id = next_local_transaction_id();
+		clean_transaction(local_transaction_id);
+
+		std::vector<Forwarder const *> forwarders = choose_forwarder(2);
+		if (forwarders.empty()) {
+			logprintf(LOG_DEFAULT, "No forwarder configured.\n");
+			SendNODATA();
+			return;
+		}
+		for (Forwarder const *f : forwarders) {
+			forward_udp(*d, client_proto, header, q, local_transaction_id, *f);
+		}
+		return;
 	}
 }
 
@@ -1642,6 +1632,21 @@ void Behind::process(InternalData *d, ProtocolFamilyType const &client_proto)
 	}
 }
 
+bool Behind::bind(void *private_in, ProtocolFamilyType const &proto, int sock)
+{
+	Behind::InternalData::In *in = static_cast<Behind::InternalData::In *>(private_in);
+	int r;
+	if (proto.is_inet4()) {
+		init_sa4(&in->sa4, nullptr, listen_port());
+		r = ::bind(sock, (struct sockaddr *)&in->sa4, sizeof(in->sa4));
+	} else {
+		init_sa6((sockaddr_in6 *)&in->sa6, nullptr, listen_port());
+		r = ::bind(sock, (struct sockaddr *)&in->sa6, sizeof(in->sa6));
+	}
+	if (r == SOCKET_ERROR) return false;
+	return true;
+}
+
 void Behind::init_socket(void *private_in, ProtocolFamilyType proto)
 {
 	Behind::InternalData::In *in = static_cast<Behind::InternalData::In *>(private_in);
@@ -1661,15 +1666,7 @@ void Behind::init_socket(void *private_in, ProtocolFamilyType proto)
 		}
 	}
 
-	int r;
-	if (proto.is_inet4()) {
-		init_sa4(&in->sa4, nullptr, listen_port());
-		r = bind(sock, (struct sockaddr *)&in->sa4, sizeof(in->sa4));
-	} else {
-		init_sa6((sockaddr_in6 *)&in->sa6, nullptr, listen_port());
-		r = bind(sock, (struct sockaddr *)&in->sa6, sizeof(in->sa6));
-	}
-	if (r == SOCKET_ERROR) {
+	if (!bind(in, proto, sock)) {
 		throw STRERROR("bind: ");
 	}
 
@@ -1745,10 +1742,6 @@ void Behind::main()
 
 	m->socket_mode = SocketMode::EPOLL;
 
-	struct TCP {
-		int fd;
-	};
-
 	if (m->socket_mode == SocketMode::SELECT) {
 		logprintf(LOG_DEFAULT, "mode: SELECT\n");
 
@@ -1756,7 +1749,6 @@ void Behind::main()
 		ctl_add(d.in6_udp.fd, nullptr);
 		ctl_add(d.in4_tcp.listener_fd, nullptr);
 		ctl_add(d.in6_tcp.listener_fd, nullptr);
-
 
 		while (1) {
 			fd_set fds;
@@ -1775,17 +1767,13 @@ void Behind::main()
 				process(&d, {AF_INET6, SOCK_DGRAM});
 			}
 			if (FD_ISSET(d.in4_tcp.listener_fd, &fds)) {
-				TCP client;
 				socklen_t len = sizeof(d.in4_tcp.sa4);
-				client.fd = accept(d.in4_tcp.listener_fd, (sockaddr *)&d.in4_tcp.sa4, &len);
-				d.in4_tcp.fd = client.fd;
+				d.in4_tcp.fd = accept(d.in4_tcp.listener_fd, (sockaddr *)&d.in4_tcp.sa4, &len);
 				process(&d, {AF_INET, SOCK_STREAM});
 			}
 			if (FD_ISSET(d.in6_tcp.listener_fd, &fds)) {
-				TCP client;
 				socklen_t len = sizeof(d.in6_tcp.sa6);
-				client.fd = accept(d.in6_tcp.listener_fd, (sockaddr *)&d.in6_tcp.sa6, &len);
-				d.in6_tcp.fd = client.fd;
+				d.in6_tcp.fd = accept(d.in6_tcp.listener_fd, (sockaddr *)&d.in6_tcp.sa6, &len);
 				process(&d, {AF_INET6, SOCK_STREAM});
 			}
 			for (int fd : m->poll_fds) {
@@ -1836,16 +1824,12 @@ void Behind::main()
 				} else if (fd == d.in6_udp.fd) {
 					process(&d, {AF_INET6, SOCK_DGRAM});
 				} else if (fd == d.in4_tcp.listener_fd) {
-					TCP client;
 					socklen_t len = sizeof(d.in4_tcp.sa4);
-					client.fd = accept(d.in4_tcp.listener_fd, (sockaddr *)&d.in4_tcp.sa4, &len);
-					d.in4_tcp.fd = client.fd;
+					d.in4_tcp.fd = accept(d.in4_tcp.listener_fd, (sockaddr *)&d.in4_tcp.sa4, &len);
 					process(&d, {AF_INET, SOCK_STREAM});
 				} else if (fd == d.in6_tcp.listener_fd) {
-					TCP client;
 					socklen_t len = sizeof(d.in6_tcp.sa6);
-					client.fd = accept(d.in6_tcp.listener_fd, (sockaddr *)&d.in6_tcp.sa6, &len);
-					d.in6_tcp.fd = client.fd;
+					d.in6_tcp.fd = accept(d.in6_tcp.listener_fd, (sockaddr *)&d.in6_tcp.sa6, &len);
 					process(&d, {AF_INET6, SOCK_STREAM});
 				} else {
 					if (!process_tcp_receive(&d, fd)) {
