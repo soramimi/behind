@@ -7,7 +7,7 @@ DESTDIR = $$PWD/../_bin
 
 INCLUDEPATH += $$PWD/../src
 
-gcc:QMAKE_CXXFLAGS += -Wno-switch
+gcc:QMAKE_CXXFLAGS += -Wall -Wextra -Werror=return-type -Werror=trigraphs -Wno-switch -Wno-reorder -Wno-unused-parameter -Wno-unused-parameter
 
 SOURCES += \
     ../src/Behind.cpp \

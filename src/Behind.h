@@ -203,6 +203,8 @@ private:
 	bool send_dns_message(InternalData *d, const ProtocolFamilyType &proto, dns::Message const &msg, bool forward, bool from_cache);
 
 	void process(InternalData *d, const ProtocolFamilyType &proto);
+	void process_udp(InternalData *d, sa_family_t family, int fd);
+	void process_tcp(InternalData *d, sa_family_t family);
 
 	void init_socket(void *private_in, ProtocolFamilyType proto);
 
@@ -223,9 +225,10 @@ private:
 	void process_query_tcp(InternalData *d, const ProtocolFamilyType &client_proto, const dns::Header &header, const dns::Question &q);
 	void process_response(InternalData *d, const ProtocolFamilyType &upstream_proto, const dns::Message &received);
 	uint16_t next_txid();
-	bool process_tcp_receive(InternalData *d, int fd);
+	bool process_receive(InternalData *d, int fd);
 	std::optional<Behind::Task> take_task_by_fd(int fd);
 	bool bind(void *private_in, const ProtocolFamilyType &proto, int sock);
+	void reply_to_client_udp(InternalData *d, Task *task, const dns::Message &received);
 public:
 	Behind(Option const &opt);
 	~Behind();
