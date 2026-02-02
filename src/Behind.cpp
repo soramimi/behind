@@ -1776,7 +1776,10 @@ int ev_fd(struct epoll_event *e)
 
 int Behind::ctl_add(int fd, struct epoll_event *e)
 {
+	if (fd == -1) return -1;
+
 	m->poll_fds.push_back(fd);
+	// fprintf(stderr, "--- add sockets: %d %d\n", fd, (int)m->poll_fds.size());
 
 	int ret = 0;
 	if (e && m->epoll_fd != -1) {
@@ -1787,8 +1790,11 @@ int Behind::ctl_add(int fd, struct epoll_event *e)
 
 int Behind::ctl_del(int fd, struct epoll_event *e)
 {
+	if (fd == -1) return -1;
+
 	auto it = std::remove(m->poll_fds.begin(), m->poll_fds.end(), fd);
 	m->poll_fds.erase(it, m->poll_fds.end());
+	// fprintf(stderr, "--- del sockets: %d %d\n", fd, (int)m->poll_fds.size());
 
 	int ret = 0;
 	if (e && m->epoll_fd != -1) {
@@ -1835,28 +1841,31 @@ void Behind::main()
 			int fd;
 			fd = d.in4_udp.fd;
 			if (FD_ISSET(fd, &fds)) {
-				process_udp(&d, AF_INET, fd);
 				FD_CLR(fd, &fds);
+				process_udp(&d, AF_INET, fd);
 			}
 			fd = d.in6_udp.fd;
 			if (FD_ISSET(fd, &fds)) {
-				process_udp(&d, AF_INET6, fd);
 				FD_CLR(fd, &fds);
+				process_udp(&d, AF_INET6, fd);
 			}
 			fd = d.in4_tcp.listener_fd;
 			if (FD_ISSET(fd, &fds)) {
-				process_tcp(&d, AF_INET);
 				FD_CLR(fd, &fds);
+				process_tcp(&d, AF_INET);
 			}
 			fd = d.in6_tcp.listener_fd;
 			if (FD_ISSET(fd, &fds)) {
-				process_tcp(&d, AF_INET6);
 				FD_CLR(fd, &fds);
+				process_tcp(&d, AF_INET6);
 			}
 			for (int fd : m->poll_fds) {
 				if (FD_ISSET(fd, &fds)) {
-					process_receive(&d, fd);
 					FD_CLR(fd, &fds);
+					if (!process_receive(&d, fd)) {
+						ctl_del(fd);
+						closesocket(fd);
+					}
 				}
 			}
 
@@ -1871,15 +1880,17 @@ void Behind::main()
 		}
 
 		auto AddEpoll = [this](Behind::InternalData::In *in, int socktype){
+			int fd = -1;
 			in->ev = {};
 			in->ev.events = EPOLLIN;
 			if (socktype == SOCK_DGRAM) {
-				in->ev.data.fd = in->fd;
+				fd = in->fd;
 			} else if (socktype == SOCK_STREAM) {
-				in->ev.data.fd = in->listener_fd;
+				fd = in->listener_fd;
 			}
-			if (ctl_add(in->fd, &in->ev) == -1) {
-				throw STRERROR("epoll_ctl: ");
+			in->ev.data.fd = fd;
+			if (ctl_add(fd, &in->ev) == -1) {
+				logprintf(LOG_DEFAULT, "epoll_ctl: %s\n", strerror(errno));
 			}
 		};
 		AddEpoll(&d.in4_udp, SOCK_DGRAM);
