@@ -345,7 +345,7 @@ struct Behind::Private {
 		dns::Cache aaaa;
 		dns::Cache soa;
 	} dns_cache;
-	std::vector<Task> queries;
+	std::vector<Behind::Task> tasks;
 	std::vector<Forwarder> forwarders;
 };
 
@@ -788,29 +788,31 @@ void Behind::init_forwarder()
 void Behind::clean()
 {
 	uint64_t now = misc::get_tick_count();
-	size_t i = m->queries.size();
+	size_t i = m->tasks.size();
 	while (i > 0) {
 		i--;
-		if (now - m->queries[i].timestamp >= 1000) { // 1 second
-			m->queries.erase(m->queries.begin() + i);
+		if (now - m->tasks[i].timestamp >= 1000) { // 1 second
+			Task *task = &m->tasks[i];
+			delete_socket(task->upstream_fd, &task->ev);
+			m->tasks.erase(m->tasks.begin() + i);
 		}
 	}
 }
 
 void Behind::clean_transaction(uint32_t id)
 {
-	size_t i = m->queries.size();
+	size_t i = m->tasks.size();
 	while (i > 0) {
 		i--;
-		if (id == m->queries[i].local_transaction_id) {
-			m->queries.erase(m->queries.begin() + i);
+		if (id == m->tasks[i].local_transaction_id) {
+			m->tasks.erase(m->tasks.begin() + i);
 		}
 	}
 }
 
 std::optional<Behind::Task> Behind::take_task_by_id(uint16_t upstream_id)
 {
-	for (Task const &q : m->queries) {
+	for (Task const &q : m->tasks) {
 		if (upstream_id == q.upstream_id) {
 			std::optional<Task> ret = q;
 			clean_transaction(q.local_transaction_id);
@@ -822,7 +824,7 @@ std::optional<Behind::Task> Behind::take_task_by_id(uint16_t upstream_id)
 
 std::optional<Behind::Task> Behind::take_task_by_fd(int fd)
 {
-	for (Task const &q : m->queries) {
+	for (Task const &q : m->tasks) {
 		if (q.ev.data.fd == fd) {
 			std::optional<Task> ret = q;
 			clean_transaction(q.local_transaction_id);
@@ -835,7 +837,7 @@ std::optional<Behind::Task> Behind::take_task_by_fd(int fd)
 void Behind::push_task(const Task &task)
 {
 	take_task_by_id(task.upstream_id);
-	m->queries.push_back(task);
+	m->tasks.push_back(task);
 }
 
 void Behind::parse_dns_message(const char *begin, const char *end, dns::Message *msg)
@@ -1620,38 +1622,46 @@ void Behind::process_response(InternalData *d, ProtocolFamilyType const &upstrea
 
 bool Behind::process_receive(InternalData *d, int fd)
 {
+	Task *task = nullptr;
+
+	auto Done = [&](bool ret){
+		delete_socket(fd, task ? &task->ev : nullptr);
+		return ret;
+	};
+
 	auto opt = take_task_by_fd(fd);
-	if (!opt) return false;
-	Task *task = &*opt;
-	if (task->op == Operation::REPLY_TO_CLIENT_TCP) {
-		char buf[4096];
-		int n = recv(task->upstream_fd, buf, sizeof(buf), 0);
-		if (n > 2) {
-			n -= 2;
-			n = std::min(n, (int)ntohs(*(uint16_t *)buf));
-			char const *begin = buf + 2;
-			char const *end = begin + n;
-			dns::Message msg;
-			parse_dns_message(begin, end, &msg);
-			msg.header.id = task->requester_id;
-			send_dns_message(d, task->client_proto, msg, false, false);
+	if (opt) {
+		task = &*opt;
+
+		if (task->op == Operation::REPLY_TO_CLIENT_TCP) {
+			char buf[4096];
+			int n = recv(task->upstream_fd, buf, sizeof(buf), 0);
+			if (n > 2) {
+				n -= 2;
+				n = std::min(n, (int)ntohs(*(uint16_t *)buf));
+				char const *begin = buf + 2;
+				char const *end = begin + n;
+				dns::Message msg;
+				parse_dns_message(begin, end, &msg);
+				msg.header.id = task->requester_id;
+				send_dns_message(d, task->client_proto, msg, false, false);
+			}
+			return Done(true);
 		}
-		ctl_del(task->upstream_fd, &task->ev);
-		closesocket(task->upstream_fd);
-		return true;
-	} else if (task->op == Operation::REPLY_TO_CLIENT_UDP) {
-		char buf[4096];
-		int n = recv(fd, buf, sizeof(buf), 0);
-		if (n > 0) {
-			dns::Message received;
-			parse_dns_message(buf, buf + n, &received);
-			reply_to_client_udp(d, task, received);
+
+		if (task->op == Operation::REPLY_TO_CLIENT_UDP) {
+			char buf[4096];
+			int n = recv(fd, buf, sizeof(buf), 0);
+			if (n > 0) {
+				dns::Message received;
+				parse_dns_message(buf, buf + n, &received);
+				reply_to_client_udp(d, task, received);
+			}
+			return Done(true);
 		}
-		ctl_del(task->upstream_fd, &task->ev);
-		closesocket(task->upstream_fd);
-		return true;
 	}
-	return false;
+
+	return Done(false);
 }
 
 void Behind::process(InternalData *d, ProtocolFamilyType const &client_proto)
@@ -1779,7 +1789,8 @@ int Behind::ctl_add(int fd, struct epoll_event *e)
 	if (fd == -1) return -1;
 
 	m->poll_fds.push_back(fd);
-	// fprintf(stderr, "--- add sockets: %d %d\n", fd, (int)m->poll_fds.size());
+
+	fprintf(stderr, "--- add sockets: %d %d\n", fd, (int)m->poll_fds.size());
 
 	int ret = 0;
 	if (e && m->epoll_fd != -1) {
@@ -1794,7 +1805,8 @@ int Behind::ctl_del(int fd, struct epoll_event *e)
 
 	auto it = std::remove(m->poll_fds.begin(), m->poll_fds.end(), fd);
 	m->poll_fds.erase(it, m->poll_fds.end());
-	// fprintf(stderr, "--- del sockets: %d %d\n", fd, (int)m->poll_fds.size());
+
+	fprintf(stderr, "--- del sockets: %d %d\n", fd, (int)m->poll_fds.size());
 
 	int ret = 0;
 	if (e && m->epoll_fd != -1) {
@@ -1803,9 +1815,10 @@ int Behind::ctl_del(int fd, struct epoll_event *e)
 	return ret;
 }
 
-int Behind::ctl_del(int fd)
+void Behind::delete_socket(int fd, struct epoll_event *e)
 {
-	return ctl_del(fd, nullptr);
+	ctl_del(fd, e);
+	closesocket(fd);
 }
 
 void Behind::main()
@@ -1863,8 +1876,7 @@ void Behind::main()
 				if (FD_ISSET(fd, &fds)) {
 					FD_CLR(fd, &fds);
 					if (!process_receive(&d, fd)) {
-						ctl_del(fd);
-						closesocket(fd);
+						delete_socket(fd, nullptr);
 					}
 				}
 			}
@@ -1918,13 +1930,13 @@ void Behind::main()
 					process_tcp(&d, AF_INET6);
 				} else {
 					if (!process_receive(&d, fd)) {
-						ctl_del(fd);
-						closesocket(fd);
+						delete_socket(fd, nullptr);
 					}
 				}
 			}
 			clean();
 		}
+		::close(m->epoll_fd);
 	}
 
 	for (int fd : m->poll_fds) {

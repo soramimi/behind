@@ -213,7 +213,7 @@ private:
 	uint32_t next_local_transaction_id();
 	int ctl_add(int fd, epoll_event *e);
 	int ctl_del(int fd, epoll_event *e);
-	int ctl_del(int fd);
+	void delete_socket(int fd, struct epoll_event *e);
 	bool accept_dns_type(DNS_TYPE t);
 
 	bool forward_tcp(InternalData *d, const ProtocolFamilyType &client_proto, uint16_t client_request_id, dns::Header const &header, const dns::Question &question, uint32_t local_transaction_id, const Forwarder &forwarder);
