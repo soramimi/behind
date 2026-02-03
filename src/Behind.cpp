@@ -825,7 +825,8 @@ std::optional<Behind::Task> Behind::take_task_by_id(uint16_t upstream_id)
 std::optional<Behind::Task> Behind::take_task_by_fd(int fd)
 {
 	for (Task const &q : m->tasks) {
-		if (q.ev.data.fd == fd) {
+		if (q.upstream_fd == fd) {
+			assert(q.upstream_fd == q.ev.data.fd);
 			std::optional<Task> ret = q;
 			clean_transaction(q.local_transaction_id);
 			return ret;
@@ -984,39 +985,47 @@ static void init_sa6(struct sockaddr_in6 *sa6, in6_addr const *addr, int port)
 	sa6->sin6_port = htons(port);
 }
 
+static std::pair<int, std::string> sock_and_address(Behind::InternalData *d, ProtocolFamilyType const &proto)
+{
+	if (proto.is_dgram()) {
+		if (proto.is_inet4()) {
+			return {d->in4_udp.fd, ::addr_to_string(AF_INET, (struct sockaddr *)&d->in4_udp.sa4)};
+		} else if (proto.is_inet6()) {
+			return {d->in6_udp.fd, ::addr_to_string(AF_INET6, (struct sockaddr *)&d->in6_udp.sa6)};
+		}
+	} else if (proto.is_stream()) {
+		if (proto.is_inet4()) {
+			return {d->in4_tcp.fd, ::addr_to_string(AF_INET, (struct sockaddr *)&d->in4_tcp.sa4)};
+		} else if (proto.is_inet6()) {
+			return {d->in6_tcp.fd, ::addr_to_string(AF_INET6, (struct sockaddr *)&d->in6_tcp.sa6)};
+		}
+	}
+	return {-1, {}};
+
+}
+
 struct Sender {
 	int sock = -1;
 	ProtocolFamilyType proto;
-	std::string addr_string;
 	Sender(ProtocolFamilyType const &proto)
 		: proto(proto)
 	{
 	}
-	void addr_to_string(struct sockaddr *sa)
-	{
-		addr_string = ::addr_to_string(proto.family(), sa);
-	}
 	ssize_t send(Behind::InternalData *d, void const *buf, size_t len)
 	{
 		int flags = 0;
-		if (proto.is_dgram()) {
-			if (proto.is_inet4()) {
-				addr_to_string((struct sockaddr *)&d->in4_udp.sa4);
-				return ::sendto(d->in4_udp.fd, buf, len, flags, (struct sockaddr *)&d->in4_udp.sa4, sizeof(sockaddr_in));
-			} else if (proto.is_inet6()) {
-				addr_to_string((struct sockaddr *)&d->in6_udp.sa6);
-				return ::sendto(d->in6_udp.fd, buf, len, flags, (struct sockaddr *)&d->in6_udp.sa6, sizeof(sockaddr_in6));
+		auto [sock, addr_str] = sock_and_address(d, proto);
+		(void)addr_str;
+		if (sock != -1) {
+			if (proto.is_dgram()) {
+				if (proto.is_inet4()) {
+					return ::sendto(sock, buf, len, flags, (struct sockaddr *)&d->in4_udp.sa4, sizeof(sockaddr_in));
+				} else if (proto.is_inet6()) {
+					return ::sendto(sock, buf, len, flags, (struct sockaddr *)&d->in6_udp.sa6, sizeof(sockaddr_in6));
+				}
+			} else if (proto.is_stream()) {
+				return ::send(sock, buf, len, flags);
 			}
-		} else if (proto.is_stream()) {
-			int sock = -1;
-			if (proto.is_inet4()) {
-				sock = d->in4_tcp.fd;
-			} else if (proto.is_inet6()) {
-				sock = d->in6_tcp.fd;
-			} else {
-				return -1;
-			}
-			return ::send(sock, buf, len, flags);
 		}
 		return -1;
 	}
@@ -1129,7 +1138,10 @@ bool Behind::send_dns_message(InternalData *d, ProtocolFamilyType const &proto, 
 
 	Sender sender(proto);
 	bool ok = sender.send(d, &packet.buffer[0], packet.buffer.size()) == (ssize_t)packet.buffer.size();
-	std::string client = sender.addr_string;
+
+	auto [sock, client] = sock_and_address(d, proto);
+	(void)sock;
+	// std::string client = sender.addr_string;
 
 	char const *comment = "";
 	if (from_cache) {
@@ -1620,18 +1632,20 @@ void Behind::process_response(InternalData *d, ProtocolFamilyType const &upstrea
 	}
 }
 
-bool Behind::process_receive(InternalData *d, int fd)
+bool Behind::process_receive(InternalData *d, int upstream_fd)
 {
 	Task *task = nullptr;
 
 	auto Done = [&](bool ret){
-		delete_socket(fd, task ? &task->ev : nullptr);
+		delete_socket(upstream_fd, task ? &task->ev : nullptr);
 		return ret;
 	};
 
-	auto opt = take_task_by_fd(fd);
+	auto opt = take_task_by_fd(upstream_fd);
 	if (opt) {
 		task = &*opt;
+
+		assert(task->upstream_fd == upstream_fd);
 
 		if (task->op == Operation::REPLY_TO_CLIENT_TCP) {
 			char buf[4096];
@@ -1646,12 +1660,23 @@ bool Behind::process_receive(InternalData *d, int fd)
 				msg.header.id = task->requester_id;
 				send_dns_message(d, task->client_proto, msg, false, false);
 			}
+			{
+				int client_fd = -1;
+				if (task->client_proto.is_inet4()) {
+					client_fd = d->in4_tcp.fd;
+				} else if (task->client_proto.is_inet6()) {
+					client_fd = d->in6_tcp.fd;
+				} else {
+					return -1;
+				}
+				delete_socket(client_fd, nullptr);;
+			}
 			return Done(true);
 		}
 
 		if (task->op == Operation::REPLY_TO_CLIENT_UDP) {
 			char buf[4096];
-			int n = recv(fd, buf, sizeof(buf), 0);
+			int n = recv(upstream_fd, buf, sizeof(buf), 0);
 			if (n > 0) {
 				dns::Message received;
 				parse_dns_message(buf, buf + n, &received);
@@ -1790,8 +1815,6 @@ int Behind::ctl_add(int fd, struct epoll_event *e)
 
 	m->poll_fds.push_back(fd);
 
-	fprintf(stderr, "--- add sockets: %d %d\n", fd, (int)m->poll_fds.size());
-
 	int ret = 0;
 	if (e && m->epoll_fd != -1) {
 		ret = epoll_ctl(m->epoll_fd, EPOLL_CTL_ADD, e->data.fd, e);
@@ -1806,7 +1829,6 @@ int Behind::ctl_del(int fd, struct epoll_event *e)
 	auto it = std::remove(m->poll_fds.begin(), m->poll_fds.end(), fd);
 	m->poll_fds.erase(it, m->poll_fds.end());
 
-	fprintf(stderr, "--- del sockets: %d %d\n", fd, (int)m->poll_fds.size());
 
 	int ret = 0;
 	if (e && m->epoll_fd != -1) {

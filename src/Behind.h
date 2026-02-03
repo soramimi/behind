@@ -225,7 +225,7 @@ private:
 	void process_query_tcp(InternalData *d, const ProtocolFamilyType &client_proto, const dns::Header &header, const dns::Question &q);
 	void process_response(InternalData *d, const ProtocolFamilyType &upstream_proto, const dns::Message &received);
 	uint16_t next_txid();
-	bool process_receive(InternalData *d, int fd);
+	bool process_receive(InternalData *d, int upstream_fd);
 	std::optional<Behind::Task> take_task_by_fd(int fd);
 	bool bind(void *private_in, const ProtocolFamilyType &proto, int sock);
 	void reply_to_client_udp(InternalData *d, Task *task, const dns::Message &received);
