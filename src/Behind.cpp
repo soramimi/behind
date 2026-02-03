@@ -1986,6 +1986,19 @@ std::string to_string(std::vector<uint8_t> const &buf)
 
 void Behind::test()
 {
+	// domain filter test
+
+	{
+		DomainFilter filter;
+		filter.add_nxdomain("*.lan");
+		filter.add_nxdomain("example.com");
+		EXPECT_EQ(filter.find("hoge.lan"), DomainFilter::NXDOMAIN);
+		EXPECT_EQ(filter.find("example.com"), DomainFilter::NXDOMAIN);
+		EXPECT_EQ(filter.find("ads.example.com"), DomainFilter::NXDOMAIN);
+	}
+
+	// serializer/desirializer test
+
 	std::vector<char> buf;
 	char const *file;
 

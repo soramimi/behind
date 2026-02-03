@@ -110,21 +110,6 @@ bool parse_option(int argc, char **argv, Option *opt)
 	return ok;
 }
 
-int main2(Behind *ns)
-{
-	auto Perform = [&](){
-		try {
-			ns->main();
-		} catch (std::string const &e) {
-			logprintf(LOG_DEFAULT, "%s\n", e.c_str());
-			fprintf(stderr, "%s\n", e.c_str());
-		}
-	};
-
-	Perform();
-	return 0;
-}
-
 std::string getcwd()
 {
 	char buf[4096];
@@ -140,16 +125,6 @@ std::string getcwd()
 
 int main(int argc, char **argv)
 {
-	{
-		DomainFilter filter;
-		filter.add_nxdomain("*.lan");
-		filter.add_nxdomain("doubleclick.net");
-		EXPECT_EQ(filter.find("hoge.lan"), DomainFilter::NXDOMAIN);
-		EXPECT_EQ(filter.find("doubleclick.net"), DomainFilter::NXDOMAIN);
-		EXPECT_EQ(filter.find("ads.doubleclick.net"), DomainFilter::NXDOMAIN);
-		// return 0;
-	}
-
 	Global g;
 	global = &g;
 
@@ -176,8 +151,14 @@ int main(int argc, char **argv)
 	logprintf(LOG_BOTH, "current working directory: %s\n", cwd.c_str());
 
 	Behind behind(opt);
-	behind.test();
-	main2(&behind);
+
+	try {
+		behind.test();
+		behind.main();
+	} catch (std::string const &e) {
+		logprintf(LOG_DEFAULT, "%s\n", e.c_str());
+		fprintf(stderr, "%s\n", e.c_str());
+	}
 
 	Logger::stop();
 
