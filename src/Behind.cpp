@@ -311,6 +311,8 @@ public:
 
 struct Behind::Task {
 	Behind::Operation op = Operation::NONE;
+	bool connect_in_progress = false;
+	std::shared_ptr<Behind::ForwardingThreadData> fwdata;
 	uint64_t timestamp;
 	uint32_t local_transaction_id;
 	uint16_t upstream_id;
@@ -319,7 +321,7 @@ struct Behind::Task {
 	ProtocolFamilyType client_proto;
 	ProtocolFamilyType upstream_proto;
 	int upstream_fd = -1;
-	struct epoll_event ev;
+	std::shared_ptr<epoll_event> ev = std::make_shared<epoll_event>();
 	union {
 		sockaddr_in client_sa4;
 		sockaddr_in6 client_sa6;
@@ -343,12 +345,9 @@ struct Behind::InternalData {
 };
 
 struct Behind::ForwardingThreadData {
-	bool busy = false;
 	Behind::InternalData d;
 	Forwarder forwarder;
 	dns::Message msg;
-	Behind::Task task;
-	std::thread thread;
 };
 
 struct Behind::Private {
@@ -801,8 +800,50 @@ void Behind::init_forwarder()
 	}
 }
 
+int Behind::ctl_add(int fd, struct epoll_event *e)
+{
+	if (fd == -1) return -1;
+	int ret = 0;
+	{
+		std::lock_guard lock(m->mutex);
+
+		m->poll_fds.push_back(fd);
+
+		if (e && m->epoll_fd != -1) {
+			ret = epoll_ctl(m->epoll_fd, EPOLL_CTL_ADD, e->data.fd, e);
+		}
+		logprintf(LOG_STDERR, "--- add: %d\n", fd);
+	}
+	return ret;
+}
+
+int Behind::ctl_del(int fd, struct epoll_event *e)
+{
+	if (fd == -1) return -1;
+	int ret = 0;
+	{
+		std::lock_guard lock(m->mutex);
+
+		auto it = std::remove(m->poll_fds.begin(), m->poll_fds.end(), fd);
+		m->poll_fds.erase(it, m->poll_fds.end());
+
+		if (e && m->epoll_fd != -1) {
+			ret = epoll_ctl(m->epoll_fd, EPOLL_CTL_DEL, e->data.fd, e);
+		}
+		logprintf(LOG_STDERR, "--- del: %d\n", fd);
+	}
+	return ret;
+}
+
+void Behind::delete_socket(int fd, struct epoll_event *e)
+{
+	ctl_del(fd, e);
+	closesocket(fd);
+}
+
 void Behind::clean()
 {
+	return;
 	std::lock_guard lock(m->mutex);
 
 	{
@@ -812,25 +853,28 @@ void Behind::clean()
 			i--;
 			if (now - m->tasks[i].timestamp >= 1000) { // 1 second
 				Task *task = &m->tasks[i];
-				delete_socket(task->upstream_fd, &task->ev);
+				m->mutex.unlock();
+				logprintf(LOG_STDERR, "--- delete: %d\n", task->upstream_fd);
+				delete_socket(task->upstream_fd, task->ev.get());
+				m->mutex.lock();
 				m->tasks.erase(m->tasks.begin() + i);
 			}
 		}
 	}
 
-	{
-		size_t i = m->threads.size();
-		while (i > 0) {
-			i--;
-			auto &sp = m->threads[i];
-			if (!sp->busy) {
-				if (sp->thread.joinable()) {
-					sp->thread.join();
-				}
-				m->threads.erase(m->threads.begin() + i);
-			}
-		}
-	}
+	// if (0) {
+	// 	size_t i = m->threads.size();
+	// 	while (i > 0) {
+	// 		i--;
+	// 		auto &sp = m->threads[i];
+	// 		if (!sp->busy) {
+	// 			if (sp->thread.joinable()) {
+	// 				sp->thread.join();
+	// 			}
+	// 			m->threads.erase(m->threads.begin() + i);
+	// 		}
+	// 	}
+	// }
 }
 
 void Behind::clean_transaction(uint32_t id)
@@ -865,7 +909,7 @@ std::optional<Behind::Task> Behind::take_task_by_fd(int fd)
 	m->mutex.lock();
 	for (Task const &q : m->tasks) {
 		if (q.upstream_fd == fd) {
-			assert(q.upstream_fd == q.ev.data.fd);
+			assert(q.upstream_fd == q.ev->data.fd);
 			std::optional<Task> ret = q;
 			m->mutex.unlock();
 			clean_transaction(q.local_transaction_id);
@@ -1402,96 +1446,113 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 		t.request_name = question.name;
 		t.forward_name = query_name;
 
-		t.ev = {};
-		t.ev.events = EPOLLIN;
-		t.ev.data.fd = t.upstream_fd;
+		t.ev->events = EPOLLIN;
+		t.ev->data.fd = t.upstream_fd;
+		ctl_add(t.upstream_fd, t.ev.get());
 		push_task(t);
-
-		ctl_add(t.upstream_fd, &t.ev);
 	}
 }
 
 void Behind::forward_tcp(InternalData *d, ProtocolFamilyType const &client_proto, uint16_t client_request_id, dns::Header const &header, dns::Question const &question, uint32_t local_transaction_id, Forwarder const &forwarder)
 {
-	std::shared_ptr<ForwardingThreadData> fwdata = std::make_shared<ForwardingThreadData>();
-	fwdata->d = *d;
-	fwdata->forwarder = forwarder;
+	Task task;
+	task.fwdata = std::make_shared<ForwardingThreadData>();
+	task.fwdata->d = *d;
+	task.fwdata->forwarder = forwarder;
 
-	fwdata->msg.header.id = header.id;
-	fwdata->msg.header.flags = 0x0100;
-	fwdata->msg.questions = {question};
+	task.fwdata->msg.header.id = header.id;
+	task.fwdata->msg.header.flags = 0x0100;
+	task.fwdata->msg.questions = {question};
 
-	int pf = -1;
-	if (fwdata->forwarder.is_inet4()) {
-		pf = PF_INET;
-		fwdata->task.client_sa4 = d->in4_udp.sa4;
-	} else if (fwdata->forwarder.is_inet6()) {
-		pf = PF_INET6;
-		fwdata->task.client_sa6 = d->in6_udp.sa6;
+	if (task.fwdata->forwarder.is_inet4()) {
+		task.client_sa4 = d->in4_udp.sa4;
+	} else if (task.fwdata->forwarder.is_inet6()) {
+		task.client_sa6 = d->in6_udp.sa6;
 	} else {
 		return;
 	}
 
-	fwdata->task.op = Operation::REPLY_TO_CLIENT_TCP;
-	fwdata->task.local_transaction_id = local_transaction_id;
-	fwdata->task.requester_id = client_request_id;
-	fwdata->task.upstream_id = header.id;
-	fwdata->task.request_name = question.name;
-	fwdata->task.forward_name = m->option.case_randomize ? randomize_case(question.name) : question.name;
-	fwdata->task.type = question.type;
-	fwdata->task.client_proto = client_proto;
+	task.op = Operation::FORWARD_TO_UPSTREAM_TCP;
+	task.local_transaction_id = local_transaction_id;
+	task.requester_id = client_request_id;
+	task.upstream_id = header.id;
+	task.request_name = question.name;
+	task.forward_name = m->option.case_randomize ? randomize_case(question.name) : question.name;
+	task.type = question.type;
+	task.client_proto = client_proto;
 
-	fwdata->task.upstream_fd = socket(pf, SOCK_STREAM, 0);
-	if (fwdata->task.upstream_fd == INVALID_SOCKET) {
+	int sock = socket(task.fwdata->forwarder.af_type, SOCK_STREAM, 0);
+	if (sock == INVALID_SOCKET) {
 		logprintf(LOG_DEFAULT, "socket: %s\n", strerror(errno));
 		return;
 	}
+	fcntl(sock, F_SETFL, O_NONBLOCK);
+	// int val = 1;
+	// ioctl(sock, FIONBIO, &val);
 
-	std::thread thread([this](ForwardingThreadData *fwdata){
-		int sock = fwdata->task.upstream_fd;
-		ProtocolFamilyType upstream_proto = {fwdata->forwarder.af_type, SOCK_STREAM};
+	// std::thread thread([this](ForwardingThreadData *fwdata){
+		ProtocolFamilyType upstream_proto = {task.fwdata->forwarder.af_type, SOCK_STREAM};
 		struct sockaddr_in sa4;
 		struct sockaddr_in6 sa6;
 		sockaddr *sa = nullptr;
 		socklen_t salen = 0;
 		if (upstream_proto.is_inet4()) {
-			fwdata->d.in4_tcp.fd = sock;
-			init_sa4(&sa4, (in_addr *)fwdata->forwarder.addr, fwdata->forwarder.port);
+			task.fwdata->d.in4_tcp.fd = sock;
+			init_sa4(&sa4, (in_addr *)task.fwdata->forwarder.addr, task.fwdata->forwarder.port);
 			sa = (sockaddr *)&sa4;
 			salen = sizeof(sa4);
 		} else if (upstream_proto.is_inet6()) {
-			fwdata->d.in6_tcp.fd = sock;
-			init_sa6(&sa6, (in6_addr *)fwdata->forwarder.addr, fwdata->forwarder.port);
+			task.fwdata->d.in6_tcp.fd = sock;
+			init_sa6(&sa6, (in6_addr *)task.fwdata->forwarder.addr, task.fwdata->forwarder.port);
 			sa = (sockaddr *)&sa6;
 			salen = sizeof(sa6);
 		}
 		if (sa) {
-			if (connect(sock, sa, salen) == SOCKET_ERROR) {
-				logprintf(LOG_DEFAULT, "connect: %s\n", strerror(errno));
-			} else {
-				if (send_dns_message(&fwdata->d, upstream_proto, fwdata->msg, true, false)) {
-					fwdata->task.timestamp = misc::get_tick_count();
-					fwdata->task.upstream_proto = upstream_proto;
+			auto e = connect(sock, sa, salen);
+			if (e < 0) {
+				if (errno == EINPROGRESS) {
+					task.connect_in_progress = true;
 
-					fwdata->task.ev = {};
-					fwdata->task.ev.events = EPOLLIN;
-					fwdata->task.ev.data.fd = fwdata->task.upstream_fd;
-					push_task(fwdata->task);
+					task.timestamp = misc::get_tick_count();
+					task.upstream_proto = upstream_proto;
+					task.upstream_fd = sock;
 
-					ctl_add(fwdata->task.upstream_fd, &fwdata->task.ev);
+					task.ev->data.fd = sock;
+					task.ev->events = EPOLLOUT | EPOLLERR | EPOLLHUP;
+					ctl_add(sock, task.ev.get());
+					push_task(task);
+				} else {
+					logprintf(LOG_DEFAULT, "connect: %s\n", strerror(errno));
 				}
+			} else {
+#if 0
+				if (send_dns_message(&fwdata->d, upstream_proto, fwdata->msg, true, false)) {
+					task.timestamp = misc::get_tick_count();
+					task.upstream_proto = upstream_proto;
+
+					task.ev = {};
+					task.ev.events = EPOLLIN;
+					task.ev.data.fd = task.upstream_fd;
+					push_task(task);
+
+					ctl_add(task.upstream_fd, &task.ev);
+				}
+#else
+#endif
 			}
 		}
-		fwdata->busy = false;
-	}, fwdata.get());
+		// task.fwdata->busy = false;
+	// }, fwdata.get());
 
-	fwdata->busy = true;
-	fwdata->thread = std::move(thread);
+	// thread.join();
 
-	{
-		std::lock_guard lock(m->mutex);
-		m->threads.push_back(fwdata);
-	}
+	// fwdata->busy = true;
+	// fwdata->thread = std::move(thread);
+
+	// {
+	// 	std::lock_guard lock(m->mutex);
+	// 	m->threads.push_back(fwdata);
+	// }
 }
 
 bool Behind::reply_from_cache(InternalData *d, ProtocolFamilyType const &client_proto, dns::Header const &header, dns::Question const &q)
@@ -1695,7 +1756,7 @@ bool Behind::process_receive(InternalData *d, int upstream_fd)
 	Task *task = nullptr;
 
 	auto Done = [&](bool ret){
-		delete_socket(upstream_fd, task ? &task->ev : nullptr);
+		delete_socket(upstream_fd, task ? task->ev.get() : nullptr);
 		return ret;
 	};
 
@@ -1705,6 +1766,27 @@ bool Behind::process_receive(InternalData *d, int upstream_fd)
 
 		assert(task->upstream_fd == upstream_fd);
 
+		if (task->op == Operation::FORWARD_TO_UPSTREAM_TCP) {
+			if (task->connect_in_progress) {
+				int upstream_fd = task->upstream_fd;
+				int so_error;
+				socklen_t len = sizeof(so_error);
+				getsockopt(upstream_fd, SOL_SOCKET, SO_ERROR, &so_error, &len);
+				if (so_error != 0) {
+					return false;
+				}
+				logprintf(LOG_DEFAULT, "---\n");
+				if (send_dns_message(&task->fwdata->d, task->upstream_proto, task->fwdata->msg, true, false)) {
+					ctl_del(upstream_fd, task->ev.get());
+					task->op = Operation::REPLY_TO_CLIENT_TCP;
+					task->timestamp = misc::get_tick_count();
+					task->ev->events = EPOLLIN;
+					ctl_add(upstream_fd, task->ev.get());
+					push_task(*task);
+					return true;
+				}
+			}
+		}
 		if (task->op == Operation::REPLY_TO_CLIENT_TCP) {
 			char buf[4096];
 			int n = recv(task->upstream_fd, buf, sizeof(buf), 0);
@@ -1866,45 +1948,6 @@ int ev_fd(struct epoll_event *e)
 	return e->data.fd;
 }
 
-int Behind::ctl_add(int fd, struct epoll_event *e)
-{
-	if (fd == -1) return -1;
-	int ret = 0;
-	{
-		std::lock_guard lock(m->mutex);
-
-		m->poll_fds.push_back(fd);
-
-		if (e && m->epoll_fd != -1) {
-			ret = epoll_ctl(m->epoll_fd, EPOLL_CTL_ADD, e->data.fd, e);
-		}
-	}
-	return ret;
-}
-
-int Behind::ctl_del(int fd, struct epoll_event *e)
-{
-	if (fd == -1) return -1;
-	int ret = 0;
-	{
-		std::lock_guard lock(m->mutex);
-
-		auto it = std::remove(m->poll_fds.begin(), m->poll_fds.end(), fd);
-		m->poll_fds.erase(it, m->poll_fds.end());
-
-		if (e && m->epoll_fd != -1) {
-			ret = epoll_ctl(m->epoll_fd, EPOLL_CTL_DEL, e->data.fd, e);
-		}
-	}
-	return ret;
-}
-
-void Behind::delete_socket(int fd, struct epoll_event *e)
-{
-	ctl_del(fd, e);
-	closesocket(fd);
-}
-
 void Behind::main()
 {
 	add_hosts(m->option.hosts);
@@ -1933,8 +1976,10 @@ void Behind::main()
 				std::lock_guard lock(m->mutex);
 				for (int fd : m->poll_fds) {
 					FD_SET(fd, &fds);
+					fprintf(stderr, " %d", fd);
 					maxfd = std::max(maxfd, fd);
 				}
+				fprintf(stderr, "\n");
 			}
 			select(maxfd + 1, &fds, nullptr, nullptr, nullptr);
 
@@ -2012,6 +2057,7 @@ void Behind::main()
 			}
 			for (int i = 0; i < n; i++) {
 				auto fd = m->epoll_events[i].data.fd;
+				logprintf(LOG_STDERR, "--- fd: %d\n", fd);
 				if (fd == d.in4_udp.fd) {
 					process_udp(&d, AF_INET, fd);
 				} else if (fd == d.in6_udp.fd) {
@@ -2048,11 +2094,11 @@ void Behind::main()
 		std::swap(threads, m->threads);
 	}
 
-	for (auto &t : threads) {
-		if (t->thread.joinable()) {
-			t->thread.join();
-		}
-	}
+	// for (auto &t : threads) {
+	// 	if (t->thread.joinable()) {
+	// 		t->thread.join();
+	// 	}
+	// }
 }
 
 // test

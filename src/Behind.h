@@ -129,6 +129,7 @@ private:
 		NONE,
 		REPLY_TO_CLIENT_UDP,
 		REPLY_TO_CLIENT_TCP,
+		FORWARD_TO_UPSTREAM_TCP,
 	};
 
 	struct Task;
