@@ -132,6 +132,7 @@ private:
 	};
 
 	struct Task;
+	struct ForwardingThreadData;
 
 	enum class SocketMode {
 		SELECT,
@@ -216,7 +217,7 @@ private:
 	void delete_socket(int fd, struct epoll_event *e);
 	bool accept_dns_type(DNS_TYPE t);
 
-	bool forward_tcp(InternalData *d, const ProtocolFamilyType &client_proto, uint16_t client_request_id, dns::Header const &header, const dns::Question &question, uint32_t local_transaction_id, const Forwarder &forwarder);
+        void forward_tcp(InternalData *d, const ProtocolFamilyType &client_proto, uint16_t client_request_id, dns::Header const &header, const dns::Question &question, uint32_t local_transaction_id, const Forwarder &forwarder);
 	void forward_udp(const InternalData &d, const ProtocolFamilyType &proto, const dns::Header &header, const dns::Question &q, uint32_t local_transaction_id, const Forwarder &forwarder);
 
 	std::vector<char> read(InternalData *d, const ProtocolFamilyType &proto);
@@ -229,6 +230,7 @@ private:
 	std::optional<Behind::Task> take_task_by_fd(int fd);
 	bool bind(void *private_in, const ProtocolFamilyType &proto, int sock);
 	void reply_to_client_udp(InternalData *d, Task *task, const dns::Message &received);
+	bool reply_from_cache(InternalData *d, const ProtocolFamilyType &client_proto, const dns::Header &header, const dns::Question &q);
 public:
 	Behind(Option const &opt);
 	~Behind();

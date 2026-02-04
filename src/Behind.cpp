@@ -14,6 +14,8 @@
 #include <regex>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <mutex>
+#include <thread>
 #include <unistd.h>
 
 #define stricmp(A, B) strcasecmp(A, B)
@@ -308,7 +310,7 @@ public:
 } // namespace dns
 
 struct Behind::Task {
-	Operation op = Operation::NONE;
+	Behind::Operation op = Operation::NONE;
 	uint64_t timestamp;
 	uint32_t local_transaction_id;
 	uint16_t upstream_id;
@@ -326,29 +328,6 @@ struct Behind::Task {
 	std::string forward_name;
 };
 
-struct Behind::Private {
-	Option option;
-	Hosts hosts;
-	uint32_t local_transaction_id = 0;
-	TransactionIdGenerator txid_gen;
-	InetResolver resolver;
-
-	Behind::SocketMode socket_mode;
-	fd_set readfds;
-	int epoll_fd = -1;
-	std::vector<int> poll_fds;
-	std::vector<epoll_event> epoll_events{10};
-
-	int ttl = 5 * 60;
-	struct {
-		dns::Cache a;
-		dns::Cache aaaa;
-		dns::Cache soa;
-	} dns_cache;
-	std::vector<Behind::Task> tasks;
-	std::vector<Forwarder> forwarders;
-};
-
 struct Behind::InternalData {
 	struct In {
 		int listener_fd = -1;
@@ -360,7 +339,41 @@ struct Behind::InternalData {
 		struct epoll_event ev;
 	};
 	In in4_udp, in6_udp;
-	In in4_tcp, in6_tcp; // wip: experimental: tcp support
+	In in4_tcp, in6_tcp;
+};
+
+struct Behind::ForwardingThreadData {
+	bool busy = false;
+	Behind::InternalData d;
+	Forwarder forwarder;
+	dns::Message msg;
+	Behind::Task task;
+	std::thread thread;
+};
+
+struct Behind::Private {
+	Option option;
+	Hosts hosts;
+	uint32_t local_transaction_id = 0;
+	TransactionIdGenerator txid_gen;
+	InetResolver resolver;
+
+	Behind::SocketMode socket_mode;
+	fd_set readfds;
+	int epoll_fd = -1;
+	std::mutex mutex;
+	std::vector<std::shared_ptr<Behind::ForwardingThreadData>> threads;
+	std::vector<int> poll_fds;
+	std::vector<epoll_event> epoll_events{10};
+
+	int ttl = 5 * 60;
+	struct {
+		dns::Cache a;
+		dns::Cache aaaa;
+		dns::Cache soa;
+	} dns_cache;
+	std::vector<Behind::Task> tasks;
+	std::vector<Forwarder> forwarders;
 };
 
 const InetResolver::Addr *Hosts::find(const std::string &name)
@@ -479,43 +492,46 @@ int Behind::decode_name(const char *begin, const char *end, const char *ptr, std
 	if (begin && ptr && begin <= ptr && ptr < end) {
 		char const *start = ptr;
 		while (ptr < end) {
-			if ((*ptr & 0xc0) == 0xc0) {
+			uint8_t n(*ptr);
+			if ((n & 0xc0) == 0xc0) {
 				if (ptr + 1 < end) {
-					int o = ((ptr[0] & 0x3f) << 8) | (ptr[1] & 0xff);
-					decode_name(begin, end, begin + o, out);
+					int o = ((n & 0x3f) << 8) | (ptr[1] & 0xff);
+					if (decode_name(begin, end, begin + o, out) < 0) return -1;
 					ptr += 2;
+					break;
 				}
-				break;
+				return -1;
 			}
-			int len = *ptr & 0xff;
+			if ((n & 0xc0) != 0x00) {
+				return -1;
+			}
 			ptr++;
-			if (len == 0 || len > 63) {
-				break;
-			}
+			if (n == 0) break;
 			if (!out->empty()) {
 				out->push_back('.');
 			}
-			out->insert(out->end(), ptr, ptr + len);
-			ptr += len;
-		}
-		if (ptr < start || ptr > end) {
-			ptr = end;
+			out->insert(out->end(), ptr, ptr + n);
+			if (out->size() > 253) {
+				return -1;
+			}
+			ptr += n;
 		}
 		return ptr - start;
 	}
-	return 0;
+	return -1;
 }
 
 int Behind::decode_name(const char *begin, const char *end, const char *ptr, std::string *name)
 {
 	std::vector<char> tmp;
-	tmp.reserve(100);
+	tmp.reserve(320);
 	int n = decode_name(begin, end, ptr, &tmp);
 	if (n > 0 && !tmp.empty()) {
 		char const *p = &tmp[0];
 		name->assign(p, tmp.size());
 		return n;
 	}
+	name->clear();
 	return 0;
 }
 
@@ -787,20 +803,39 @@ void Behind::init_forwarder()
 
 void Behind::clean()
 {
-	uint64_t now = misc::get_tick_count();
-	size_t i = m->tasks.size();
-	while (i > 0) {
-		i--;
-		if (now - m->tasks[i].timestamp >= 1000) { // 1 second
-			Task *task = &m->tasks[i];
-			delete_socket(task->upstream_fd, &task->ev);
-			m->tasks.erase(m->tasks.begin() + i);
+	std::lock_guard lock(m->mutex);
+
+	{
+		uint64_t now = misc::get_tick_count();
+		size_t i = m->tasks.size();
+		while (i > 0) {
+			i--;
+			if (now - m->tasks[i].timestamp >= 1000) { // 1 second
+				Task *task = &m->tasks[i];
+				delete_socket(task->upstream_fd, &task->ev);
+				m->tasks.erase(m->tasks.begin() + i);
+			}
+		}
+	}
+
+	{
+		size_t i = m->threads.size();
+		while (i > 0) {
+			i--;
+			auto &sp = m->threads[i];
+			if (!sp->busy) {
+				if (sp->thread.joinable()) {
+					sp->thread.join();
+				}
+				m->threads.erase(m->threads.begin() + i);
+			}
 		}
 	}
 }
 
 void Behind::clean_transaction(uint32_t id)
 {
+	std::lock_guard lock(m->mutex);
 	size_t i = m->tasks.size();
 	while (i > 0) {
 		i--;
@@ -812,33 +847,42 @@ void Behind::clean_transaction(uint32_t id)
 
 std::optional<Behind::Task> Behind::take_task_by_id(uint16_t upstream_id)
 {
+	m->mutex.lock();
 	for (Task const &q : m->tasks) {
 		if (upstream_id == q.upstream_id) {
 			std::optional<Task> ret = q;
+			m->mutex.unlock();
 			clean_transaction(q.local_transaction_id);
 			return ret;
 		}
 	}
+	m->mutex.unlock();
 	return std::nullopt;
 }
 
 std::optional<Behind::Task> Behind::take_task_by_fd(int fd)
 {
+	m->mutex.lock();
 	for (Task const &q : m->tasks) {
 		if (q.upstream_fd == fd) {
 			assert(q.upstream_fd == q.ev.data.fd);
 			std::optional<Task> ret = q;
+			m->mutex.unlock();
 			clean_transaction(q.local_transaction_id);
 			return ret;
 		}
 	}
+	m->mutex.unlock();
 	return std::nullopt;
 }
 
 void Behind::push_task(const Task &task)
 {
 	take_task_by_id(task.upstream_id);
-	m->tasks.push_back(task);
+	{
+		std::lock_guard lock(m->mutex);
+		m->tasks.push_back(task);
+	}
 }
 
 void Behind::parse_dns_message(const char *begin, const char *end, dns::Message *msg)
@@ -985,7 +1029,7 @@ static void init_sa6(struct sockaddr_in6 *sa6, in6_addr const *addr, int port)
 	sa6->sin6_port = htons(port);
 }
 
-static std::pair<int, std::string> sock_and_address(Behind::InternalData *d, ProtocolFamilyType const &proto)
+std::pair<int, std::string> sock_and_address(Behind::InternalData *d, ProtocolFamilyType const &proto)
 {
 	if (proto.is_dgram()) {
 		if (proto.is_inet4()) {
@@ -1141,7 +1185,6 @@ bool Behind::send_dns_message(InternalData *d, ProtocolFamilyType const &proto, 
 
 	auto [sock, client] = sock_and_address(d, proto);
 	(void)sock;
-	// std::string client = sender.addr_string;
 
 	char const *comment = "";
 	if (from_cache) {
@@ -1368,83 +1411,106 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 	}
 }
 
-bool Behind::forward_tcp(InternalData *d, ProtocolFamilyType const &client_proto, uint16_t client_request_id, dns::Header const &header, dns::Question const &question, uint32_t local_transaction_id, Forwarder const &forwarder)
+void Behind::forward_tcp(InternalData *d, ProtocolFamilyType const &client_proto, uint16_t client_request_id, dns::Header const &header, dns::Question const &question, uint32_t local_transaction_id, Forwarder const &forwarder)
 {
-	std::string query_name = question.name;
-	if (m->option.case_randomize) {
-		query_name = randomize_case(query_name);
-	}
+	std::shared_ptr<ForwardingThreadData> fwdata = std::make_shared<ForwardingThreadData>();
+	fwdata->d = *d;
+	fwdata->forwarder = forwarder;
 
-	ProtocolFamilyType upstream_proto = {forwarder.af_type, SOCK_STREAM};
+	fwdata->msg.header.id = header.id;
+	fwdata->msg.header.flags = 0x0100;
+	fwdata->msg.questions = {question};
 
-	InternalData::In in;
-
-	sockaddr *sa = nullptr;
-	socklen_t salen = 0;
-	if (upstream_proto.is_inet4()) {
-		init_sa4(&in.sa4, (in_addr *)forwarder.addr, forwarder.port);
-		sa = (sockaddr *)&in.sa4;
-		salen = sizeof(in.sa4);
-	} else if (upstream_proto.is_inet6()) {
-		init_sa6(&in.sa6, (in6_addr *)forwarder.addr, forwarder.port);
-		sa = (sockaddr *)&in.sa6;
-		salen = sizeof(in.sa6);
+	int pf = -1;
+	if (fwdata->forwarder.is_inet4()) {
+		pf = PF_INET;
+		fwdata->task.client_sa4 = d->in4_udp.sa4;
+	} else if (fwdata->forwarder.is_inet6()) {
+		pf = PF_INET6;
+		fwdata->task.client_sa6 = d->in6_udp.sa6;
 	} else {
-		return false;
+		return;
 	}
 
-	int sock = socket(upstream_proto.pfamily(), upstream_proto.socktype(), 0);
-	if (sock == INVALID_SOCKET) {
+	fwdata->task.op = Operation::REPLY_TO_CLIENT_TCP;
+	fwdata->task.local_transaction_id = local_transaction_id;
+	fwdata->task.requester_id = client_request_id;
+	fwdata->task.upstream_id = header.id;
+	fwdata->task.request_name = question.name;
+	fwdata->task.forward_name = m->option.case_randomize ? randomize_case(question.name) : question.name;
+	fwdata->task.type = question.type;
+	fwdata->task.client_proto = client_proto;
+
+	fwdata->task.upstream_fd = socket(pf, SOCK_STREAM, 0);
+	if (fwdata->task.upstream_fd == INVALID_SOCKET) {
 		logprintf(LOG_DEFAULT, "socket: %s\n", strerror(errno));
-		return false;
+		return;
 	}
 
-	bool ok = false;
-
-	if (connect(sock, sa, salen) == SOCKET_ERROR) {
-		logprintf(LOG_DEFAULT, "connect: %s\n", strerror(errno));
-	} else {
-		dns::Message msg;
-		msg.header.id = header.id;
-		msg.header.flags = 0x0100;
-		msg.questions = {question};
-
-		InternalData d2 =*d;
+	std::thread thread([this](ForwardingThreadData *fwdata){
+		int sock = fwdata->task.upstream_fd;
+		ProtocolFamilyType upstream_proto = {fwdata->forwarder.af_type, SOCK_STREAM};
+		struct sockaddr_in sa4;
+		struct sockaddr_in6 sa6;
+		sockaddr *sa = nullptr;
+		socklen_t salen = 0;
 		if (upstream_proto.is_inet4()) {
-			d2.in4_tcp.fd = sock;
+			fwdata->d.in4_tcp.fd = sock;
+			init_sa4(&sa4, (in_addr *)fwdata->forwarder.addr, fwdata->forwarder.port);
+			sa = (sockaddr *)&sa4;
+			salen = sizeof(sa4);
 		} else if (upstream_proto.is_inet6()) {
-			d2.in6_tcp.fd = sock;
+			fwdata->d.in6_tcp.fd = sock;
+			init_sa6(&sa6, (in6_addr *)fwdata->forwarder.addr, fwdata->forwarder.port);
+			sa = (sockaddr *)&sa6;
+			salen = sizeof(sa6);
 		}
-		if (send_dns_message(&d2, upstream_proto, msg, true, false)) {
-			Task t;
-			t.upstream_fd = sock;
-			t.op = Operation::REPLY_TO_CLIENT_TCP;
-			t.timestamp = misc::get_tick_count();
-			t.local_transaction_id = local_transaction_id;
-			t.requester_id = client_request_id;
-			t.upstream_id = header.id;
-			t.type = question.type;
-			t.client_proto = client_proto;
-			t.upstream_proto = upstream_proto;
-			if (upstream_proto.is_inet4()) {
-				t.client_sa4 = d->in4_udp.sa4;
-			} else if (upstream_proto.is_inet6()) {
-				t.client_sa6 = d->in6_udp.sa6;
+		if (sa) {
+			if (connect(sock, sa, salen) == SOCKET_ERROR) {
+				logprintf(LOG_DEFAULT, "connect: %s\n", strerror(errno));
+			} else {
+				if (send_dns_message(&fwdata->d, upstream_proto, fwdata->msg, true, false)) {
+					fwdata->task.timestamp = misc::get_tick_count();
+					fwdata->task.upstream_proto = upstream_proto;
+
+					fwdata->task.ev = {};
+					fwdata->task.ev.events = EPOLLIN;
+					fwdata->task.ev.data.fd = fwdata->task.upstream_fd;
+					push_task(fwdata->task);
+
+					ctl_add(fwdata->task.upstream_fd, &fwdata->task.ev);
+				}
 			}
-			t.request_name = question.name;
-			t.forward_name = query_name;
+		}
+		fwdata->busy = false;
+	}, fwdata.get());
 
-			t.ev = {};
-			t.ev.events = EPOLLIN;
-			t.ev.data.fd = t.upstream_fd;
-			push_task(t);
+	fwdata->busy = true;
+	fwdata->thread = std::move(thread);
 
-			ctl_add(t.upstream_fd, &t.ev);
-			ok = true;
+	{
+		std::lock_guard lock(m->mutex);
+		m->threads.push_back(fwdata);
+	}
+}
+
+bool Behind::reply_from_cache(InternalData *d, ProtocolFamilyType const &client_proto, dns::Header const &header, dns::Question const &q)
+{
+	dns::Cache *cache = get_cache(q.type);
+	if (cache) {
+		auto entry = cache->find(q.name);
+		if (entry) {
+			dns::Message sending;
+			sending.header.id = header.id;
+			sending.header.flags = 0x8180;
+			sending.questions = {q};
+			sending.answers = entry->answers;
+			sending.authorities = entry->authorities;
+			send_dns_message(d, client_proto, sending, false, true);
+			return true;
 		}
 	}
-
-	return ok;
+	return false;
 }
 
 void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client_proto, dns::Header const &header, dns::Question const &q)
@@ -1510,19 +1576,9 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 			SendNODATA();
 			return;
 		}
-		dns::Cache *cache = get_cache(q.type);
-		if (cache) {
-			auto entry = cache->find(q.name);
-			if (entry) {
-				dns::Message sending;
-				sending.header.id = header.id;
-				sending.header.flags = 0x8180;
-				sending.questions = {q};
-				sending.answers = entry->answers;
-				sending.authorities = entry->authorities;
-				send_dns_message(d, client_proto, sending, false, true);
-				return;
-			}
+
+		if (reply_from_cache(d, client_proto, header, q)) {
+			return;
 		}
 
 		const uint32_t local_transaction_id = next_local_transaction_id();
@@ -1549,11 +1605,13 @@ void Behind::process_query_tcp(InternalData *d, ProtocolFamilyType const &client
 		return;
 	}
 
+	if (reply_from_cache(d, client_proto, header, q)) {
+		return;
+	}
+
 	const uint32_t local_transaction_id = next_local_transaction_id();
 	Forwarder const *f = forwarders.front();
-	if (!forward_tcp(d, client_proto, header.id, header, q, local_transaction_id, *f)) {
-		logprintf(LOG_DEFAULT, "Failed to forward DNS query via TCP.\n");
-	}
+	forward_tcp(d, client_proto, header.id, header, q, local_transaction_id, *f);
 }
 
 void Behind::reply_to_client_udp(InternalData *d, Task *task, dns::Message const &received)
@@ -1655,20 +1713,19 @@ bool Behind::process_receive(InternalData *d, int upstream_fd)
 				n = std::min(n, (int)ntohs(*(uint16_t *)buf));
 				char const *begin = buf + 2;
 				char const *end = begin + n;
-				dns::Message msg;
-				parse_dns_message(begin, end, &msg);
-				msg.header.id = task->requester_id;
-				send_dns_message(d, task->client_proto, msg, false, false);
+				dns::Message sending;
+				parse_dns_message(begin, end, &sending);
+				sending.header.id = task->requester_id;
+				send_dns_message(d, task->client_proto, sending, false, false);
+				// cahce
+				dns::Cache *cache = get_cache(task->type);
+				if (cache) {
+					cache->insert(task->forward_name, sending);
+				}
 			}
 			{
-				int client_fd = -1;
-				if (task->client_proto.is_inet4()) {
-					client_fd = d->in4_tcp.fd;
-				} else if (task->client_proto.is_inet6()) {
-					client_fd = d->in6_tcp.fd;
-				} else {
-					return -1;
-				}
+				auto [client_fd, addr] = sock_and_address(d, task->client_proto);
+				(void)addr;
 				delete_socket(client_fd, nullptr);;
 			}
 			return Done(true);
@@ -1704,7 +1761,7 @@ void Behind::process(InternalData *d, ProtocolFamilyType const &client_proto)
 				dns::Question const &q = *it;
 				if (client_proto.is_dgram()) {
 					process_query_udp(d, client_proto, received.header, q);
-				} else if (client_proto.is_stream()) { // experimental
+				} else if (client_proto.is_stream()) {
 					process_query_tcp(d, client_proto, received.header, q);
 				}
 			}
@@ -1725,7 +1782,7 @@ void Behind::process_tcp(InternalData *d, sa_family_t family)
 		socklen_t len = sizeof(d->in4_tcp.sa4);
 		d->in4_tcp.fd = accept(d->in4_tcp.listener_fd, (sockaddr *)&d->in4_tcp.sa4, &len);
 		process(d, {family, SOCK_STREAM});
-	} else if (family = AF_INET6) {
+	} else if (family == AF_INET6) {
 		socklen_t len = sizeof(d->in6_tcp.sa6);
 		d->in6_tcp.fd = accept(d->in6_tcp.listener_fd, (sockaddr *)&d->in6_tcp.sa6, &len);
 		process(d, {family, SOCK_STREAM});
@@ -1812,12 +1869,15 @@ int ev_fd(struct epoll_event *e)
 int Behind::ctl_add(int fd, struct epoll_event *e)
 {
 	if (fd == -1) return -1;
-
-	m->poll_fds.push_back(fd);
-
 	int ret = 0;
-	if (e && m->epoll_fd != -1) {
-		ret = epoll_ctl(m->epoll_fd, EPOLL_CTL_ADD, e->data.fd, e);
+	{
+		std::lock_guard lock(m->mutex);
+
+		m->poll_fds.push_back(fd);
+
+		if (e && m->epoll_fd != -1) {
+			ret = epoll_ctl(m->epoll_fd, EPOLL_CTL_ADD, e->data.fd, e);
+		}
 	}
 	return ret;
 }
@@ -1825,14 +1885,16 @@ int Behind::ctl_add(int fd, struct epoll_event *e)
 int Behind::ctl_del(int fd, struct epoll_event *e)
 {
 	if (fd == -1) return -1;
-
-	auto it = std::remove(m->poll_fds.begin(), m->poll_fds.end(), fd);
-	m->poll_fds.erase(it, m->poll_fds.end());
-
-
 	int ret = 0;
-	if (e && m->epoll_fd != -1) {
-		ret = epoll_ctl(m->epoll_fd, EPOLL_CTL_DEL, e->data.fd, e);
+	{
+		std::lock_guard lock(m->mutex);
+
+		auto it = std::remove(m->poll_fds.begin(), m->poll_fds.end(), fd);
+		m->poll_fds.erase(it, m->poll_fds.end());
+
+		if (e && m->epoll_fd != -1) {
+			ret = epoll_ctl(m->epoll_fd, EPOLL_CTL_DEL, e->data.fd, e);
+		}
 	}
 	return ret;
 }
@@ -1867,9 +1929,12 @@ void Behind::main()
 			fd_set fds;
 			FD_ZERO(&fds);
 			int maxfd = -1;
-			for (int fd : m->poll_fds) {
-				FD_SET(fd, &fds);
-				maxfd = std::max(maxfd, fd);
+			{
+				std::lock_guard lock(m->mutex);
+				for (int fd : m->poll_fds) {
+					FD_SET(fd, &fds);
+					maxfd = std::max(maxfd, fd);
+				}
 			}
 			select(maxfd + 1, &fds, nullptr, nullptr, nullptr);
 
@@ -1894,7 +1959,12 @@ void Behind::main()
 				FD_CLR(fd, &fds);
 				process_tcp(&d, AF_INET6);
 			}
-			for (int fd : m->poll_fds) {
+			std::vector<int> fdvec;
+			{
+				std::lock_guard lock(m->mutex);
+				fdvec = m->poll_fds;
+			}
+			for (int fd : fdvec) {
 				if (FD_ISSET(fd, &fds)) {
 					FD_CLR(fd, &fds);
 					if (!process_receive(&d, fd)) {
@@ -1961,15 +2031,28 @@ void Behind::main()
 		::close(m->epoll_fd);
 	}
 
-	for (int fd : m->poll_fds) {
-		closesocket(fd);
-	}
-	m->poll_fds.clear();
-
 	closesocket(d.in4_udp.fd);
 	closesocket(d.in6_udp.fd);
 	closesocket(d.in4_udp.listener_fd);
 	closesocket(d.in6_udp.listener_fd);
+
+	std::vector<std::shared_ptr<Behind::ForwardingThreadData>> threads;
+
+	{
+		std::lock_guard lock(m->mutex);
+		for (int fd : m->poll_fds) {
+			closesocket(fd);
+		}
+		m->poll_fds.clear();
+
+		std::swap(threads, m->threads);
+	}
+
+	for (auto &t : threads) {
+		if (t->thread.joinable()) {
+			t->thread.join();
+		}
+	}
 }
 
 // test
@@ -1986,6 +2069,20 @@ std::string to_string(std::vector<uint8_t> const &buf)
 
 void Behind::test()
 {
+	// decode_name test
+
+	{
+		std::string in, out;
+
+		in = "\x03" "www" "\x06" "google" "\x03" "com" "\x00";
+		decode_name(in.data(), in.data() + in.size(), in.data(), &out);
+		EXPECT_EQ(out, "www.google.com");
+
+		in = "\x03" "www" "\x06" "google" "\x03" "com" "\xc0\x00"; // infinite loop
+		decode_name(in.data(), in.data() + 17, in.data(), &out);
+		EXPECT_EQ(out, "");
+	}
+
 	// domain filter test
 
 	{
