@@ -9,15 +9,17 @@ Designed for home networks and small organizations, BEHIND is typically deployed
 ## Features
 
 - **DNS Forwarding**: Forward DNS queries to upstream DNS servers with support for multiple forwarders and automatic random selection
+- **TCP/UDP Dual Protocol Support**: Support both UDP and TCP protocols for DNS queries. Automatically handles TCP fallback for large responses (>512 bytes) by setting the TC (truncation) flag
+- **UDP Port Randomization**: Randomized source port selection for UDP forwarding to enhance security and prevent DNS spoofing attacks
 - **Dual Stack Support**: Full IPv4 and IPv6 support
-- **DNS Cache**: Intelligent response caching with per-record TTL tracking (up to 4096 entries)
+- **DNS Cache**: Intelligent response caching with per-record TTL tracking (up to 4096 entries), supporting both UDP and TCP responses
 - **DNS Compression**: DNS name compression in response packets for reduced bandwidth usage
 - **Security**: DNS 0x20 encoding (case randomization) to mitigate DNS spoofing attacks
 - **Advanced Domain Filtering**: Block domains using exact match, prefix match, suffix match, or regex patterns (useful for ad-blocking)
 - **Static Host Resolution**: Define custom hostname-to-IP mappings in the configuration
 - **Modular Configuration**: Support for nested configuration files using include directives
 - **Logging**: Automatic log file rotation with date-based filenames
-- **High Performance**: epoll-based event handling for improved scalability and minimal resource usage
+- **High Performance**: epoll-based event handling with non-blocking I/O for improved scalability and minimal resource usage
 
 ## Building
 
@@ -170,17 +172,31 @@ sudo systemctl status behind
 
 ## How It Works
 
-BEHIND acts as a DNS proxy/forwarder:
+BEHIND acts as a DNS proxy/forwarder with support for both UDP and TCP protocols:
 
-1. Listens for DNS queries on UDP port 53 using epoll-based event handling for high performance
+1. Listens for DNS queries on both UDP and TCP port 53 using epoll-based event handling for high performance
 2. Checks if there's a static host mapping in the [hosts] section
 3. Checks if the domain should be blocked using the domain filter (supports exact, prefix, suffix, and regex matching)
 4. Checks the local cache for recent responses (with per-record TTL tracking)
-5. If not cached, randomly selects one of the configured upstream DNS servers and forwards the query
-6. Caches the response based on each record's TTL value
+5. If not cached, randomly selects one of the configured upstream DNS servers and forwards the query:
+   - **UDP forwarding**: Uses randomized source ports for enhanced security against DNS spoofing attacks
+   - **TCP forwarding**: Uses non-blocking connections with epoll for efficient connection management
+   - Automatically falls back to TCP when UDP responses exceed 512 bytes (sets TC truncation flag)
+6. Caches the response based on each record's TTL value (supports both UDP and TCP responses)
 7. Returns the response to the client with DNS name compression for efficiency
 
 The case randomization feature (when enabled) randomly changes the case of letters in domain names to help detect and prevent DNS spoofing attacks.
+
+### Protocol Handling
+
+- **UDP Protocol**: The primary protocol for DNS queries. BEHIND uses randomized source ports when forwarding UDP queries to upstream servers, which adds an extra layer of security by making it harder for attackers to predict and spoof DNS responses.
+
+- **TCP Protocol**: Automatically used for:
+  - Large DNS responses that exceed the UDP packet size limit (512 bytes)
+  - Direct TCP queries from clients
+  - TCP forwarding uses non-blocking connections managed by epoll, ensuring efficient handling of multiple simultaneous TCP connections without thread overhead
+
+- **Truncation Handling**: When a DNS response over UDP would exceed 512 bytes, BEHIND sets the TC (truncation) flag in the response, signaling the client to retry the query over TCP.
 
 ### Logging
 
