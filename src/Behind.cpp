@@ -360,9 +360,8 @@ struct Behind::Private {
 	Behind::SocketMode socket_mode;
 	fd_set readfds;
 	int epoll_fd = -1;
-	std::mutex mutex;
-	std::vector<std::shared_ptr<Behind::ForwardingThreadData>> threads;
-	std::vector<int> poll_fds;
+	std::vector<int> select_in_fds;
+	std::vector<int> select_out_fds;
 	std::vector<epoll_event> epoll_events{10};
 
 	int ttl = 5 * 60;
@@ -800,19 +799,19 @@ void Behind::init_forwarder()
 	}
 }
 
-int Behind::ctl_add(int fd, struct epoll_event *e)
+int Behind::ctl_add(int fd, struct epoll_event *e, bool in, bool out)
 {
 	if (fd == -1) return -1;
 	int ret = 0;
-	{
-		std::lock_guard lock(m->mutex);
+	if (in) {
+		m->select_in_fds.push_back(fd);
+	}
+	if (out) {
+		m->select_out_fds.push_back(fd);
+	}
 
-		m->poll_fds.push_back(fd);
-
-		if (e && m->epoll_fd != -1) {
-			ret = epoll_ctl(m->epoll_fd, EPOLL_CTL_ADD, e->data.fd, e);
-		}
-		logprintf(LOG_STDERR, "--- add: %d\n", fd);
+	if (e && m->epoll_fd != -1) {
+		ret = epoll_ctl(m->epoll_fd, EPOLL_CTL_ADD, e->data.fd, e);
 	}
 	return ret;
 }
@@ -822,15 +821,16 @@ int Behind::ctl_del(int fd, struct epoll_event *e)
 	if (fd == -1) return -1;
 	int ret = 0;
 	{
-		std::lock_guard lock(m->mutex);
+		auto it = std::remove(m->select_in_fds.begin(), m->select_in_fds.end(), fd);
+		m->select_in_fds.erase(it, m->select_in_fds.end());
+	}
+	{
+		auto it = std::remove(m->select_out_fds.begin(), m->select_out_fds.end(), fd);
+		m->select_out_fds.erase(it, m->select_out_fds.end());
+	}
 
-		auto it = std::remove(m->poll_fds.begin(), m->poll_fds.end(), fd);
-		m->poll_fds.erase(it, m->poll_fds.end());
-
-		if (e && m->epoll_fd != -1) {
-			ret = epoll_ctl(m->epoll_fd, EPOLL_CTL_DEL, e->data.fd, e);
-		}
-		logprintf(LOG_STDERR, "--- del: %d\n", fd);
+	if (e && m->epoll_fd != -1) {
+		ret = epoll_ctl(m->epoll_fd, EPOLL_CTL_DEL, e->data.fd, e);
 	}
 	return ret;
 }
@@ -843,43 +843,20 @@ void Behind::delete_socket(int fd, struct epoll_event *e)
 
 void Behind::clean()
 {
-	return;
-	std::lock_guard lock(m->mutex);
-
-	{
-		uint64_t now = misc::get_tick_count();
-		size_t i = m->tasks.size();
-		while (i > 0) {
-			i--;
-			if (now - m->tasks[i].timestamp >= 1000) { // 1 second
-				Task *task = &m->tasks[i];
-				m->mutex.unlock();
-				logprintf(LOG_STDERR, "--- delete: %d\n", task->upstream_fd);
-				delete_socket(task->upstream_fd, task->ev.get());
-				m->mutex.lock();
-				m->tasks.erase(m->tasks.begin() + i);
-			}
+	uint64_t now = misc::get_tick_count();
+	size_t i = m->tasks.size();
+	while (i > 0) {
+		i--;
+		if (now - m->tasks[i].timestamp >= 1000) { // 1 second
+			Task *task = &m->tasks[i];
+			delete_socket(task->upstream_fd, task->ev.get());
+			m->tasks.erase(m->tasks.begin() + i);
 		}
 	}
-
-	// if (0) {
-	// 	size_t i = m->threads.size();
-	// 	while (i > 0) {
-	// 		i--;
-	// 		auto &sp = m->threads[i];
-	// 		if (!sp->busy) {
-	// 			if (sp->thread.joinable()) {
-	// 				sp->thread.join();
-	// 			}
-	// 			m->threads.erase(m->threads.begin() + i);
-	// 		}
-	// 	}
-	// }
 }
 
 void Behind::clean_transaction(uint32_t id)
 {
-	std::lock_guard lock(m->mutex);
 	size_t i = m->tasks.size();
 	while (i > 0) {
 		i--;
@@ -891,42 +868,33 @@ void Behind::clean_transaction(uint32_t id)
 
 std::optional<Behind::Task> Behind::take_task_by_id(uint16_t upstream_id)
 {
-	m->mutex.lock();
 	for (Task const &q : m->tasks) {
 		if (upstream_id == q.upstream_id) {
 			std::optional<Task> ret = q;
-			m->mutex.unlock();
 			clean_transaction(q.local_transaction_id);
 			return ret;
 		}
 	}
-	m->mutex.unlock();
 	return std::nullopt;
 }
 
 std::optional<Behind::Task> Behind::take_task_by_fd(int fd)
 {
-	m->mutex.lock();
 	for (Task const &q : m->tasks) {
 		if (q.upstream_fd == fd) {
 			assert(q.upstream_fd == q.ev->data.fd);
 			std::optional<Task> ret = q;
-			m->mutex.unlock();
 			clean_transaction(q.local_transaction_id);
 			return ret;
 		}
 	}
-	m->mutex.unlock();
 	return std::nullopt;
 }
 
 void Behind::push_task(const Task &task)
 {
 	take_task_by_id(task.upstream_id);
-	{
-		std::lock_guard lock(m->mutex);
-		m->tasks.push_back(task);
-	}
+	m->tasks.push_back(task);
 }
 
 void Behind::parse_dns_message(const char *begin, const char *end, dns::Message *msg)
@@ -1398,11 +1366,7 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 
 	int sock = -1;
 	{
-		int pf = PF_INET;
-		if (forwarder.is_inet6()) {
-			pf = PF_INET6;
-		}
-		sock = socket(pf, SOCK_DGRAM, 0);
+		sock = socket(forwarder.af_type, SOCK_DGRAM, 0);
 		if (sock == INVALID_SOCKET) {
 			throw STRERROR("socket: ");
 		}
@@ -1412,7 +1376,7 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 		{
 			int yes = 1;
 			setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
-			if (pf == PF_INET6) {
+			if (forwarder.af_type == AF_INET6) {
 				setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&yes, sizeof(yes));
 			}
 		}
@@ -1448,7 +1412,7 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 
 		t.ev->events = EPOLLIN;
 		t.ev->data.fd = t.upstream_fd;
-		ctl_add(t.upstream_fd, t.ev.get());
+		ctl_add(t.upstream_fd, t.ev.get(), true, false);
 		push_task(t);
 	}
 }
@@ -1487,72 +1451,42 @@ void Behind::forward_tcp(InternalData *d, ProtocolFamilyType const &client_proto
 		return;
 	}
 	fcntl(sock, F_SETFL, O_NONBLOCK);
-	// int val = 1;
-	// ioctl(sock, FIONBIO, &val);
 
-	// std::thread thread([this](ForwardingThreadData *fwdata){
-		ProtocolFamilyType upstream_proto = {task.fwdata->forwarder.af_type, SOCK_STREAM};
-		struct sockaddr_in sa4;
-		struct sockaddr_in6 sa6;
-		sockaddr *sa = nullptr;
-		socklen_t salen = 0;
-		if (upstream_proto.is_inet4()) {
-			task.fwdata->d.in4_tcp.fd = sock;
-			init_sa4(&sa4, (in_addr *)task.fwdata->forwarder.addr, task.fwdata->forwarder.port);
-			sa = (sockaddr *)&sa4;
-			salen = sizeof(sa4);
-		} else if (upstream_proto.is_inet6()) {
-			task.fwdata->d.in6_tcp.fd = sock;
-			init_sa6(&sa6, (in6_addr *)task.fwdata->forwarder.addr, task.fwdata->forwarder.port);
-			sa = (sockaddr *)&sa6;
-			salen = sizeof(sa6);
-		}
-		if (sa) {
-			auto e = connect(sock, sa, salen);
-			if (e < 0) {
-				if (errno == EINPROGRESS) {
-					task.connect_in_progress = true;
+	ProtocolFamilyType upstream_proto = {task.fwdata->forwarder.af_type, SOCK_STREAM};
+	struct sockaddr_in sa4;
+	struct sockaddr_in6 sa6;
+	sockaddr *sa = nullptr;
+	socklen_t salen = 0;
+	if (upstream_proto.is_inet4()) {
+		task.fwdata->d.in4_tcp.fd = sock;
+		init_sa4(&sa4, (in_addr *)task.fwdata->forwarder.addr, task.fwdata->forwarder.port);
+		sa = (sockaddr *)&sa4;
+		salen = sizeof(sa4);
+	} else if (upstream_proto.is_inet6()) {
+		task.fwdata->d.in6_tcp.fd = sock;
+		init_sa6(&sa6, (in6_addr *)task.fwdata->forwarder.addr, task.fwdata->forwarder.port);
+		sa = (sockaddr *)&sa6;
+		salen = sizeof(sa6);
+	}
+	if (sa) {
+		auto e = connect(sock, sa, salen);
+		if (e < 0) {
+			if (errno == EINPROGRESS) {
+				task.connect_in_progress = true;
 
-					task.timestamp = misc::get_tick_count();
-					task.upstream_proto = upstream_proto;
-					task.upstream_fd = sock;
+				task.timestamp = misc::get_tick_count();
+				task.upstream_proto = upstream_proto;
+				task.upstream_fd = sock;
 
-					task.ev->data.fd = sock;
-					task.ev->events = EPOLLOUT | EPOLLERR | EPOLLHUP;
-					ctl_add(sock, task.ev.get());
-					push_task(task);
-				} else {
-					logprintf(LOG_DEFAULT, "connect: %s\n", strerror(errno));
-				}
+				task.ev->data.fd = sock;
+				task.ev->events = EPOLLOUT | EPOLLERR | EPOLLHUP;
+				ctl_add(sock, task.ev.get(), false, true);
+				push_task(task);
 			} else {
-#if 0
-				if (send_dns_message(&fwdata->d, upstream_proto, fwdata->msg, true, false)) {
-					task.timestamp = misc::get_tick_count();
-					task.upstream_proto = upstream_proto;
-
-					task.ev = {};
-					task.ev.events = EPOLLIN;
-					task.ev.data.fd = task.upstream_fd;
-					push_task(task);
-
-					ctl_add(task.upstream_fd, &task.ev);
-				}
-#else
-#endif
+				logprintf(LOG_DEFAULT, "connect: %s\n", strerror(errno));
 			}
 		}
-		// task.fwdata->busy = false;
-	// }, fwdata.get());
-
-	// thread.join();
-
-	// fwdata->busy = true;
-	// fwdata->thread = std::move(thread);
-
-	// {
-	// 	std::lock_guard lock(m->mutex);
-	// 	m->threads.push_back(fwdata);
-	// }
+	}
 }
 
 bool Behind::reply_from_cache(InternalData *d, ProtocolFamilyType const &client_proto, dns::Header const &header, dns::Question const &q)
@@ -1769,23 +1703,23 @@ bool Behind::process_receive(InternalData *d, int upstream_fd)
 		if (task->op == Operation::FORWARD_TO_UPSTREAM_TCP) {
 			if (task->connect_in_progress) {
 				int upstream_fd = task->upstream_fd;
-				int so_error;
-				socklen_t len = sizeof(so_error);
-				getsockopt(upstream_fd, SOL_SOCKET, SO_ERROR, &so_error, &len);
-				if (so_error != 0) {
-					return false;
-				}
-				logprintf(LOG_DEFAULT, "---\n");
-				if (send_dns_message(&task->fwdata->d, task->upstream_proto, task->fwdata->msg, true, false)) {
-					ctl_del(upstream_fd, task->ev.get());
-					task->op = Operation::REPLY_TO_CLIENT_TCP;
-					task->timestamp = misc::get_tick_count();
-					task->ev->events = EPOLLIN;
-					ctl_add(upstream_fd, task->ev.get());
-					push_task(*task);
-					return true;
+				int err;
+				socklen_t len = sizeof(err);
+				getsockopt(upstream_fd, SOL_SOCKET, SO_ERROR, &err, &len);
+				if (err == 0) {
+					if (send_dns_message(&task->fwdata->d, task->upstream_proto, task->fwdata->msg, true, false)) {
+						ctl_del(upstream_fd, task->ev.get());
+						task->connect_in_progress = false;
+						task->op = Operation::REPLY_TO_CLIENT_TCP;
+						task->timestamp = misc::get_tick_count();
+						task->ev->events = EPOLLIN;
+						ctl_add(upstream_fd, task->ev.get(), true, false);
+						push_task(*task);
+						return true;
+					}
 				}
 			}
+			return Done(false);
 		}
 		if (task->op == Operation::REPLY_TO_CLIENT_TCP) {
 			char buf[4096];
@@ -1890,7 +1824,7 @@ void Behind::init_socket(void *private_in, ProtocolFamilyType proto)
 {
 	Behind::InternalData::In *in = static_cast<Behind::InternalData::In *>(private_in);
 
-	int sock = socket(proto.pfamily(), proto.socktype(), 0);
+	int sock = socket(proto.family(), proto.socktype(), 0);
 	if (sock == INVALID_SOCKET) {
 		throw STRERROR("socket: ");
 	}
@@ -1963,55 +1897,65 @@ void Behind::main()
 	if (m->socket_mode == SocketMode::SELECT) {
 		logprintf(LOG_DEFAULT, "mode: SELECT\n");
 
-		ctl_add(d.in4_udp.fd, nullptr);
-		ctl_add(d.in6_udp.fd, nullptr);
-		ctl_add(d.in4_tcp.listener_fd, nullptr);
-		ctl_add(d.in6_tcp.listener_fd, nullptr);
+		ctl_add(d.in4_udp.fd, nullptr, true, false);
+		ctl_add(d.in6_udp.fd, nullptr, true, false);
+		ctl_add(d.in4_tcp.listener_fd, nullptr, true, false);
+		ctl_add(d.in6_tcp.listener_fd, nullptr, true, false);
 
 		while (1) {
-			fd_set fds;
-			FD_ZERO(&fds);
+			fd_set infds;
+			fd_set outfds;
+			FD_ZERO(&infds);
+			FD_ZERO(&outfds);
 			int maxfd = -1;
+			std::vector<int> infdvec;
+			std::vector<int> outfdvec;
 			{
-				std::lock_guard lock(m->mutex);
-				for (int fd : m->poll_fds) {
-					FD_SET(fd, &fds);
-					fprintf(stderr, " %d", fd);
+				infdvec = m->select_in_fds;
+				for (int fd : infdvec) {
+					FD_SET(fd, &infds);
 					maxfd = std::max(maxfd, fd);
 				}
-				fprintf(stderr, "\n");
+				outfdvec = m->select_out_fds;
+				for (int fd : outfdvec) {
+					FD_SET(fd, &outfds);
+					maxfd = std::max(maxfd, fd);
+				}
 			}
-			select(maxfd + 1, &fds, nullptr, nullptr, nullptr);
+			select(maxfd + 1, &infds, &outfds, nullptr, nullptr);
 
 			int fd;
 			fd = d.in4_udp.fd;
-			if (FD_ISSET(fd, &fds)) {
-				FD_CLR(fd, &fds);
+			if (FD_ISSET(fd, &infds)) {
+				FD_CLR(fd, &infds);
 				process_udp(&d, AF_INET, fd);
 			}
 			fd = d.in6_udp.fd;
-			if (FD_ISSET(fd, &fds)) {
-				FD_CLR(fd, &fds);
+			if (FD_ISSET(fd, &infds)) {
+				FD_CLR(fd, &infds);
 				process_udp(&d, AF_INET6, fd);
 			}
 			fd = d.in4_tcp.listener_fd;
-			if (FD_ISSET(fd, &fds)) {
-				FD_CLR(fd, &fds);
+			if (FD_ISSET(fd, &infds)) {
+				FD_CLR(fd, &infds);
 				process_tcp(&d, AF_INET);
 			}
 			fd = d.in6_tcp.listener_fd;
-			if (FD_ISSET(fd, &fds)) {
-				FD_CLR(fd, &fds);
+			if (FD_ISSET(fd, &infds)) {
+				FD_CLR(fd, &infds);
 				process_tcp(&d, AF_INET6);
 			}
-			std::vector<int> fdvec;
-			{
-				std::lock_guard lock(m->mutex);
-				fdvec = m->poll_fds;
+			for (int fd : infdvec) {
+				if (FD_ISSET(fd, &infds)) {
+					FD_CLR(fd, &infds);
+					if (!process_receive(&d, fd)) {
+						delete_socket(fd, nullptr);
+					}
+				}
 			}
-			for (int fd : fdvec) {
-				if (FD_ISSET(fd, &fds)) {
-					FD_CLR(fd, &fds);
+			for (int fd : outfdvec) {
+				if (FD_ISSET(fd, &outfds)) {
+					FD_CLR(fd, &outfds);
 					if (!process_receive(&d, fd)) {
 						delete_socket(fd, nullptr);
 					}
@@ -2038,7 +1982,7 @@ void Behind::main()
 				fd = in->listener_fd;
 			}
 			in->ev.data.fd = fd;
-			if (ctl_add(fd, &in->ev) == -1) {
+			if (ctl_add(fd, &in->ev, true, false) == -1) {
 				logprintf(LOG_DEFAULT, "epoll_ctl: %s\n", strerror(errno));
 			}
 		};
@@ -2057,7 +2001,6 @@ void Behind::main()
 			}
 			for (int i = 0; i < n; i++) {
 				auto fd = m->epoll_events[i].data.fd;
-				logprintf(LOG_STDERR, "--- fd: %d\n", fd);
 				if (fd == d.in4_udp.fd) {
 					process_udp(&d, AF_INET, fd);
 				} else if (fd == d.in6_udp.fd) {
@@ -2082,23 +2025,10 @@ void Behind::main()
 	closesocket(d.in4_udp.listener_fd);
 	closesocket(d.in6_udp.listener_fd);
 
-	std::vector<std::shared_ptr<Behind::ForwardingThreadData>> threads;
-
-	{
-		std::lock_guard lock(m->mutex);
-		for (int fd : m->poll_fds) {
-			closesocket(fd);
-		}
-		m->poll_fds.clear();
-
-		std::swap(threads, m->threads);
+	for (int fd : m->select_in_fds) {
+		closesocket(fd);
 	}
-
-	// for (auto &t : threads) {
-	// 	if (t->thread.joinable()) {
-	// 		t->thread.join();
-	// 	}
-	// }
+	m->select_in_fds.clear();
 }
 
 // test

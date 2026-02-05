@@ -31,14 +31,6 @@ public:
 	{
 		return sock_type_;
 	}
-	int pfamily() const
-	{
-		switch (family()) {
-		case AF_INET:  return PF_INET;
-		case AF_INET6: return PF_INET6;
-		}
-		return PF_UNSPEC;
-	}
 	bool is_inet4() const
 	{
 		return af_family_ == AF_INET;
@@ -213,12 +205,12 @@ private:
 	const InetResolver::Addr *find_host(std::string const &name) const;
 	void add_hosts(const std::map<std::string, std::string> &hosts);
 	uint32_t next_local_transaction_id();
-	int ctl_add(int fd, epoll_event *e);
+        int ctl_add(int fd, epoll_event *e, bool in, bool out);
 	int ctl_del(int fd, epoll_event *e);
 	void delete_socket(int fd, struct epoll_event *e);
 	bool accept_dns_type(DNS_TYPE t);
 
-        void forward_tcp(InternalData *d, const ProtocolFamilyType &client_proto, uint16_t client_request_id, dns::Header const &header, const dns::Question &question, uint32_t local_transaction_id, const Forwarder &forwarder);
+	void forward_tcp(InternalData *d, const ProtocolFamilyType &client_proto, uint16_t client_request_id, dns::Header const &header, const dns::Question &question, uint32_t local_transaction_id, const Forwarder &forwarder);
 	void forward_udp(const InternalData &d, const ProtocolFamilyType &proto, const dns::Header &header, const dns::Question &q, uint32_t local_transaction_id, const Forwarder &forwarder);
 
 	std::vector<char> read(InternalData *d, const ProtocolFamilyType &proto);
