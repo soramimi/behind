@@ -82,7 +82,7 @@ void Logger::write(LogItem const &item)
 			msg += item.file;
 			msg += buf;
 		}
-		int len = asprintf(&text, "[%d-%02d-%02d.%02d:%02d:%02d.%03d] %s\n"
+		int len = asprintf(&text, "[%d-%02d-%02d,%02d:%02d:%02d.%03d] %s\n"
 				, tm->tm_year + 1900
 				, tm->tm_mon + 1
 				, tm->tm_mday
