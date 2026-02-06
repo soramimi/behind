@@ -362,7 +362,7 @@ struct Behind::Private {
 	int epoll_fd = -1;
 	std::vector<int> select_in_fds;
 	std::vector<int> select_out_fds;
-	std::vector<epoll_event> epoll_events{10};
+	std::vector<epoll_event> epoll_events{100};
 
 	int ttl = 5 * 60;
 	struct {
@@ -1376,7 +1376,7 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 		{
 			int yes = 1;
 			setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
-			if (forwarder.af_type == AF_INET6) {
+			if (forwarder.is_inet6()) {
 				setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&yes, sizeof(yes));
 			}
 		}
@@ -1834,7 +1834,7 @@ void Behind::init_socket(void *private_in, ProtocolFamilyType proto)
 	{
 		int yes = 1;
 		setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
-		if (proto.family() == AF_INET6) {
+		if (proto.is_inet6()) {
 			setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&yes, sizeof(yes));
 		}
 	}
