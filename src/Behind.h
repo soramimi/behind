@@ -10,6 +10,7 @@
 #include <sys/socket.h>
 #include <unordered_map>
 #include <optional>
+#include <unordered_set>
 
 #define STANDARD_DNS_PORT 53
 #define DEFAUT_LISTEN_PORT 5300

@@ -487,16 +487,26 @@ bool Behind::write_name(std::vector<char> *out, NameMap *namemap, const std::str
 
 int Behind::decode_name(const char *begin, const char *end, const char *ptr, std::vector<char> *out)
 {
-	if (begin && ptr && begin <= ptr && ptr < end) {
+	if (begin && end && ptr && begin <= ptr && ptr < end) {
+		char const *lower = ptr;
+		char const *upper = end;
 		char const *start = ptr;
-		while (ptr < end) {
+		char const *firstjump = nullptr;
+		while (ptr < upper) {
 			uint8_t n(*ptr);
 			if ((n & 0xc0) == 0xc0) {
-				if (ptr + 1 < end) {
-					int o = ((n & 0x3f) << 8) | (ptr[1] & 0xff);
-					if (decode_name(begin, end, begin + o, out) < 0) return -1;
-					ptr += 2;
-					break;
+				if (ptr + 1 < upper) {
+					int offset = ((n & 0x3f) << 8) | (ptr[1] & 0xff);
+					char const *next = begin + offset;
+					if (next < lower) {
+						if (!firstjump) {
+							firstjump = ptr + 2;
+						}
+						upper = lower;
+						lower = next;
+						ptr = next;
+						continue;
+					}
 				}
 				return -1;
 			}
@@ -504,7 +514,9 @@ int Behind::decode_name(const char *begin, const char *end, const char *ptr, std
 				return -1;
 			}
 			ptr++;
-			if (n == 0) break;
+			if (n == 0) {
+				break;
+			}
 			if (!out->empty()) {
 				out->push_back('.');
 			}
@@ -514,19 +526,19 @@ int Behind::decode_name(const char *begin, const char *end, const char *ptr, std
 			}
 			ptr += n;
 		}
-		return ptr - start;
+		return (firstjump ? firstjump : ptr) - start;
 	}
 	return -1;
 }
 
 int Behind::decode_name(const char *begin, const char *end, const char *ptr, std::string *name)
 {
-	std::vector<char> tmp;
-	tmp.reserve(320);
-	int n = decode_name(begin, end, ptr, &tmp);
-	if (n > 0 && !tmp.empty()) {
-		char const *p = &tmp[0];
-		name->assign(p, tmp.size());
+	std::vector<char> decoded;
+	decoded.reserve(320);
+	int n = decode_name(begin, end, ptr, &decoded);
+	if (n > 0 && !decoded.empty()) {
+		char const *p = &decoded[0];
+		name->assign(p, decoded.size());
 		return n;
 	}
 	name->clear();
@@ -2053,6 +2065,10 @@ void Behind::test()
 		in = "\x03" "www" "\x06" "google" "\x03" "com" "\x00";
 		decode_name(in.data(), in.data() + in.size(), in.data(), &out);
 		EXPECT_EQ(out, "www.google.com");
+
+		in = "\xc0\x00"; // infinite loop
+		decode_name(in.data(), in.data() + 2, in.data(), &out);
+		EXPECT_EQ(out, "");
 
 		in = "\x03" "www" "\x06" "google" "\x03" "com" "\xc0\x00"; // infinite loop
 		decode_name(in.data(), in.data() + 17, in.data(), &out);
