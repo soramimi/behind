@@ -81,6 +81,7 @@ enum class DNS_TYPE : uint16_t {
 	PTR = 12,
 	MX = 15,
 	AAAA = 28,
+	HTTPS = 65,
 };
 char const *dns_type_to_string(DNS_TYPE type);
 
@@ -198,7 +199,7 @@ private:
 	bool send_dns_message(InternalData *d, const ProtocolFamilyType &proto, dns::Message const &msg, bool forward, bool from_cache);
 
 	void process(InternalData *d, const ProtocolFamilyType &proto);
-	void process_udp(InternalData *d, sa_family_t family, int fd);
+        void process_udp(InternalData *d, sa_family_t family);
 	void process_tcp(InternalData *d, sa_family_t family);
 
 	void init_socket(void *private_in, ProtocolFamilyType proto);
@@ -216,8 +217,8 @@ private:
 
 	std::vector<char> read(InternalData *d, const ProtocolFamilyType &proto);
 	dns::Cache *get_cache(DNS_TYPE type);
-	void process_query_udp(InternalData *d, const ProtocolFamilyType &proto, const dns::Header &header, const dns::Question &question);
-	void process_query_tcp(InternalData *d, const ProtocolFamilyType &client_proto, const dns::Header &header, const dns::Question &q);
+	void process_query_udp(InternalData *d, const ProtocolFamilyType &proto, const dns::Message &received, const dns::Question &question);
+	void process_query_tcp(InternalData *d, const ProtocolFamilyType &client_proto, const dns::Message &received, const dns::Question &q);
 	void process_response(InternalData *d, const ProtocolFamilyType &upstream_proto, const dns::Message &received);
 	uint16_t next_txid();
 	bool process_receive(InternalData *d, int upstream_fd);

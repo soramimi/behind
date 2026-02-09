@@ -1358,6 +1358,7 @@ bool Behind::accept_dns_type(DNS_TYPE t)
 	case DNS_TYPE::CNAME:
 	case DNS_TYPE::SOA:
 	case DNS_TYPE::MX:
+	case DNS_TYPE::HTTPS:
 		return true;
 	}
 	return false;
@@ -1520,11 +1521,11 @@ bool Behind::reply_from_cache(InternalData *d, ProtocolFamilyType const &client_
 	return false;
 }
 
-void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client_proto, dns::Header const &header, dns::Question const &q)
+void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client_proto, dns::Message const &received, dns::Question const &q)
 {
 	auto SendNXDOMAIN = [&](){
 		dns::Message sending;
-		sending.header.id = header.id;
+		sending.header.id = received.header.id;
 		sending.header.flags = 0x8003;
 		sending.questions = {q};
 		send_dns_message(d, client_proto, sending, false, false);
@@ -1532,7 +1533,7 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 
 	auto SendNODATA = [&](){
 		dns::Message sending;
-		sending.header.id = header.id;
+		sending.header.id = received.header.id;
 		sending.header.flags = 0x8000;
 		sending.questions = {q};
 		sending.authorities = {dns::Record()};
@@ -1565,7 +1566,7 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 					rec.push_back(r);
 				}
 				dns::Message sending;
-				sending.header.id = header.id;
+				sending.header.id = received.header.id;
 				sending.header.flags = 0x8180;
 				sending.questions = {q};
 				sending.answers = rec;
@@ -1584,7 +1585,7 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 			return;
 		}
 
-		if (reply_from_cache(d, client_proto, header, q)) {
+		if (reply_from_cache(d, client_proto, received.header, q)) {
 			return;
 		}
 
@@ -1598,13 +1599,13 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 			return;
 		}
 		for (Forwarder const *f : forwarders) {
-			forward_udp(*d, client_proto, header, q, local_transaction_id, *f);
+			forward_udp(*d, client_proto, received.header, q, local_transaction_id, *f);
 		}
 		return;
 	}
 }
 
-void Behind::process_query_tcp(InternalData *d, ProtocolFamilyType const &client_proto, dns::Header const &header, dns::Question const &q)
+void Behind::process_query_tcp(InternalData *d, ProtocolFamilyType const &client_proto, dns::Message const &received, dns::Question const &q)
 {
 	std::vector<Forwarder const *> forwarders = choose_forwarder(1);
 	if (forwarders.empty()) {
@@ -1612,13 +1613,13 @@ void Behind::process_query_tcp(InternalData *d, ProtocolFamilyType const &client
 		return;
 	}
 
-	if (reply_from_cache(d, client_proto, header, q)) {
+	if (reply_from_cache(d, client_proto, received.header, q)) {
 		return;
 	}
 
 	const uint32_t local_transaction_id = next_local_transaction_id();
 	Forwarder const *f = forwarders.front();
-	forward_tcp(d, client_proto, header.id, header, q, local_transaction_id, *f);
+	forward_tcp(d, client_proto, received.header.id, received.header, q, local_transaction_id, *f);
 }
 
 void Behind::reply_to_client_udp(InternalData *d, Task *task, dns::Message const &received)
@@ -1641,19 +1642,23 @@ void Behind::reply_to_client_udp(InternalData *d, Task *task, dns::Message const
 			sending.questions.push_back(q2);
 		}
 		// answers
-		for (dns::Record const &a1 : received.answers) {
-			dns::Record a2 = a1;
-			if (a2.clas == DNS_CLASS_IN) {
-				if (accept_dns_type(a2.type)) {
-					a2.name = AmendName(a2.name);
+		if (received.answers.empty()) {
+			sending.authorities = received.authorities;
+		} else {
+			for (dns::Record const &a1 : received.answers) {
+				dns::Record a2 = a1;
+				if (a2.clas == DNS_CLASS_IN) {
+					if (accept_dns_type(a2.type)) {
+						a2.name = AmendName(a2.name);
+					}
+					if (a2.type == DNS_TYPE::CNAME && a2.cname()) {
+						a2.cname()->cname = AmendName(a2.cname()->cname);
+					} else if (a2.type == DNS_TYPE::SOA && a2.soa()) {
+						a2.soa()->nname = AmendName(a2.soa()->nname);
+						a2.soa()->rname = AmendName(a2.soa()->rname);
+					}
+					sending.answers.push_back(a2);
 				}
-				if (a2.type == DNS_TYPE::CNAME && a2.cname()) {
-					a2.cname()->cname = AmendName(a2.cname()->cname);
-				} else if (a2.type == DNS_TYPE::SOA && a2.soa()) {
-					a2.soa()->nname = AmendName(a2.soa()->nname);
-					a2.soa()->rname = AmendName(a2.soa()->rname);
-				}
-				sending.answers.push_back(a2);
 			}
 		}
 		// send
@@ -1788,9 +1793,9 @@ void Behind::process(InternalData *d, ProtocolFamilyType const &client_proto)
 			for (auto it = received.questions.begin(); it != received.questions.end(); it++) {
 				dns::Question const &q = *it;
 				if (client_proto.is_dgram()) {
-					process_query_udp(d, client_proto, received.header, q);
+					process_query_udp(d, client_proto, received, q);
 				} else if (client_proto.is_stream()) {
-					process_query_tcp(d, client_proto, received.header, q);
+					process_query_tcp(d, client_proto, received, q);
 				}
 			}
 		} else if (received.header.flags & 0x8000) { // response
@@ -1799,7 +1804,7 @@ void Behind::process(InternalData *d, ProtocolFamilyType const &client_proto)
 	}
 }
 
-void Behind::process_udp(InternalData *d, sa_family_t family, int fd)
+void Behind::process_udp(InternalData *d, sa_family_t family)
 {
 	process(d, {family, SOCK_DGRAM});
 }
@@ -1940,12 +1945,12 @@ void Behind::main()
 			fd = d.in4_udp.fd;
 			if (FD_ISSET(fd, &infds)) {
 				FD_CLR(fd, &infds);
-				process_udp(&d, AF_INET, fd);
+				process_udp(&d, AF_INET);
 			}
 			fd = d.in6_udp.fd;
 			if (FD_ISSET(fd, &infds)) {
 				FD_CLR(fd, &infds);
-				process_udp(&d, AF_INET6, fd);
+				process_udp(&d, AF_INET6);
 			}
 			fd = d.in4_tcp.listener_fd;
 			if (FD_ISSET(fd, &infds)) {
@@ -2014,9 +2019,9 @@ void Behind::main()
 			for (int i = 0; i < n; i++) {
 				auto fd = m->epoll_events[i].data.fd;
 				if (fd == d.in4_udp.fd) {
-					process_udp(&d, AF_INET, fd);
+					process_udp(&d, AF_INET);
 				} else if (fd == d.in6_udp.fd) {
-					process_udp(&d, AF_INET6, fd);
+					process_udp(&d, AF_INET6);
 				} else if (fd == d.in4_tcp.listener_fd) {
 					process_tcp(&d, AF_INET);
 				} else if (fd == d.in6_tcp.listener_fd) {
