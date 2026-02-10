@@ -102,6 +102,12 @@ struct SOA {
 	uint32_t minimum;
 };
 
+struct HTTPS {
+	uint16_t priority;
+	std::string name;
+	std::vector<char> data;
+};
+
 struct Record {
 	std::string name;
 	DNS_TYPE type = DNS_TYPE::A;
@@ -181,6 +187,24 @@ struct Record {
 	MX const *mx() const
 	{
 		return const_cast<Record *>(this)->mx();
+	}
+
+	// https
+
+	void set_https(std::shared_ptr<HTTPS> https)
+	{
+		sp = https;
+	}
+	HTTPS *https()
+	{
+		if (type == DNS_TYPE::HTTPS && sp) {
+			return std::static_pointer_cast<HTTPS>(sp).get();
+		}
+		return nullptr;
+	}
+	HTTPS const *https() const
+	{
+		return const_cast<Record *>(this)->https();
 	}
 
 	//
@@ -369,6 +393,7 @@ struct Behind::Private {
 		dns::Cache a;
 		dns::Cache aaaa;
 		dns::Cache soa;
+		dns::Cache https;
 	} dns_cache;
 	std::vector<Behind::Task> tasks;
 	std::vector<Forwarder> forwarders;
@@ -575,32 +600,23 @@ bool Behind::write_dns_answer_rr(std::vector<char> *out, NameMap *namemap, std::
 	write_us(out, clas);
 	write_ul(out, ttl);
 
+	size_t i = out->size();
+	write_us(out, 0);
 	if (item.type == DNS_TYPE::CNAME) {
 		dns::CNAME const *cname = item.cname();
 		if (!cname) return false;
-		size_t i = out->size();
-		write_us(out, 0);
 		write_name(out, namemap, cname->cname);
-		write_us(&out->at(i), out->size() - i - 2);
 	} else if (item.type == DNS_TYPE::NS) {
 		dns::NS const *ns = item.ns();
 		if (!ns) return false;
-		size_t i = out->size();
-		write_us(out, 0);
 		write_name(out, namemap, ns->nsname);
-		write_us(&out->at(i), out->size() - i - 2);
 	} else if (item.type == DNS_TYPE::MX) {
 		dns::MX const *mx = item.mx();
 		if (!mx) return false;
-		size_t i = out->size();
-		write_us(out, 0);
 		write_us(out, mx->preference);
 		write_name(out, namemap, mx->exchange);
-		write_us(&out->at(i), out->size() - i - 2);
 	} else if (item.type == DNS_TYPE::SOA) {
 		auto WriteSOA = [&](dns::SOA const &soa){
-			size_t i = out->size();
-			write_us(out, 0);
 			write_name(out, namemap, soa.nname);
 			write_name(out, namemap, soa.rname);
 			write_ul(out, soa.serial);
@@ -608,10 +624,17 @@ bool Behind::write_dns_answer_rr(std::vector<char> *out, NameMap *namemap, std::
 			write_ul(out, soa.retry);
 			write_ul(out, soa.expire);
 			write_ul(out, soa.minimum);
-			write_us(&out->at(i), out->size() - i - 2);
 		};
 		if (item.soa()) {
 			WriteSOA(*item.soa());
+		}
+	} else if (item.type == DNS_TYPE::HTTPS) {
+		dns::HTTPS const *https = item.https();
+		if (!https) return false;
+		write_us(out, https->priority);
+		write_name(out, namemap, https->name);
+		if (!https->data.empty()) {
+			write(out, https->data.data(), https->data.size());
 		}
 	} else {
 		int len = item.bin.size();
@@ -622,9 +645,9 @@ bool Behind::write_dns_answer_rr(std::vector<char> *out, NameMap *namemap, std::
 		} else {
 			return false;
 		}
-		write_us(out, len);
 		write(out, (char const *)item.bin.data(), len);
 	}
+	write_us(&out->at(i), out->size() - i - 2);
 	return true;
 }
 
@@ -1011,6 +1034,24 @@ void Behind::parse_dns_message(const char *begin, const char *end, dns::Message 
 							soa->rname = misc::strtolower(soa->rname);
 							it->set_soa(soa);
 						}
+					} else if (a.type == DNS_TYPE::HTTPS) {
+						if (rdlen > 2) {
+							std::shared_ptr<dns::HTTPS> https = std::make_shared<dns::HTTPS>();
+							https->priority = ntohs(*(uint16_t *)ptr);
+							ptr += 2;
+							int n = decode_name(begin, end, ptr, &https->name);
+							if (n > 0) {
+								https->name = misc::strtolower(https->name);
+								ptr += n;
+							}
+							if (n < rdlen) {
+								n = rdlen - 2 - n;
+								https->data.resize(n);
+								memcpy(https->data.data(), ptr, n);
+							}
+							it->set_https(https);
+							ptr += rdlen;
+						}
 					}
 				}
 			}
@@ -1115,6 +1156,8 @@ char const *dns_type_to_string(DNS_TYPE type)
 		return "PTR";
 	case DNS_TYPE::AAAA:
 		return "AAAA";
+	case DNS_TYPE::HTTPS:
+		return "HTTPS";
 	default:
 		return "?";
 	}
@@ -1333,9 +1376,10 @@ std::vector<char> Behind::read(InternalData *d, ProtocolFamilyType const &proto)
 dns::Cache *Behind::get_cache(DNS_TYPE type)
 {
 	switch (type) {
-	case DNS_TYPE::A:    return &m->dns_cache.a;
-	case DNS_TYPE::AAAA: return &m->dns_cache.aaaa;
-	case DNS_TYPE::SOA:  return &m->dns_cache.soa;
+	case DNS_TYPE::A:     return &m->dns_cache.a;
+	case DNS_TYPE::AAAA:  return &m->dns_cache.aaaa;
+	case DNS_TYPE::SOA:   return &m->dns_cache.soa;
+	case DNS_TYPE::HTTPS: return &m->dns_cache.https;
 	}
 	return nullptr;
 }
@@ -1647,6 +1691,8 @@ void Behind::reply_to_client_udp(InternalData *d, Task *task, dns::Message const
 					} else if (a2.type == DNS_TYPE::SOA && a2.soa()) {
 						a2.soa()->nname = AmendName(a2.soa()->nname);
 						a2.soa()->rname = AmendName(a2.soa()->rname);
+					} else if (a2.type == DNS_TYPE::HTTPS && a2.https()) {
+						a2.https()->name = AmendName(a2.https()->name);
 					}
 					sending.answers.push_back(a2);
 				}
@@ -2056,18 +2102,32 @@ void Behind::test()
 	// decode_name test
 
 	{
+		int r;
 		std::string in, out;
 
 		in = "\x03" "www" "\x06" "google" "\x03" "com" "\x00";
-		decode_name(in.data(), in.data() + 16, in.data(), &out);
+		r = decode_name(in.data(), in.data() + 16, in.data(), &out);
+		EXPECT_EQ(r, 16);
 		EXPECT_EQ(out, "www.google.com");
 
+		in = "\x03" "www" "\x06" "google" "\x03" "com" "\x00\x00\x00";
+		r = decode_name(in.data(), in.data() + 18, in.data(), &out);
+		EXPECT_EQ(r, 16);
+		EXPECT_EQ(out, "www.google.com");
+
+		in = "\x03" "www" "\x00\x00\x00";
+		r = decode_name(in.data(), in.data() + 7, in.data(), &out);
+		EXPECT_EQ(r, 5);
+		EXPECT_EQ(out, "www");
+
 		in = "\xc0\x00"; // infinite loop
-		decode_name(in.data(), in.data() + 2, in.data(), &out);
+		r = decode_name(in.data(), in.data() + 2, in.data(), &out);
+		EXPECT_EQ(r, 0);
 		EXPECT_EQ(out, "");
 
 		in = "\x03" "www" "\x06" "google" "\x03" "com" "\xc0\x00"; // infinite loop
-		decode_name(in.data(), in.data() + 17, in.data(), &out);
+		r = decode_name(in.data(), in.data() + 17, in.data(), &out);
+		EXPECT_EQ(r, 0);
 		EXPECT_EQ(out, "");
 	}
 

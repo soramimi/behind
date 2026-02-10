@@ -177,7 +177,6 @@ private:
 		}
 	};
 	static bool write_name(std::vector<char> *out, NameMap *namemap, std::string const &name);
-	static int decode_name(char const *begin, char const *end, char const *ptr, std::vector<char> *out);
 	static int decode_name(char const *begin, char const *end, char const *ptr, std::string *name);
 	static void write_dns_header(std::vector<char> *out, uint16_t id, uint16_t flags, uint16_t qdcount, uint16_t ancount, uint16_t nscount, uint16_t arcount);
 	static void write_dns_question_rr(std::vector<char> *out, NameMap *namemap, std::string const &name, DNS_TYPE type, uint16_t clas);
@@ -199,7 +198,7 @@ private:
 	bool send_dns_message(InternalData *d, const ProtocolFamilyType &proto, dns::Message const &msg, bool forward, bool from_cache);
 
 	void process(InternalData *d, const ProtocolFamilyType &proto);
-        void process_udp(InternalData *d, sa_family_t family);
+	void process_udp(InternalData *d, sa_family_t family);
 	void process_tcp(InternalData *d, sa_family_t family);
 
 	void init_socket(void *private_in, ProtocolFamilyType proto);
@@ -207,7 +206,7 @@ private:
 	const InetResolver::Addr *find_host(std::string const &name) const;
 	void add_hosts(const std::map<std::string, std::string> &hosts);
 	uint32_t next_local_transaction_id();
-        int ctl_add(int fd, epoll_event *e, bool in, bool out);
+	int ctl_add(int fd, epoll_event *e, bool in, bool out);
 	int ctl_del(int fd, epoll_event *e);
 	void delete_socket(int fd, struct epoll_event *e);
 	bool accept_dns_type(DNS_TYPE t);

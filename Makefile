@@ -46,3 +46,7 @@ q3:
 
 q4:
 	dig @127.0.0.1 -p 5301 www.google.com +tcp
+
+q5:
+	dig @127.0.0.1 -p 5301 www.google.com HTTPS
+
