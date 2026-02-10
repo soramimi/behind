@@ -1562,7 +1562,7 @@ void Behind::set_edns0(dns::Message *msg)
 		}
 	}
 
-	const uint16_t payload_size = 4096;
+	const uint16_t payload_size = 1232;
 	const uint8_t ex_rcode = 0;
 	const uint8_t version = 0;
 	const bool dnssec_ok = false;
