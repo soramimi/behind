@@ -485,16 +485,20 @@ bool Behind::write_name(std::vector<char> *out, NameMap *namemap, const std::str
 	return true;
 }
 
-int Behind::decode_name(const char *begin, const char *end, const char *ptr, std::vector<char> *out)
+int Behind::decode_name(const char *begin, const char *end, const char *ptr, std::string *name)
 {
+	name->clear();
 	if (begin && end && ptr && begin <= ptr && ptr < end) {
+		char buf[253];
+		size_t len = 0;
+		char const *start = ptr;
 		char const *lower = ptr;
 		char const *upper = end;
-		char const *start = ptr;
 		char const *firstjump = nullptr;
 		while (ptr < upper) {
 			uint8_t n(*ptr);
-			if ((n & 0xc0) == 0xc0) {
+			uint8_t bits = n & 0xc0;
+			if (bits == 0xc0) {
 				if (ptr + 1 < upper) {
 					int offset = ((n & 0x3f) << 8) | (ptr[1] & 0xff);
 					char const *next = begin + offset;
@@ -508,40 +512,27 @@ int Behind::decode_name(const char *begin, const char *end, const char *ptr, std
 						continue;
 					}
 				}
-				return -1;
-			}
-			if ((n & 0xc0) != 0x00) {
-				return -1;
-			}
-			ptr++;
-			if (n == 0) {
 				break;
 			}
-			if (!out->empty()) {
-				out->push_back('.');
+			if (bits != 0x00) {
+				break;
 			}
-			out->insert(out->end(), ptr, ptr + n);
-			if (out->size() > 253) {
-				return -1;
+			ptr++;
+			if (n == 0) { // normal end
+				name->assign(buf, len);
+				return (firstjump ? firstjump : ptr) - start;
 			}
+			if (len + 1 + n > sizeof(buf)) {
+				break;
+			}
+			if (len > 0) {
+				buf[len++] = '.';
+			}
+			memcpy(buf + len, ptr, n);
+			len += n;
 			ptr += n;
 		}
-		return (firstjump ? firstjump : ptr) - start;
 	}
-	return -1;
-}
-
-int Behind::decode_name(const char *begin, const char *end, const char *ptr, std::string *name)
-{
-	std::vector<char> decoded;
-	decoded.reserve(320);
-	int n = decode_name(begin, end, ptr, &decoded);
-	if (n > 0 && !decoded.empty()) {
-		char const *p = &decoded[0];
-		name->assign(p, decoded.size());
-		return n;
-	}
-	name->clear();
 	return 0;
 }
 
@@ -2068,7 +2059,7 @@ void Behind::test()
 		std::string in, out;
 
 		in = "\x03" "www" "\x06" "google" "\x03" "com" "\x00";
-		decode_name(in.data(), in.data() + in.size(), in.data(), &out);
+		decode_name(in.data(), in.data() + 16, in.data(), &out);
 		EXPECT_EQ(out, "www.google.com");
 
 		in = "\xc0\x00"; // infinite loop
