@@ -111,7 +111,7 @@ struct HTTPS {
 struct Record {
 	std::string name;
 	DNS_TYPE type = DNS_TYPE::A;
-	uint16_t clas = AF_INET;
+	uint16_t clas = DNS_CLASS_IN;
 	uint32_t ttl = 300;
 	uint64_t expire = 0;
 	std::vector<uint8_t> bin;
@@ -243,6 +243,7 @@ struct Message {
 	std::vector<Question> questions;
 	std::vector<Record> answers;
 	std::vector<Record> authorities;
+	std::vector<Record> additionals;
 };
 
 class Cache {
@@ -561,15 +562,15 @@ int Behind::decode_name(const char *begin, const char *end, const char *ptr, std
 	return 0;
 }
 
-void Behind::write_dns_header(std::vector<char> *out, uint16_t id, uint16_t flags, uint16_t qdcount, uint16_t ancount, uint16_t nscount, uint16_t arcount)
+void Behind::write_dns_header(std::vector<char> *out, dns::Header const &h)
 {
 	uint16_t tmp[6];
-	tmp[0] = htons(id);
-	tmp[1] = htons(flags);
-	tmp[2] = htons(qdcount);
-	tmp[3] = htons(ancount);
-	tmp[4] = htons(nscount);
-	tmp[5] = htons(arcount);
+	tmp[0] = htons(h.id);
+	tmp[1] = htons(h.flags);
+	tmp[2] = htons(h.qdcount);
+	tmp[3] = htons(h.ancount);
+	tmp[4] = htons(h.nscount);
+	tmp[5] = htons(h.arcount);
 	write(out, (char const *)tmp, 12);
 }
 
@@ -593,12 +594,12 @@ std::shared_ptr<dns::SOA> fake_soa()
 	return soa;
 }
 
-bool Behind::write_dns_answer_rr(std::vector<char> *out, NameMap *namemap, std::string const &name, uint16_t clas, uint32_t ttl, const dns::Record &item)
+bool Behind::write_dns_answer_rr(std::vector<char> *out, NameMap *namemap, std::string const &name, const dns::Record &item)
 {
 	write_name(out, namemap, name);
 	write_us(out, (int)item.type);
-	write_us(out, clas);
-	write_ul(out, ttl);
+	write_us(out, item.clas);
+	write_ul(out, item.ttl);
 
 	size_t i = out->size();
 	write_us(out, 0);
@@ -642,6 +643,8 @@ bool Behind::write_dns_answer_rr(std::vector<char> *out, NameMap *namemap, std::
 			// len = 4;
 		} else if (item.type == DNS_TYPE::AAAA && len == 16) {
 			// len = 16;
+		} else if (item.type == DNS_TYPE::OPT) {
+			// through
 		} else {
 			return false;
 		}
@@ -1172,7 +1175,7 @@ struct Behind::Packet {
 	}
 };
 
-Behind::Packet Behind::make_dns_message(dns::Message const &msg, bool tcp)
+Behind::Packet Behind::make_dns_packet(dns::Message const &msg, bool tcp)
 {
 	Packet ret;
 	NameMap namemap;
@@ -1190,9 +1193,9 @@ Behind::Packet Behind::make_dns_message(dns::Message const &msg, bool tcp)
 	h.qdcount = LimitCount(msg.questions.size());
 	h.ancount = LimitCount(msg.answers.size());
 	h.nscount = LimitCount(msg.authorities.size());
-	h.arcount = 0;
+	h.arcount = LimitCount(msg.additionals.size());
 
-	write_dns_header(&ret.buffer, h.id, h.flags, 1, h.ancount, h.nscount, 0);
+	write_dns_header(&ret.buffer, h);
 
 	for (auto it = msg.questions.begin(); it != msg.questions.end(); it++) {
 		dns::Question const &q = *it;
@@ -1206,7 +1209,7 @@ Behind::Packet Behind::make_dns_message(dns::Message const &msg, bool tcp)
 	for (int i = 0; i < h.ancount; i++) {
 		dns::Record const &r = msg.answers[i];
 		std::string name = stricmp(ret.q.name.c_str(), r.name.c_str()) == 0 ? ret.q.name : misc::strtolower(r.name);
-		if (!write_dns_answer_rr(&ret.buffer, &namemap, name, ret.q.clas, r.ttl, r)) {
+		if (!write_dns_answer_rr(&ret.buffer, &namemap, name, r)) {
 			return {};
 		}
 	}
@@ -1214,7 +1217,18 @@ Behind::Packet Behind::make_dns_message(dns::Message const &msg, bool tcp)
 	for (int i = 0; i < h.nscount; i++) {
 		dns::Record const &r = msg.authorities[i];
 		std::string name = stricmp(ret.q.name.c_str(), r.name.c_str()) == 0 ? ret.q.name : misc::strtolower(r.name);
-		if (!write_dns_answer_rr(&ret.buffer, &namemap, name, ret.q.clas, r.ttl, r)) {
+		if (!write_dns_answer_rr(&ret.buffer, &namemap, name, r)) {
+			return {};
+		}
+	}
+
+	for (int i = 0; i < h.arcount; i++) {
+		dns::Record const &r = msg.additionals[i];
+		std::string name;
+		if (0) {
+			name = stricmp(ret.q.name.c_str(), r.name.c_str()) == 0 ? ret.q.name : misc::strtolower(r.name);
+		}
+		if (!write_dns_answer_rr(&ret.buffer, &namemap, name, r)) {
 			return {};
 		}
 	}
@@ -1235,7 +1249,7 @@ Behind::Packet Behind::make_dns_message(dns::Message const &msg, bool tcp)
 bool Behind::send_dns_message(InternalData *d, ProtocolFamilyType const &proto, dns::Message const &msg, bool forward, bool from_cache)
 {
 	bool tcp = proto.socktype() == SOCK_STREAM;
-	Packet packet = make_dns_message(msg, tcp);
+	Packet packet = make_dns_packet(msg, tcp);
 	if (!packet) return false;
 
 	Sender sender(proto);
@@ -1394,6 +1408,7 @@ bool Behind::accept_dns_type(DNS_TYPE t)
 	case DNS_TYPE::SOA:
 	case DNS_TYPE::MX:
 	case DNS_TYPE::HTTPS:
+	case DNS_TYPE::OPT:
 		return true;
 	}
 	return false;
@@ -1537,6 +1552,29 @@ void Behind::forward_tcp(InternalData *d, ProtocolFamilyType const &client_proto
 	}
 }
 
+void Behind::set_edns0(dns::Message *msg)
+{
+	size_t i = msg->additionals.size();
+	while (i > 0) {
+		i--;
+		if (msg->additionals[i].type == DNS_TYPE::OPT) {
+			msg->additionals.erase(msg->additionals.begin() + i);
+		}
+	}
+
+	const uint16_t payload_size = 4096;
+	const uint8_t ex_rcode = 0;
+	const uint8_t version = 0;
+	const bool dnssec_ok = false;
+	const uint16_t z = 0;
+
+	dns::Record edns0;
+	edns0.type = DNS_TYPE::OPT;
+	edns0.clas = payload_size;
+	edns0.ttl = ((uint32_t)ex_rcode << 24) | ((uint32_t)version << 16) | (dnssec_ok ? 0x8000 : 0) | z;
+	msg->additionals.push_back(edns0);
+}
+
 bool Behind::reply_from_cache(InternalData *d, ProtocolFamilyType const &client_proto, dns::Header const &header, dns::Question const &q)
 {
 	dns::Cache *cache = get_cache(q.type);
@@ -1549,6 +1587,7 @@ bool Behind::reply_from_cache(InternalData *d, ProtocolFamilyType const &client_
 			sending.questions = {q};
 			sending.answers = entry->answers;
 			sending.authorities = entry->authorities;
+			set_edns0(&sending);
 			send_dns_message(d, client_proto, sending, false, true);
 			return true;
 		}
@@ -1698,6 +1737,8 @@ void Behind::reply_to_client_udp(InternalData *d, Task *task, dns::Message const
 				}
 			}
 		}
+		// edns0
+		set_edns0(&sending);
 		// send
 		auto d2 = *d;
 		d2.in4_udp.sa4 = task->client_sa4;
@@ -2172,7 +2213,7 @@ void Behind::test()
 		EXPECT_EQ(msg.answers[0].ttl, 300);
 
 		{
-			Packet response = make_dns_message(msg, false);
+			Packet response = make_dns_packet(msg, false);
 
 			dns::Message msg2;
 			char const *begin = response.buffer.data();
@@ -2225,7 +2266,7 @@ void Behind::test()
 		EXPECT_EQ(msg.answers[2].ttl, 300);
 
 		{
-			Packet response = make_dns_message(msg, false);
+			Packet response = make_dns_packet(msg, false);
 
 			dns::Message msg2;
 			char const *begin = response.buffer.data();

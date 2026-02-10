@@ -81,6 +81,7 @@ enum class DNS_TYPE : uint16_t {
 	PTR = 12,
 	MX = 15,
 	AAAA = 28,
+	OPT = 41,
 	HTTPS = 65,
 };
 char const *dns_type_to_string(DNS_TYPE type);
@@ -178,9 +179,9 @@ private:
 	};
 	static bool write_name(std::vector<char> *out, NameMap *namemap, std::string const &name);
 	static int decode_name(char const *begin, char const *end, char const *ptr, std::string *name);
-	static void write_dns_header(std::vector<char> *out, uint16_t id, uint16_t flags, uint16_t qdcount, uint16_t ancount, uint16_t nscount, uint16_t arcount);
+	static void write_dns_header(std::vector<char> *out, const dns::Header &h);
 	static void write_dns_question_rr(std::vector<char> *out, NameMap *namemap, std::string const &name, DNS_TYPE type, uint16_t clas);
-	static bool write_dns_answer_rr(std::vector<char> *out, NameMap *namemap, std::string const &name, uint16_t clas, uint32_t ttl, dns::Record const &item);
+	static bool write_dns_answer_rr(std::vector<char> *out, NameMap *namemap, std::string const &name, dns::Record const &item);
 	static int parse_question_section(char const *begin, char const *end, char const *ptr, dns::Question *out);
 	std::vector<const Forwarder *> choose_forwarder(int max) const;
 	void init_forwarder();
@@ -194,8 +195,9 @@ private:
 	bool is_nodata_aaaa(std::string const &name) const;
 
 	struct Packet;
-	static Packet make_dns_message(dns::Message const &msg, bool tcp);
+	static Packet make_dns_packet(dns::Message const &msg, bool tcp);
 	bool send_dns_message(InternalData *d, const ProtocolFamilyType &proto, dns::Message const &msg, bool forward, bool from_cache);
+	void set_edns0(dns::Message *msg);
 
 	void process(InternalData *d, const ProtocolFamilyType &proto);
 	void process_udp(InternalData *d, sa_family_t family);
