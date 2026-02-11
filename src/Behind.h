@@ -73,6 +73,10 @@ struct Option {
 	std::map<std::string, std::string> hosts;
 };
 
+enum class DNS_CLASS : uint16_t {
+	IN = 1,
+};
+
 enum class DNS_TYPE : uint16_t {
 	A = 1,
 	NS = 2,
@@ -180,7 +184,7 @@ private:
 	static bool write_name(std::vector<char> *out, NameMap *namemap, std::string const &name);
 	static int decode_name(char const *begin, char const *end, char const *ptr, std::string *name);
 	static void write_dns_header(std::vector<char> *out, const dns::Header &h);
-	static void write_dns_question_rr(std::vector<char> *out, NameMap *namemap, std::string const &name, DNS_TYPE type, uint16_t clas);
+	static void write_dns_question_rr(std::vector<char> *out, NameMap *namemap, std::string const &name, DNS_TYPE type, DNS_CLASS clas);
 	static bool write_dns_answer_rr(std::vector<char> *out, NameMap *namemap, std::string const &name, dns::Record const &item);
 	static int parse_question_section(char const *begin, char const *end, char const *ptr, dns::Question *out);
 	std::vector<const Forwarder *> choose_forwarder(int max) const;

@@ -24,8 +24,6 @@
 #define SOCKET_ERROR (-1)
 #define closesocket(S) close(S)
 
-#define DNS_CLASS_IN 1
-
 std::string randomize_case(std::string qname)
 {
 	for (size_t i = 0; i < qname.size(); i++) {
@@ -68,8 +66,8 @@ struct Header {
 
 struct Question {
 	std::string name;
-	DNS_TYPE type;
-	uint16_t clas;
+	DNS_TYPE type = DNS_TYPE::A;
+	DNS_CLASS clas = DNS_CLASS::IN;
 };
 static inline bool operator == (const Question &l, const Question &r)
 {
@@ -111,7 +109,7 @@ struct HTTPS {
 struct Record {
 	std::string name;
 	DNS_TYPE type = DNS_TYPE::A;
-	uint16_t clas = DNS_CLASS_IN;
+	DNS_CLASS clas = DNS_CLASS::IN;
 	uint32_t ttl = 300;
 	uint64_t expire = 0;
 	std::vector<uint8_t> bin;
@@ -574,11 +572,11 @@ void Behind::write_dns_header(std::vector<char> *out, dns::Header const &h)
 	write(out, (char const *)tmp, 12);
 }
 
-void Behind::write_dns_question_rr(std::vector<char> *out, NameMap *namemap, const std::string &name, DNS_TYPE type, uint16_t clas)
+void Behind::write_dns_question_rr(std::vector<char> *out, NameMap *namemap, const std::string &name, DNS_TYPE type, DNS_CLASS clas)
 {
 	write_name(out, namemap, name);
 	write_us(out, (uint16_t)type);
-	write_us(out, clas);
+	write_us(out, (uint16_t)clas);
 }
 
 std::shared_ptr<dns::SOA> fake_soa()
@@ -598,7 +596,7 @@ bool Behind::write_dns_answer_rr(std::vector<char> *out, NameMap *namemap, std::
 {
 	write_name(out, namemap, name);
 	write_us(out, (int)item.type);
-	write_us(out, item.clas);
+	write_us(out, (int)item.clas);
 	write_ul(out, item.ttl);
 
 	size_t i = out->size();
@@ -664,7 +662,7 @@ int Behind::parse_question_section(const char *begin, const char *end, const cha
 		memcpy(tmp, ptr, 4);
 		ptr += 4;
 		out->type = (DNS_TYPE)ntohs(tmp[0]);
-		out->clas = ntohs(tmp[1]);
+		out->clas = (DNS_CLASS)ntohs(tmp[1]);
 		return ptr - start;
 	}
 	return 0;
@@ -962,7 +960,7 @@ void Behind::parse_dns_message(const char *begin, const char *end, dns::Message 
 				uint16_t tmp[5];
 				memcpy(tmp, ptr, 10);
 				a.type = (DNS_TYPE)ntohs(tmp[0]);
-				a.clas = ntohs(tmp[1]);
+				a.clas = (DNS_CLASS)ntohs(tmp[1]);
 				memcpy(&a.ttl, tmp + 2, 4); // a.ttl = ntohl(*(uint32_t *)&tmp[2]); // -Wstrict-aliasing
 				a.ttl = ntohl(a.ttl);
 				uint16_t rdlen = ntohs(tmp[4]);
@@ -1570,7 +1568,7 @@ void Behind::set_edns0(dns::Message *msg)
 
 	dns::Record edns0;
 	edns0.type = DNS_TYPE::OPT;
-	edns0.clas = payload_size;
+	edns0.clas = (DNS_CLASS)payload_size;
 	edns0.ttl = ((uint32_t)ex_rcode << 24) | ((uint32_t)version << 16) | (dnssec_ok ? 0x8000 : 0) | z;
 	msg->additionals.push_back(edns0);
 }
@@ -1620,7 +1618,7 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 		send_dns_message(d, client_proto, sending, false, false);
 	};
 
-	if (q.clas == DNS_CLASS_IN && !q.name.empty()) {
+	if (q.clas == DNS_CLASS::IN && !q.name.empty()) {
 		if (!accept_dns_type(q.type)) {
 			SendNODATA();
 			return;
@@ -1721,7 +1719,7 @@ void Behind::reply_to_client_udp(InternalData *d, Task *task, dns::Message const
 		} else {
 			for (dns::Record const &a1 : received.answers) {
 				dns::Record a2 = a1;
-				if (a2.clas == DNS_CLASS_IN) {
+				if (a2.clas == DNS_CLASS::IN) {
 					if (accept_dns_type(a2.type)) {
 						a2.name = AmendName(a2.name);
 					}
@@ -2202,11 +2200,11 @@ void Behind::test()
 		EXPECT_EQ(msg.answers.size(), 1);
 		EXPECT_EQ(msg.questions.size(), 1);
 
-		EXPECT_EQ(msg.questions[0].clas, DNS_CLASS_IN);
+		EXPECT_EQ(msg.questions[0].clas, DNS_CLASS::IN);
 		EXPECT_EQ(msg.questions[0].type, DNS_TYPE::A);
 		EXPECT_EQ(msg.questions[0].name, "www.google.com");
 
-		EXPECT_EQ(msg.answers[0].clas, DNS_CLASS_IN);
+		EXPECT_EQ(msg.answers[0].clas, DNS_CLASS::IN);
 		EXPECT_EQ(msg.answers[0].type, DNS_TYPE::A);
 		EXPECT_EQ(msg.answers[0].name, "www.google.com");
 		EXPECT_EQ(to_string(msg.answers[0].bin), std::string("\x8e\xfa\xc2\xc4", 4));
@@ -2243,23 +2241,23 @@ void Behind::test()
 		EXPECT_EQ(msg.answers.size(), 3);
 		EXPECT_EQ(msg.questions.size(), 1);
 
-		EXPECT_EQ(msg.questions[0].clas, DNS_CLASS_IN);
+		EXPECT_EQ(msg.questions[0].clas, DNS_CLASS::IN);
 		EXPECT_EQ(msg.questions[0].type, DNS_TYPE::A);
 		EXPECT_EQ(msg.questions[0].name, "www.amazon.co.jp");
 
-		EXPECT_EQ(msg.answers[0].clas, DNS_CLASS_IN);
+		EXPECT_EQ(msg.answers[0].clas, DNS_CLASS::IN);
 		EXPECT_EQ(msg.answers[0].type, DNS_TYPE::CNAME);
 		EXPECT_EQ(msg.answers[0].name, "www.amazon.co.jp");
 		EXPECT_EQ(msg.answers[0].cname()->cname, "tp.4d5ad1d2b-frontier.amazon.co.jp");
 		EXPECT_EQ(msg.answers[0].ttl, 300);
 
-		EXPECT_EQ(msg.answers[1].clas, DNS_CLASS_IN);
+		EXPECT_EQ(msg.answers[1].clas, DNS_CLASS::IN);
 		EXPECT_EQ(msg.answers[1].type, DNS_TYPE::CNAME);
 		EXPECT_EQ(msg.answers[1].name, "tp.4d5ad1d2b-frontier.amazon.co.jp");
 		EXPECT_EQ(msg.answers[1].cname()->cname, "cf.4d5ad1d2b-frontier.amazon.co.jp");
 		EXPECT_EQ(msg.answers[1].ttl, 300);
 
-		EXPECT_EQ(msg.answers[2].clas, DNS_CLASS_IN);
+		EXPECT_EQ(msg.answers[2].clas, DNS_CLASS::IN);
 		EXPECT_EQ(msg.answers[2].type, DNS_TYPE::A);
 		EXPECT_EQ(msg.answers[2].name, "cf.4d5ad1d2b-frontier.amazon.co.jp");
 		EXPECT_EQ(to_string(msg.answers[2].bin), std::string("\x03\xa8\xfb\x86", 4));
@@ -2296,7 +2294,7 @@ void Behind::test()
 		EXPECT_EQ(msg.answers.size(), 0);
 		EXPECT_EQ(msg.questions.size(), 1);
 
-		EXPECT_EQ(msg.questions[0].clas, DNS_CLASS_IN);
+		EXPECT_EQ(msg.questions[0].clas, DNS_CLASS::IN);
 		EXPECT_EQ(msg.questions[0].type, DNS_TYPE::A);
 		EXPECT_EQ(msg.questions[0].name, "doubleclick.net");
 	}
