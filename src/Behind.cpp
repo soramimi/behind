@@ -392,6 +392,7 @@ struct Behind::Private {
 		dns::Cache a;
 		dns::Cache aaaa;
 		dns::Cache soa;
+		dns::Cache txt;
 		dns::Cache https;
 	} dns_cache;
 	std::vector<Behind::Task> tasks;
@@ -642,6 +643,8 @@ bool Behind::write_dns_answer_rr(std::vector<char> *out, NameMap *namemap, std::
 		} else if (item.type == DNS_TYPE::AAAA && len == 16) {
 			// len = 16;
 		} else if (item.type == DNS_TYPE::OPT) {
+			// through
+		} else if (item.type == DNS_TYPE::TXT) {
 			// through
 		} else {
 			return false;
@@ -1053,6 +1056,12 @@ void Behind::parse_dns_message(const char *begin, const char *end, dns::Message 
 							it->set_https(https);
 							ptr += rdlen;
 						}
+					} else if (a.type == DNS_TYPE::TXT) {
+						if (rdlen > 0) {
+							it->bin.resize(rdlen);
+							memcpy(it->bin.data(), ptr, rdlen);
+							ptr += rdlen;
+						}
 					}
 				}
 			}
@@ -1155,6 +1164,8 @@ char const *dns_type_to_string(DNS_TYPE type)
 		return "SOA";
 	case DNS_TYPE::PTR:
 		return "PTR";
+	case DNS_TYPE::TXT:
+		return "TXT";
 	case DNS_TYPE::AAAA:
 		return "AAAA";
 	case DNS_TYPE::HTTPS:
@@ -1391,6 +1402,7 @@ dns::Cache *Behind::get_cache(DNS_TYPE type)
 	case DNS_TYPE::A:     return &m->dns_cache.a;
 	case DNS_TYPE::AAAA:  return &m->dns_cache.aaaa;
 	case DNS_TYPE::SOA:   return &m->dns_cache.soa;
+	case DNS_TYPE::TXT:   return &m->dns_cache.txt;
 	case DNS_TYPE::HTTPS: return &m->dns_cache.https;
 	}
 	return nullptr;
@@ -1405,6 +1417,7 @@ bool Behind::accept_dns_type(DNS_TYPE t)
 	case DNS_TYPE::CNAME:
 	case DNS_TYPE::SOA:
 	case DNS_TYPE::MX:
+	case DNS_TYPE::TXT:
 	case DNS_TYPE::HTTPS:
 	case DNS_TYPE::OPT:
 		return true;
@@ -1815,27 +1828,27 @@ bool Behind::process_receive(InternalData *d, int upstream_fd)
 			return Done(false);
 		}
 		if (task->op == Operation::REPLY_TO_CLIENT_TCP) {
-			char buf[4096];
-			int n = recv(task->upstream_fd, buf, sizeof(buf), 0);
-			if (n > 2) {
-				n -= 2;
-				n = std::min(n, (int)ntohs(*(uint16_t *)buf));
-				char const *begin = buf + 2;
-				char const *end = begin + n;
-				dns::Message sending;
-				parse_dns_message(begin, end, &sending);
-				sending.header.id = task->requester_id;
-				send_dns_message(d, task->client_proto, sending, false, false);
-				// cahce
-				dns::Cache *cache = get_cache(task->type);
-				if (cache) {
-					cache->insert(task->forward_name, sending);
+			uint16_t len = 0;
+			int n = recv(task->upstream_fd, &len, 2, 0);
+			if (n == 2) {
+				len = ntohs(len);
+				if (len > 0) {
+					std::vector<char> buf(len);
+					int n = recv(task->upstream_fd, buf.data(), len, 0);
+					if (n == len) {
+						char const *begin = buf.data();
+						char const *end = begin + len;
+						dns::Message sending;
+						parse_dns_message(begin, end, &sending);
+						sending.header.id = task->requester_id;
+						send_dns_message(d, task->client_proto, sending, false, false);
+						// cahce
+						dns::Cache *cache = get_cache(task->type);
+						if (cache) {
+							cache->insert(task->forward_name, sending);
+						}
+					}
 				}
-			}
-			{
-				auto [client_fd, addr] = sock_and_address(d, task->client_proto);
-				(void)addr;
-				delete_socket(client_fd, nullptr);;
 			}
 			return Done(true);
 		}
@@ -1846,7 +1859,23 @@ bool Behind::process_receive(InternalData *d, int upstream_fd)
 			if (n > 0) {
 				dns::Message received;
 				parse_dns_message(buf, buf + n, &received);
-				reply_to_client_udp(d, task, received);
+				bool tc = bool(received.header.flags & 0x0200);
+				if (tc) {
+					std::vector<Forwarder const *> forwarders = choose_forwarder(1);
+					if (!forwarders.empty()) {
+						dns::Header header;
+						header.id = next_txid();
+						header.flags = received.header.flags & ~0x0200;
+						dns::Question q;
+						if (!received.questions.empty()) {
+							q = received.questions.front();
+						}
+						auto local_transaction_id = next_local_transaction_id();
+						forward_tcp(d, task->client_proto, task->requester_id, header, q, local_transaction_id, *forwarders.front());
+					}
+				} else {
+					reply_to_client_udp(d, task, received);
+				}
 			}
 			return Done(true);
 		}
