@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <optional>
 #include <unordered_set>
+#include <memory>
 
 #define STANDARD_DNS_PORT 53
 #define DEFAUT_LISTEN_PORT 5300
@@ -127,6 +128,7 @@ private:
 
 	enum class Operation {
 		NONE,
+		READING_FROM_CLIENT,
 		REPLY_TO_CLIENT_UDP,
 		REPLY_TO_CLIENT_TCP,
 		FORWARD_TO_UPSTREAM_TCP,
@@ -192,8 +194,8 @@ private:
 	void init_forwarder();
 	void clean();
 	void clean_transaction(uint32_t id);
-	std::optional<Task> take_task_by_id(uint16_t upstream_id);
-	void push_task(Task const &task);
+	std::shared_ptr<Task> take_task_by_id(uint16_t upstream_id);
+	void push_task(std::shared_ptr<Task> task, int timeout);
 	static void parse_dns_message(char const *begin, char const *end, dns::Message *msg);
 
 	bool is_nxdomain(std::string const &name) const;
@@ -204,7 +206,7 @@ private:
 	bool send_dns_message(InternalData *d, const ProtocolFamilyType &proto, dns::Message const &msg, bool forward, bool from_cache);
 	void set_edns0(dns::Message *msg);
 
-	void process(InternalData *d, const ProtocolFamilyType &proto);
+	bool process(InternalData *d, const ProtocolFamilyType &proto);
 	void process_udp(InternalData *d, sa_family_t family);
 	void process_tcp(InternalData *d, sa_family_t family);
 
@@ -228,10 +230,12 @@ private:
 	void process_response(InternalData *d, const ProtocolFamilyType &upstream_proto, const dns::Message &received);
 	uint16_t next_txid();
 	bool process_receive(InternalData *d, int upstream_fd);
-	std::optional<Behind::Task> take_task_by_fd(int fd);
+	std::shared_ptr<Task> take_task_by_fd(int fd);
 	bool bind(void *private_in, const ProtocolFamilyType &proto, int sock);
-	void reply_to_client_udp(InternalData *d, Task *task, const dns::Message &received);
+	void reply_to_client_udp(InternalData *d, std::shared_ptr<Task> task, const dns::Message &received);
 	bool reply_from_cache(InternalData *d, const ProtocolFamilyType &client_proto, const dns::Header &header, const dns::Question &q);
+	std::shared_ptr<Task> make_task(Operation op, uint32_t local_transaction_id);
+	void init_epoll_event(Task *task, int fd, uint32_t events);
 public:
 	Behind(Option const &opt);
 	~Behind();

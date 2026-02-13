@@ -51,5 +51,5 @@ q5:
 	dig @127.0.0.1 -p 5301 www.google.com HTTPS
 
 q6:
-	dig @127.0.0.1 -p 5301 www.google.com OPT
+	dig @127.0.0.1 -p 5301 amazon.com TXT
 
