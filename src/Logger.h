@@ -19,7 +19,7 @@ private:
 
 	int log_rotate_size() const
 	{
-		return 1 * 1024 * 1024;
+		return 10 * 1024 * 1024;
 	}
 
 	time_point_t now();

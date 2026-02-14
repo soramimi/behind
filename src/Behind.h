@@ -236,6 +236,7 @@ private:
 	bool reply_from_cache(InternalData *d, const ProtocolFamilyType &client_proto, const dns::Header &header, const dns::Question &q);
 	std::shared_ptr<Task> make_task(Operation op, uint32_t local_transaction_id);
 	void init_epoll_event(Task *task, int fd, uint32_t events);
+	void uptime();
 public:
 	Behind(Option const &opt);
 	~Behind();

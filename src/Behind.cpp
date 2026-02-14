@@ -377,6 +377,10 @@ struct Behind::ForwardingThreadData {
 
 struct Behind::Private {
 	Option option;
+
+	uint64_t start_time = 0;
+	uint64_t last_uptime_min = 0;
+
 	Hosts hosts;
 	uint32_t local_transaction_id = 0;
 	TransactionIdGenerator txid_gen;
@@ -835,12 +839,13 @@ int Behind::ctl_add(int fd, struct epoll_event *e, bool in, bool out)
 {
 	if (fd == -1) return -1;
 	int ret = 0;
-	if (in) {
-		m->select_in_fds.push_back(fd);
-	}
-	if (out) {
-		m->select_out_fds.push_back(fd);
-	}
+
+	auto Add = [](std::vector<int> *fds, int fd){
+		fds->push_back(fd);
+	};
+	if (in)  Add(&m->select_in_fds, fd);
+	if (out) Add(&m->select_out_fds, fd);
+	logprintf(LOG_DEFAULT, "(debug) fd tracking: + %d, in=%d, out=%d\n", fd, (int)m->select_in_fds.size(), (int)m->select_out_fds.size());
 	
 	if (e && m->epoll_fd != -1) {
 		ret = epoll_ctl(m->epoll_fd, EPOLL_CTL_ADD, e->data.fd, e);
@@ -852,14 +857,14 @@ int Behind::ctl_del(int fd, struct epoll_event *e)
 {
 	if (fd == -1) return -1;
 	int ret = 0;
-	{
-		auto it = std::remove(m->select_in_fds.begin(), m->select_in_fds.end(), fd);
-		m->select_in_fds.erase(it, m->select_in_fds.end());
-	}
-	{
-		auto it = std::remove(m->select_out_fds.begin(), m->select_out_fds.end(), fd);
-		m->select_out_fds.erase(it, m->select_out_fds.end());
-	}
+
+	auto Remove = [](std::vector<int> *fds, int fd){
+		auto it = std::remove(fds->begin(), fds->end(), fd);
+		fds->erase(it, fds->end());
+	};
+	Remove(&m->select_in_fds, fd);
+	Remove(&m->select_out_fds, fd);
+	logprintf(LOG_DEFAULT, "(debug) fd tracking: - %d, in=%d, out=%d\n", fd, (int)m->select_in_fds.size(), (int)m->select_out_fds.size());
 	
 	if (e && m->epoll_fd != -1) {
 		ret = epoll_ctl(m->epoll_fd, EPOLL_CTL_DEL, e->data.fd, e);
@@ -871,6 +876,23 @@ void Behind::delete_socket(int fd, struct epoll_event *e)
 {
 	ctl_del(fd, e);
 	closesocket(fd);
+}
+
+void Behind::uptime()
+{
+	uint64_t now = misc::get_tick_count();
+	uint64_t uptime_ms = now - m->start_time;
+	uint64_t uptime_sec = uptime_ms / 1000;
+	uint64_t uptime_min = uptime_sec / 60;
+
+	if (uptime_min != m->last_uptime_min) {
+		m->last_uptime_min = uptime_min;
+		int days = int(uptime_min / (60 * 24));
+		int minutes = int(uptime_min % (60 * 24));
+		int hours = minutes / 60;
+		minutes %= 60;
+		logprintf(LOG_DEFAULT, "(info) uptime: %d days %d:%02d\n", days, hours, minutes);
+	}
 }
 
 void Behind::clean()
@@ -2039,7 +2061,9 @@ int ev_fd(struct epoll_event *e)
 void Behind::main()
 {
 	add_hosts(m->option.hosts);
-	
+
+	m->start_time = misc::get_tick_count();
+
 	InternalData d;
 	init_socket(&d.in4_udp, {AF_INET, SOCK_DGRAM});
 	init_socket(&d.in6_udp, {AF_INET6, SOCK_DGRAM});
@@ -2120,7 +2144,7 @@ void Behind::main()
 					}
 				}
 			}
-			
+			uptime();
 			clean();
 		}
 	} else if (m->socket_mode == SocketMode::EPOLL) {
@@ -2174,6 +2198,7 @@ void Behind::main()
 					}
 				}
 			}
+			uptime();
 			clean();
 		}
 		::close(m->epoll_fd);
