@@ -677,23 +677,54 @@ int Behind::parse_question_section(const char *begin, const char *end, const cha
 	return 0;
 }
 
-std::vector<Forwarder const *> Behind::choose_forwarder(int max) const
+std::vector<Forwarder const *> Behind::choose_forwarder(std::string const &name, size_t max) const
 {
-	std::vector<Forwarder const *> ret;
+	std::vector<Forwarder const *> default_forwarders;
+	std::vector<Forwarder const *> matched_forwarders;
+
 	for (Forwarder const &f : m->forwarders) {
 		if (f) {
-			ret.push_back(&f);
+			assert(!f.zone.empty() && f.zone.back() == '.');
+			size_t n = f.zone.size();
+			if (n == 1) {
+				default_forwarders.push_back(&f);
+			} else if (n > 1) {
+				n--;
+				size_t i = name.size();
+				if (i >= n) {
+					i -= n;
+					if (i == 0 || name[i - 1] == '.') {
+						auto Compare = [&](){
+							for (size_t j = 0; j < n; j++) {
+								if (tolower((unsigned char)name[i + j]) != tolower((unsigned char)f.zone[j])) {
+									return false;
+								}
+							}
+							return true;
+						};
+						if (Compare()) {
+							matched_forwarders.push_back(&f);
+						}
+					}
+				}
+
+			}
 		}
 	}
-	if (max < 0) return ret;
-	size_t n = ret.size();
-	size_t m = std::min((size_t)max, n);
-	for (size_t i = 0; i < m; i++) {
-		size_t j = i + rand() % (n - i);
-		std::swap(ret[i], ret[j]);
+
+	std::vector<Forwarder const *> *forwarders = matched_forwarders.empty() ? &default_forwarders : &matched_forwarders;
+
+	{ // shuffle and resize
+		size_t n = forwarders->size();
+		size_t m = std::min((size_t)max, n);
+		for (size_t i = 0; i < m; i++) {
+			size_t j = i + rand() % (n - i);
+			std::swap(forwarders->at(i), forwarders->at(j));
+		}
+		forwarders->resize(m);
 	}
-	ret.resize(m);
-	return ret;
+
+	return *forwarders;
 }
 
 uint16_t Behind::next_txid()
@@ -809,13 +840,13 @@ InetResolver::Type parse_inet_address(std::string name, InetResolver::Addr *addr
 
 void Behind::init_forwarder()
 {
-	for (std::string const &name : m->option.forward_addr) {
+	for (Option::Zone const &z : m->option.forward_addr) {
 		InetResolver::Addr addr;
 		int port = STANDARD_DNS_PORT;
 		
-		InetResolver::Type type = parse_inet_address(name, &addr, &port);
+		InetResolver::Type type = parse_inet_address(z.name, &addr, &port);
 		
-		m->resolver.resolve(name.c_str(), type, &addr);
+		m->resolver.resolve(z.name.c_str(), type, &addr);
 		
 		Forwarder forwarder;
 		forwarder.port = port;
@@ -831,6 +862,8 @@ void Behind::init_forwarder()
 			}
 		}
 		
+		assert(!z.zone.empty() && z.zone.back() == '.');
+		forwarder.zone = z.zone;
 		m->forwarders.push_back(forwarder);
 	}
 }
@@ -1366,6 +1399,8 @@ bool Behind::send_dns_message(InternalData *d, ProtocolFamilyType const &proto, 
 	return ok;
 }
 
+
+
 InetResolver::Addr const *Behind::find_host(std::string const &name) const
 {
 	return m->hosts.find(name);
@@ -1710,7 +1745,7 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 		const uint32_t local_transaction_id = next_local_transaction_id();
 		clean_transaction(local_transaction_id);
 		
-		std::vector<Forwarder const *> forwarders = choose_forwarder(2);
+		std::vector<Forwarder const *> forwarders = choose_forwarder(q.name, 2);
 		if (forwarders.empty()) {
 			logprintf(LOG_DEFAULT, "No forwarder configured.\n");
 			SendNODATA();
@@ -1725,7 +1760,7 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 
 void Behind::process_query_tcp(InternalData *d, ProtocolFamilyType const &client_proto, dns::Message const &received, dns::Question const &q)
 {
-	std::vector<Forwarder const *> forwarders = choose_forwarder(1);
+	std::vector<Forwarder const *> forwarders = choose_forwarder(q.name, 1);
 	if (forwarders.empty()) {
 		logprintf(LOG_DEFAULT, "No forwarder configured for TCP.\n");
 		return;
@@ -1803,7 +1838,8 @@ void Behind::process_response(InternalData *d, ProtocolFamilyType const &upstrea
 	if (task->upstream_proto == upstream_proto && accept_dns_type(task->type)) {
 		bool tc = bool(received.header.flags & 0x0200);
 		if (tc) { // truncated
-			std::vector<Forwarder const *> forwarders = choose_forwarder(1);
+			std::string qname = task->forward_name;
+			std::vector<Forwarder const *> forwarders = choose_forwarder(qname, 1);
 			if (!forwarders.empty()) {
 				dns::Header header;
 				header.id = next_txid();
@@ -1878,6 +1914,7 @@ bool Behind::process_receive(InternalData *d, int upstream_fd)
 						char const *end = begin + len;
 						dns::Message sending;
 						parse_dns_message(begin, end, &sending);
+						drop_aa_flag(&sending);
 						sending.header.id = task->requester_id;
 						send_dns_message(d, task->client_proto, sending, false, false);
 						// cahce
@@ -1897,9 +1934,11 @@ bool Behind::process_receive(InternalData *d, int upstream_fd)
 			if (n > 0) {
 				dns::Message received;
 				parse_dns_message(buf, buf + n, &received);
+				drop_aa_flag(&received);
 				bool tc = bool(received.header.flags & 0x0200);
 				if (tc) {
-					std::vector<Forwarder const *> forwarders = choose_forwarder(1);
+					std::string qname = task->forward_name;
+					std::vector<Forwarder const *> forwarders = choose_forwarder(qname, 1);
 					if (!forwarders.empty()) {
 						dns::Header header;
 						header.id = next_txid();
@@ -1920,6 +1959,11 @@ bool Behind::process_receive(InternalData *d, int upstream_fd)
 	}
 	
 	return Done(false);
+}
+
+void Behind::drop_aa_flag(dns::Message *msg)
+{
+	msg->header.flags &= ~0x0400;
 }
 
 bool Behind::process(InternalData *d, ProtocolFamilyType const &client_proto)
@@ -1946,6 +1990,7 @@ bool Behind::process(InternalData *d, ProtocolFamilyType const &client_proto)
 				}
 			}
 		} else if (received.header.flags & 0x8000) { // response
+			drop_aa_flag(&received);
 			process_response(d, client_proto, received);
 			return true;
 		}
@@ -2229,6 +2274,16 @@ std::string to_string(std::vector<uint8_t> const &buf)
 
 void Behind::test()
 {
+	// split test
+	{
+		std::string s = "  abc    \"def  ghi\"  jkl  ";
+		std::vector<std::string_view> sv = misc::split(s);
+		EXPECT_EQ(sv.size(), 3);
+		EXPECT_EQ(std::string(sv[0]), "abc");
+		EXPECT_EQ(std::string(sv[1]), "\"def  ghi\"");
+		EXPECT_EQ(std::string(sv[2]), "jkl");
+	}
+
 	// decode_name test
 	
 	{

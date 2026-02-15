@@ -50,6 +50,45 @@ std::string misc::trimmed(char const *begin, char const *end)
 	return std::string(left, right);
 }
 
+std::vector<std::string_view> misc::split(char const *begin, char const *end)
+{
+	char const *left = begin;
+	char const *right = begin;
+	char const *ptr = begin;
+	std::vector<std::string_view> r;
+	int quote = 0;
+	while (1) {
+		int c = 0;
+		char const *next = ptr;
+		if (ptr < end) {
+			c = (unsigned char)*ptr;
+			next++;
+		}
+		if (quote) {
+			if (c == quote) {
+				quote = 0;
+			} else if (c == 0) {
+				break;
+			}
+			right = ptr = next;
+		} else if (!quote && (c == '"')) {
+			quote = c;
+		} else if (c == 0 || isspace(c)) {
+			if (left < right) {
+				r.emplace_back(left, right - left);
+			}
+			if (c == 0) {
+				break;
+			}
+			left = right = next;
+		} else {
+			right = next;
+		}
+		ptr = next;
+	}
+	return r;
+}
+
 std::string misc::realpath(const char *path)
 {
 	char tmp[PATH_MAX];

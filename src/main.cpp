@@ -22,7 +22,10 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 		return false;
 	};
 
-	if (section == "options") {
+	std::vector<std::string_view> section_parts = misc::split(section);
+	std::string const &sec = section_parts.empty() ? section : std::string(section_parts.front());
+
+	if (sec == "options") {
 		if (key == "directory") {
 			opt->working_dir = value;
 			return true;
@@ -36,22 +39,38 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 			logprintf(LOG_DEFAULT, "invalid port number: %s\n", value.c_str());
 			return false;
 		}
-	} else if (section == "logging") {
+	} else if (sec == "logging") {
 		if (key == "file") {
 			opt->log_file = value;
 			return true;
 		}
-	} else if (section == "forward-zone") {
+	} else if (sec == "forward-zone") {
 		if (key == "forward-addr") {
-			opt->forward_addr.push_back(value);
+			std::string zone;
+			if (section_parts.size() >= 2) {
+				zone = section_parts[1];
+				if (zone.size() >= 2 && zone.front() == '"' && zone.back() == '"') {
+					zone = std::string(zone.substr(1, zone.size() - 2));
+				}
+				zone = misc::strtolower(zone);
+			}
+			if (zone.empty()) {
+				zone = ".";
+			} else if (zone.back() != '.') {
+				zone += '.';
+			}
+			Option::Zone z;
+			z.zone = zone;
+			z.name = value;
+			opt->forward_addr.push_back(z);
 			return true;
 		}
-	} else if (section == "security") {
+	} else if (sec == "security") {
 		if (key == "case-randomize") {
 			opt->case_randomize = IsTrue(value);
 			return true;
 		}
-	} else if (section == "filter") {
+	} else if (sec == "filter") {
 		if (key == "nxdomain") {
 			opt->domain_filter.add_nxdomain(value);
 			return true;
@@ -60,14 +79,14 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 			opt->domain_filter.add_nodata_aaaa(value);
 			return true;
 		}
-	} else if (section == "hosts") {
+	} else if (sec == "hosts") {
 		opt->hosts[key] = value;
 		return true;
 	} else {
-		logprintf(LOG_DEFAULT, "unknown section: [%s]\n", section.c_str());
+		logprintf(LOG_DEFAULT, "unknown section: [%s]\n", sec.c_str());
 		return false;
 	}
-	logprintf(LOG_DEFAULT, "unknown option: [%s] %s\n", section.c_str(), key.c_str());
+	logprintf(LOG_DEFAULT, "unknown option: [%s] %s\n", sec.c_str(), key.c_str());
 	return false;
 }
 

@@ -68,7 +68,11 @@ struct Option {
 	int listen_port = DEFAUT_LISTEN_PORT;
 	std::string working_dir = "/var/lib/behind";
 	std::string log_file = "/var/log/behind/behind.log";
-	std::vector<std::string> forward_addr;
+	struct Zone {
+		std::string zone;
+		std::string name;
+	};
+	std::vector<Zone> forward_addr;
 	bool case_randomize = false;
 	DomainFilter domain_filter;
 	std::map<std::string, std::string> hosts;
@@ -93,6 +97,7 @@ enum class DNS_TYPE : uint16_t {
 char const *dns_type_to_string(DNS_TYPE type);
 
 struct Forwarder {
+	std::string zone;
 	sa_family_t af_type = AF_UNSPEC;
 	uint8_t addr[16] = {0};
 	int port = STANDARD_DNS_PORT;
@@ -190,7 +195,7 @@ private:
 	static void write_dns_question_rr(std::vector<char> *out, NameMap *namemap, std::string const &name, DNS_TYPE type, DNS_CLASS clas);
 	static bool write_dns_answer_rr(std::vector<char> *out, NameMap *namemap, std::string const &name, dns::Record const &item);
 	static int parse_question_section(char const *begin, char const *end, char const *ptr, dns::Question *out);
-	std::vector<const Forwarder *> choose_forwarder(int max) const;
+	std::vector<const Forwarder *> choose_forwarder(const std::string &name, size_t max) const;
 	void init_forwarder();
 	void clean();
 	void clean_transaction(uint32_t id);
@@ -237,6 +242,7 @@ private:
 	std::shared_ptr<Task> make_task(Operation op, uint32_t local_transaction_id);
 	void init_epoll_event(Task *task, int fd, uint32_t events);
 	void uptime();
+	void drop_aa_flag(dns::Message *msg);
 public:
 	Behind(Option const &opt);
 	~Behind();
