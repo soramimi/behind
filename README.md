@@ -81,6 +81,22 @@ forward-addr = 1.1.1.1              ; Cloudflare DNS (IPv4)
 forward-addr = 2606:4700:4700::1111  ; Cloudflare DNS (IPv6)
 ```
 
+You can also specify different upstream DNS servers for specific zones by adding a zone name to the section header. This allows you to route queries for different domains to different DNS servers:
+
+```ini
+[forward-zone "example.com."]
+forward-addr = 192.168.1.53         ; Internal DNS server for example.com
+
+[forward-zone "corp.local."]
+forward-addr = 10.0.0.1             ; Corporate DNS server
+
+[forward-zone]
+forward-addr = 8.8.8.8              ; Default DNS for all other queries
+forward-addr = 1.1.1.1
+```
+
+When a query matches a specific zone, BEHIND will use the forwarders configured for that zone. Otherwise, it will use the default forwarders (configured without a zone name).
+
 #### [security]
 Enable DNS security features:
 
