@@ -9,8 +9,6 @@
 #include <string.h>
 #include <unistd.h>
 
-InetResolver::Type parse_inet_address(std::string name, InetResolver::Addr *addr_out, int *port_out);
-
 bool set_option(std::string const &section, std::string const &key, std::string const &value, Option *opt)
 {
 	auto IsTrue = [](std::string const &val){
@@ -30,14 +28,21 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 			opt->working_dir = value;
 			return true;
 		}
-		if (key == "port") {
-			int port = DEFAUT_LISTEN_PORT;
-			if (misc::parse_int(value.c_str(), &port) > 0) {
-				opt->listen_port = port;
-				return true;
+		if (key == "listen") {
+			auto addrport = InetAddrPort::parse(value);
+			if (addrport.port == 0) {
+				addrport.port = DEFAUT_LISTEN_PORT;
 			}
-			logprintf(LOG_DEFAULT, "invalid port number: %s\n", value.c_str());
-			return false;
+			if (addrport.addr.type == InetResolver::IN4) {
+				opt->listen4 = addrport;
+				return true;
+			} else if (addrport.addr.type == InetResolver::IN6) {
+				opt->listen6 = addrport;
+				return true;
+			} else {
+				logprintf(LOG_DEFAULT, "invalid listen address: %s\n", value.c_str());
+				return false;
+			}
 		}
 	} else if (sec == "logging") {
 		if (key == "file") {

@@ -707,7 +707,6 @@ std::vector<Forwarder const *> Behind::choose_forwarder(std::string const &name,
 						}
 					}
 				}
-
 			}
 		}
 	}
@@ -743,99 +742,36 @@ size_t parse_space(char const *p)
 	return i;
 }
 
-InetResolver::Type parse_inet_address(std::string name, InetResolver::Addr *addr_out, int *port_out)
+InetAddrPort InetAddrPort::parse(std::string name)
 {
-	char const *host_begin = name.c_str();
-	char const *host_end = host_begin + name.size();
-	
-	// detect address type
-	char const *p = name.c_str();
-	bool in4 = true;
-	bool in6 = true;
-	bool bracket = false;
-	int dots = 0;
-	p += parse_space(p);
-	while (*p) {
-		int c = (unsigned char)*p++;
-		if (c == ']') {
-			host_end = p - 1;
-			in4 = false;
-			if (!bracket) {
-				in6 = false;
-				break;
-			}
-			if (*p == ':') {
-				break;
-			}
-			break;
-		} else if (c == '[') {
-			host_begin = p;
-			bracket = true;
-			in4 = false;
-		} else if (isdigit(c)) {
-			// ok
-		} else if (isxdigit(c)) {
-			in4 = false;
-		} else if (c == ':') {
-			if (in4) {
-				if (dots == 3) {
-					host_end = p;
-					break;
-				}
-				in4 = false;
-			}
-		} else if (c == '.') {
-			in6 = false;
-			dots++;
-			if (dots > 3) {
-				in4 = false;
-				break;
-			}
-		} else {
-			in4 = in6 = false;
-			break;
+	InetAddrPort ret;
+
+	std::regex re_ipv4(R"(^\s*((\d{1,3}\.){3}\d{1,3})([:@](\d+))?\s*$)");
+	std::regex re_ipv6(R"(^\s*(\[[0-9a-fA-F:]+\]|[0-9a-fA-F:]+)([:@](\d+))?\s*$)");
+
+	if (std::smatch m; std::regex_match(name, m, re_ipv4)) {
+		name = m[1];
+		if (m[4].matched) {
+			ret.port = std::stoi(m[4]);
 		}
-	}
-	if (dots != 3) {
-		in4 = false;
-	}
-	if (*p == ':') {
-		p++;
-		int port = STANDARD_DNS_PORT;
-		size_t len = misc::parse_int(p, &port);
-		if (len > 0) {
-			p += len;
-			if (port_out) {
-				*port_out = port;
-			}
-		} else {
-			in4 = in6 = false;
-		}
-	}
-	p += parse_space(p);
-	if (*p) {
-		in4 = in6 = false;
-	}
-	name = std::string(host_begin, host_end - host_begin);
-	
-	InetResolver::Addr addr;
-	if (in4) {
-		addr.type = InetResolver::IN4;
+		ret.addr.type = InetResolver::IN4;
 		struct sockaddr_in sa4 = {};
 		inet_pton(AF_INET, name.c_str(), &sa4.sin_addr);
-		addr.add_in4(&sa4.sin_addr.s_addr);
-	} else if (in6) {
-		addr.type = InetResolver::IN6;
+		ret.addr.add_in4(&sa4.sin_addr.s_addr);
+	} else if (std::smatch m; std::regex_match(name, m, re_ipv6)) {
+		name = m[1];
+		if (name.front() == '[' && name.back() == ']') {
+			name = name.substr(1, name.size() - 2);
+		}
+		if (m[3].matched) {
+			ret.port = std::stoi(m[3]);
+		}
+		ret.addr.type = InetResolver::IN6;
 		struct sockaddr_in6 sa6 = {};
 		inet_pton(AF_INET6, name.c_str(), &sa6.sin6_addr);
-		addr.add_in6(&sa6.sin6_addr.s6_addr);
+		ret.addr.add_in6(&sa6.sin6_addr.s6_addr);
 	}
-	
-	if (addr_out) {
-		*addr_out = addr;
-	}
-	
-	return addr.type;
+	return ret;
 }
 
 void Behind::init_forwarder()
@@ -844,8 +780,9 @@ void Behind::init_forwarder()
 		InetResolver::Addr addr;
 		int port = STANDARD_DNS_PORT;
 		
-		InetResolver::Type type = parse_inet_address(z.name, &addr, &port);
-		
+		auto addrport = InetAddrPort::parse(z.name);
+		InetResolver::Type type = addrport.addr.type;
+
 		m->resolver.resolve(z.name.c_str(), type, &addr);
 		
 		Forwarder forwarder;
@@ -2026,22 +1963,9 @@ void Behind::process_tcp(InternalData *d, sa_family_t family)
 	}
 }
 
-bool Behind::bind(void *private_in, ProtocolFamilyType const &proto, int sock)
-{
-	Behind::InternalData::In *in = static_cast<Behind::InternalData::In *>(private_in);
-	int r;
-	if (proto.is_inet4()) {
-		init_sa4(&in->sa4, nullptr, listen_port());
-		r = ::bind(sock, (struct sockaddr *)&in->sa4, sizeof(in->sa4));
-	} else {
-		init_sa6((sockaddr_in6 *)&in->sa6, nullptr, listen_port());
-		r = ::bind(sock, (struct sockaddr *)&in->sa6, sizeof(in->sa6));
-	}
-	if (r == SOCKET_ERROR) return false;
-	return true;
-}
 
-void Behind::init_socket(void *private_in, ProtocolFamilyType proto)
+
+bool Behind::init_socket(void *private_in, ProtocolFamilyType proto)
 {
 	Behind::InternalData::In *in = static_cast<Behind::InternalData::In *>(private_in);
 	
@@ -2059,18 +1983,41 @@ void Behind::init_socket(void *private_in, ProtocolFamilyType proto)
 			setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&yes, sizeof(yes));
 		}
 	}
+
+	auto Bind = [&](void *private_in, ProtocolFamilyType const &proto, int sock){
+		Behind::InternalData::In *in = static_cast<Behind::InternalData::In *>(private_in);
+		int r = SOCKET_ERROR;
+		if (proto.is_inet4()) {
+			if (m->option.listen4.addr) {
+				init_sa4(&in->sa4, (in_addr *)m->option.listen4.addr.to_in4(0), m->option.listen4.port);
+				r = ::bind(sock, (struct sockaddr *)&in->sa4, sizeof(in->sa4));
+			}
+		} else {
+			if (m->option.listen6.addr) {
+				init_sa6((sockaddr_in6 *)&in->sa6, (in6_addr *)m->option.listen6.addr.to_in6(0), m->option.listen6.port);
+				r = ::bind(sock, (struct sockaddr *)&in->sa6, sizeof(in->sa6));
+			}
+		}
+		if (r == SOCKET_ERROR) return false;
+		return true;
+	};
 	
-	if (!bind(in, proto, sock)) {
-		throw STRERROR("bind: ");
+	if (!Bind(in, proto, sock)) {
+		// throw STRERROR("bind: ");
+		return false;
 	}
+
+	char const *proto_str = nullptr;
 	
 	if (proto.is_dgram()) {
 		in->fd = sock;
+		proto_str = "udp";
 	} else if (proto.is_stream()) {
 		if (listen(sock, 5) == SOCKET_ERROR) {
 			throw STRERROR("listen: ");
 		}
 		in->listener_fd = sock;
+		proto_str = "tcp";
 	}
 	
 	InetResolver::Addr addr;
@@ -2080,7 +2027,8 @@ void Behind::init_socket(void *private_in, ProtocolFamilyType proto)
 		addr.add_in6(&in->sa6.sin6_addr);
 	}
 	std::string s = addr.to_string(0);
-	logprintf(LOG_BOTH, "listen port: %s@%d\n", s.c_str(), ntohs(in->sa4.sin_port));
+	logprintf(LOG_BOTH, "listen %s port: %s@%d\n", proto_str, s.c_str(), ntohs(in->sa4.sin_port));
+	return true;
 }
 
 void Behind::add_hosts(std::map<std::string, std::string> const &hosts)
@@ -2088,13 +2036,12 @@ void Behind::add_hosts(std::map<std::string, std::string> const &hosts)
 	for (auto const &pair : hosts) {
 		std::string const &name = pair.first;
 		std::string const &value = pair.second;
-		InetResolver::Addr addr;
-		auto type = parse_inet_address(value, &addr, nullptr);
-		if (type == InetResolver::UNDEFINED) {
+		auto addrport = InetAddrPort::parse(value);
+		if (!addrport) {
 			logprintf(LOG_DEFAULT, "invalid address in hosts: %s\n", value.c_str());
 			continue;
 		}
-		m->hosts[name] = addr;
+		m->hosts[name] = addrport.addr;
 	}
 }
 
@@ -2210,8 +2157,10 @@ void Behind::main()
 				fd = in->listener_fd;
 			}
 			in->ev.data.fd = fd;
-			if (ctl_add(fd, &in->ev, true, false) == -1) {
-				logprintf(LOG_DEFAULT, "epoll_ctl: %s\n", strerror(errno));
+			if (fd != -1) {
+				if (ctl_add(fd, &in->ev, true, false) == -1) {
+					logprintf(LOG_DEFAULT, "epoll_ctl: %s\n", strerror(errno));
+				}
 			}
 		};
 		AddEpoll(&d.in4_udp, SOCK_DGRAM);

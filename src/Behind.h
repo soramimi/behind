@@ -16,6 +16,18 @@
 #define STANDARD_DNS_PORT 53
 #define DEFAUT_LISTEN_PORT 5300
 
+struct InetAddrPort {
+	InetResolver::Addr addr;
+	uint16_t port = 0;
+	operator bool () const
+	{
+		return addr && port != 0;
+	}
+	static InetAddrPort parse(std::string name);
+};
+
+InetAddrPort parse_inet_address_and_port(std::string name);
+
 class ProtocolFamilyType {
 private:
 	sa_family_t af_family_ = AF_UNSPEC;
@@ -66,6 +78,8 @@ public:
 
 struct Option {
 	int listen_port = DEFAUT_LISTEN_PORT;
+	InetAddrPort listen4;
+	InetAddrPort listen6;
 	std::string working_dir = "/var/lib/behind";
 	std::string log_file = "/var/log/behind/behind.log";
 	struct Zone {
@@ -215,7 +229,7 @@ private:
 	void process_udp(InternalData *d, sa_family_t family);
 	void process_tcp(InternalData *d, sa_family_t family);
 
-	void init_socket(void *private_in, ProtocolFamilyType proto);
+	bool init_socket(void *private_in, ProtocolFamilyType proto);
 
 	const InetResolver::Addr *find_host(std::string const &name) const;
 	void add_hosts(const std::map<std::string, std::string> &hosts);
@@ -236,7 +250,7 @@ private:
 	uint16_t next_txid();
 	bool process_receive(InternalData *d, int upstream_fd);
 	std::shared_ptr<Task> take_task_by_fd(int fd);
-	bool bind(void *private_in, const ProtocolFamilyType &proto, int sock);
+
 	void reply_to_client_udp(InternalData *d, std::shared_ptr<Task> task, const dns::Message &received);
 	bool reply_from_cache(InternalData *d, const ProtocolFamilyType &client_proto, const dns::Header &header, const dns::Question &q);
 	std::shared_ptr<Task> make_task(Operation op, uint32_t local_transaction_id);
