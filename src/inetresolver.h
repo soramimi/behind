@@ -8,14 +8,14 @@
 class InetResolver {
 public:
 	enum Type {
-		UNDEFINED,
+		UNSPEC,
 		IN4,
 		IN6,
 	};
 	typedef void _in_addr;
 	typedef void _in6_addr;
 	struct Addr {
-		Type type = UNDEFINED;
+		Type type = UNSPEC;
 		std::vector<std::vector<uint8_t>> addr;
 		size_t size() const
 		{

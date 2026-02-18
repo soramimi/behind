@@ -12,6 +12,8 @@ std::string asprintf(char const *fmt, ...);
 
 uint64_t get_tick_count();
 
+std::string_view unquote(std::string_view s);
+std::string unquote(std::string s);
 std::string strtolower(std::string_view const &s);
 
 std::string trimmed(char const *begin, char const *end);

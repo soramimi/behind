@@ -1,4 +1,5 @@
 #include "Behind.h"
+#include "LineReader.h"
 #include "Logger.h"
 #include "TransactionIdGenerator.h"
 #include "misc.h"
@@ -746,8 +747,8 @@ InetAddrPort InetAddrPort::parse(std::string name)
 {
 	InetAddrPort ret;
 
-	std::regex re_ipv4(R"(^\s*((\d{1,3}\.){3}\d{1,3})([:@](\d+))?\s*$)");
-	std::regex re_ipv6(R"(^\s*(\[[0-9a-fA-F:]+\]|[0-9a-fA-F:]+)([:@](\d+))?\s*$)");
+	std::regex re_ipv4(R"(^\s*((\d{1,3}\.){3}\d{1,3})(@(\d+))?\s*$)");
+	std::regex re_ipv6(R"(^\s*(\[[0-9a-fA-F:]+\]|[0-9a-fA-F:]+)(@(\d+))?\s*$)");
 
 	if (std::smatch m; std::regex_match(name, m, re_ipv4)) {
 		name = m[1];
@@ -2031,17 +2032,63 @@ bool Behind::init_socket(void *private_in, ProtocolFamilyType proto)
 	return true;
 }
 
-void Behind::add_hosts(std::map<std::string, std::string> const &hosts)
+void Behind::update_hosts(std::map<std::string, Option::Host> const &hosts, std::vector<Option::HostsFile> const &hostsfiles)
 {
-	for (auto const &pair : hosts) {
-		std::string const &name = pair.first;
-		std::string const &value = pair.second;
-		auto addrport = InetAddrPort::parse(value);
-		if (!addrport) {
-			logprintf(LOG_DEFAULT, "invalid address in hosts: %s\n", value.c_str());
-			continue;
+	m->hosts.clear();
+
+	auto Name = [](std::string name, std::string suffix){
+		if (name[name.size() - 1] == '.') {
+			// thru
+		} else if (!suffix.empty()) {
+			name = name + '.' + suffix;
 		}
-		m->hosts[name] = addrport.addr;
+		return name;
+	};
+
+	for (auto const &pair : hosts) {
+		std::string name = pair.first;
+		if (!name.empty()) {
+			if (name[name.size() - 1] == '.') {
+				name = name.substr(0, name.size() - 1);
+			}
+			Option::Host h = pair.second;
+			std::string name = h.name;
+			if (name[name.size() - 1] == '.') {
+				// thru
+			} else if (!h.suffix.empty()) {
+				name = name + '.' + h.suffix;
+			}
+			std::string value = h.address;
+			auto addrport = InetAddrPort::parse(value);
+			if (!addrport) {
+				logprintf(LOG_DEFAULT, "invalid address in hosts: %s\n", value.c_str());
+				continue;
+			}
+			m->hosts[name] = addrport.addr;
+		}
+	}
+
+	for (Option::HostsFile const &hf : hostsfiles) {
+		LineReader reader;
+		reader.open(hf.path);
+		std::string line;
+		while (reader.getline(&line)) {
+			std::vector<std::string_view> words = misc::split(line);
+			if (words.size() >= 2) {
+				std::string_view ip = words[0];
+				InetAddrPort addrport = InetAddrPort::parse(std::string(ip));
+				if (addrport) {
+					for (size_t i = 1; i < words.size(); i++) {
+						std::string name(words[i]);
+						name = Name(name, hf.suffix);
+						m->hosts[name] = addrport.addr;
+					}
+				} else {
+					logprintf(LOG_DEFAULT, "invalid IP address in hosts file %s: %s\n", hf.path.c_str(), ip.data());
+				}
+			}
+		}
+
 	}
 }
 
@@ -2052,7 +2099,7 @@ int ev_fd(struct epoll_event *e)
 
 void Behind::main()
 {
-	add_hosts(m->option.hosts);
+	update_hosts(m->option.hosts, m->option.hostsfiles);
 
 	m->start_time = misc::get_tick_count();
 

@@ -32,6 +32,23 @@ uint64_t misc::get_tick_count()
 	return static_cast<uint64_t>(elapsed.count());
 }
 
+std::string_view misc::unquote(std::string_view s)
+{
+	if (s.size() >= 2 && s.front() == '"' && s.back() == '"') {
+		s.remove_prefix(1);
+		s.remove_suffix(1);
+	}
+	return s;
+}
+
+std::string misc::unquote(std::string s)
+{
+	if (s.size() >= 2 && s.front() == '"' && s.back() == '"') {
+		s = s.substr(1, s.size() - 2);
+	}
+	return s;
+}
+
 std::string misc::strtolower(std::string_view const &s)
 {
 	std::string r(s);

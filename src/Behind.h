@@ -21,12 +21,10 @@ struct InetAddrPort {
 	uint16_t port = 0;
 	operator bool () const
 	{
-		return addr && port != 0;
+		return addr.type != InetResolver::UNSPEC;
 	}
 	static InetAddrPort parse(std::string name);
 };
-
-InetAddrPort parse_inet_address_and_port(std::string name);
 
 class ProtocolFamilyType {
 private:
@@ -74,6 +72,10 @@ private:
 public:
 	InetResolver::Addr const *find(std::string const &name);
 	InetResolver::Addr &operator [] (std::string const &name);
+	void clear()
+	{
+		map_.clear();
+	}
 };
 
 struct Option {
@@ -89,7 +91,17 @@ struct Option {
 	std::vector<Zone> forward_addr;
 	bool case_randomize = false;
 	DomainFilter domain_filter;
-	std::map<std::string, std::string> hosts;
+	struct Host {
+		std::string name;
+		std::string suffix;
+		std::string address;
+	};
+	std::map<std::string, Host> hosts;
+	struct HostsFile {
+		std::string suffix;
+		std::string path;
+	};
+	std::vector<HostsFile> hostsfiles;
 };
 
 enum class DNS_CLASS : uint16_t {
@@ -232,7 +244,7 @@ private:
 	bool init_socket(void *private_in, ProtocolFamilyType proto);
 
 	const InetResolver::Addr *find_host(std::string const &name) const;
-	void add_hosts(const std::map<std::string, std::string> &hosts);
+	void update_hosts(const std::map<std::string, Option::Host> &hosts, const std::vector<Option::HostsFile> &hostsfiles);
 	uint32_t next_local_transaction_id();
 	int ctl_add(int fd, epoll_event *e, bool in, bool out);
 	int ctl_del(int fd, epoll_event *e);

@@ -54,9 +54,7 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 			std::string zone;
 			if (section_parts.size() >= 2) {
 				zone = section_parts[1];
-				if (zone.size() >= 2 && zone.front() == '"' && zone.back() == '"') {
-					zone = std::string(zone.substr(1, zone.size() - 2));
-				}
+				zone = misc::unquote(zone);
 				zone = misc::strtolower(zone);
 			}
 			if (zone.empty()) {
@@ -85,7 +83,26 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 			return true;
 		}
 	} else if (sec == "hosts") {
-		opt->hosts[key] = value;
+		std::string suffix;
+		if (section_parts.size() >= 2) {
+			suffix = misc::unquote(section_parts[1]);
+		}
+		if (key[0] == '"') {
+			std::string name = misc::unquote(key);
+			if (!name.empty()) {
+				Option::Host h;
+				h.name = name;
+				h.suffix = suffix;
+				h.address = value;
+				opt->hosts[name] = h;
+			}
+		} else if (key == "file") {
+			logprintf(LOG_STDERR, "--- file = %s\n", value.c_str());
+			Option::HostsFile hf;
+			hf.suffix = suffix;
+			hf.path = value;
+			opt->hostsfiles.push_back(hf);
+		}
 		return true;
 	} else {
 		logprintf(LOG_DEFAULT, "unknown section: [%s]\n", sec.c_str());

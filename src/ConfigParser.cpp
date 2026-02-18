@@ -52,6 +52,9 @@ bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 					}
 				} else if (c == '\"' || c == '\'') {
 					quote = c;
+					if (!key) {
+						key = pre;
+					}
 				} else if (c == ';') {
 					comment = pre;
 					break;
