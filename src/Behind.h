@@ -96,7 +96,7 @@ struct Option {
 		std::string suffix;
 		std::string address;
 	};
-	std::map<std::string, Host> hosts;
+	std::vector<Host> hosts;
 	struct HostsFile {
 		std::string suffix;
 		std::string path;
@@ -244,7 +244,7 @@ private:
 	bool init_socket(void *private_in, ProtocolFamilyType proto);
 
 	const InetResolver::Addr *find_host(std::string const &name) const;
-	void update_hosts(const std::map<std::string, Option::Host> &hosts, const std::vector<Option::HostsFile> &hostsfiles);
+	void update_hosts(const std::vector<Option::Host> &hosts, const std::vector<Option::HostsFile> &hostsfiles);
 	uint32_t next_local_transaction_id();
 	int ctl_add(int fd, epoll_event *e, bool in, bool out);
 	int ctl_del(int fd, epoll_event *e);

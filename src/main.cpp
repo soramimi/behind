@@ -94,7 +94,7 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 				h.name = name;
 				h.suffix = suffix;
 				h.address = value;
-				opt->hosts[name] = h;
+				opt->hosts.push_back(h);
 			}
 		} else if (key == "file") {
 			logprintf(LOG_STDERR, "--- file = %s\n", value.c_str());

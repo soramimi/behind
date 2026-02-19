@@ -2032,7 +2032,7 @@ bool Behind::init_socket(void *private_in, ProtocolFamilyType proto)
 	return true;
 }
 
-void Behind::update_hosts(std::map<std::string, Option::Host> const &hosts, std::vector<Option::HostsFile> const &hostsfiles)
+void Behind::update_hosts(std::vector<Option::Host> const &hosts, std::vector<Option::HostsFile> const &hostsfiles)
 {
 	m->hosts.clear();
 
@@ -2045,20 +2045,19 @@ void Behind::update_hosts(std::map<std::string, Option::Host> const &hosts, std:
 		return name;
 	};
 
-	for (auto const &pair : hosts) {
-		std::string name = pair.first;
+	for (Option::Host const &host : hosts) {
+		std::string name = host.name;
 		if (!name.empty()) {
 			if (name[name.size() - 1] == '.') {
 				name = name.substr(0, name.size() - 1);
 			}
-			Option::Host h = pair.second;
-			std::string name = h.name;
+			std::string name = host.name;
 			if (name[name.size() - 1] == '.') {
 				// thru
-			} else if (!h.suffix.empty()) {
-				name = name + '.' + h.suffix;
+			} else if (!host.suffix.empty()) {
+				name = Name(name, host.suffix);
 			}
-			std::string value = h.address;
+			std::string value = host.address;
 			auto addrport = InetAddrPort::parse(value);
 			if (!addrport) {
 				logprintf(LOG_DEFAULT, "invalid address in hosts: %s\n", value.c_str());
