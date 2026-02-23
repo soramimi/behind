@@ -26,7 +26,7 @@ bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 			char const *comment = nullptr;
 			char const *sec = nullptr;
 			char const *key = nullptr;
-			char const *sep = nullptr;
+			char const *eq = nullptr;
 			char quote = 0;
 			while (1) {
 				int c = 0;
@@ -37,12 +37,14 @@ bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 				}
 				if (c == 0) {
 					if (key) {
-						std::string k = misc::trimmed(key, sep);
-						std::string v = misc::trimmed(sep + 1, comment ? comment : pre);
+						std::string_view k = misc::trimmed({key, eq - key});
+						eq++; // skip '='
+						std::string_view v = misc::trimmed({eq, (comment ? comment : pre) - eq});
+						eq = nullptr;
 						if (v.size() >= 2 && v[0] == '\"' && v[v.size() - 1] == '\"') {
 							v = v.substr(1, v.size() - 2);
 						}
-						fn_assign(section, k, v, cookie);
+						fn_assign(section, std::string{k}, std::string{v}, cookie);
 						break;
 					}
 					if (c == 0) break;
@@ -74,7 +76,7 @@ bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 					}
 				} else if (c == '=') {
 					if (key) {
-						sep = pre;
+						eq = pre;
 					}
 				} else if (!isspace(c) && !key) {
 					key = pre;

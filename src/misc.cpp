@@ -58,13 +58,15 @@ std::string misc::strtolower(std::string_view const &s)
 	return r;
 }
 
-std::string misc::trimmed(char const *begin, char const *end)
+std::string_view misc::trimmed(std::string_view const &sv)
 {
+	char const *begin = sv.data();
+	char const *end = begin + sv.size();
 	char const *left = begin;
 	char const *right = end;
 	while (left < right && isspace((unsigned char)*left)) left++;
 	while (left < right && isspace((unsigned char)right[-1])) right--;
-	return std::string(left, right);
+	return {left, right - left};
 }
 
 std::vector<std::string_view> misc::split(char const *begin, char const *end)
