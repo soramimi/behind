@@ -816,7 +816,7 @@ int Behind::ctl_add(int fd, struct epoll_event *e, bool in, bool out)
 	};
 	if (in)  Add(&m->select_in_fds, fd);
 	if (out) Add(&m->select_out_fds, fd);
-	logprintf(LOG_DEFAULT, "(debug) fd tracking: + %d, in=%d, out=%d\n", fd, (int)m->select_in_fds.size(), (int)m->select_out_fds.size());
+	logprintf(LOG_DEFAULT, "(debug) fd tracking: add %d, in=%d, out=%d\n", fd, (int)m->select_in_fds.size(), (int)m->select_out_fds.size());
 	
 	if (e && m->epoll_fd != -1) {
 		ret = epoll_ctl(m->epoll_fd, EPOLL_CTL_ADD, e->data.fd, e);
@@ -835,7 +835,7 @@ int Behind::ctl_del(int fd, struct epoll_event *e)
 	};
 	Remove(&m->select_in_fds, fd);
 	Remove(&m->select_out_fds, fd);
-	logprintf(LOG_DEFAULT, "(debug) fd tracking: - %d, in=%d, out=%d\n", fd, (int)m->select_in_fds.size(), (int)m->select_out_fds.size());
+	logprintf(LOG_DEFAULT, "(debug) fd tracking: del %d, in=%d, out=%d\n", fd, (int)m->select_in_fds.size(), (int)m->select_out_fds.size());
 	
 	if (e && m->epoll_fd != -1) {
 		ret = epoll_ctl(m->epoll_fd, EPOLL_CTL_DEL, e->data.fd, e);
@@ -847,6 +847,13 @@ void Behind::delete_socket(int fd, struct epoll_event *e)
 {
 	ctl_del(fd, e);
 	closesocket(fd);
+}
+
+void Behind::delete_socket(std::shared_ptr<Task> task)
+{
+	if (task) {
+		delete_socket(task->upstream_fd, task->ev.get());
+	}
 }
 
 void Behind::uptime()
@@ -873,8 +880,7 @@ void Behind::clean()
 	while (i > 0) {
 		i--;
 		if (now - m->tasks[i]->timestamp >= m->tasks[i]->timeout) {
-			Task *task = m->tasks[i].get();
-			delete_socket(task->upstream_fd, task->ev.get());
+			delete_socket(m->tasks[i]);
 			m->tasks.erase(m->tasks.begin() + i);
 		}
 	}
@@ -886,18 +892,26 @@ void Behind::clean_transaction(uint32_t id)
 	while (i > 0) {
 		i--;
 		if (id == m->tasks[i]->local_transaction_id) {
+			delete_socket(m->tasks[i]);
 			m->tasks.erase(m->tasks.begin() + i);
 		}
 	}
 }
 
+std::shared_ptr<Behind::Task> Behind::take_task_item(std::vector<std::shared_ptr<Behind::Task>> *tasks, size_t index)
+{
+	std::shared_ptr<Behind::Task> item = std::move(tasks->at(index));
+	std::swap(tasks->at(index), tasks->back());
+	tasks->pop_back();
+	clean_transaction(item->local_transaction_id);
+	return item;
+}
+
 std::shared_ptr<Behind::Task> Behind::take_task_by_id(uint16_t upstream_id)
 {
-	for (std::shared_ptr<Task> q : m->tasks) {
-		if (upstream_id == q->upstream_id) {
-			std::shared_ptr<Task> ret = q;
-			clean_transaction(q->local_transaction_id);
-			return ret;
+	for (size_t i = 0; i < m->tasks.size(); i++) {
+		if (m->tasks[i]->upstream_id == upstream_id) {
+			return take_task_item(&m->tasks, i);
 		}
 	}
 	return {};
@@ -905,20 +919,23 @@ std::shared_ptr<Behind::Task> Behind::take_task_by_id(uint16_t upstream_id)
 
 std::shared_ptr<Behind::Task> Behind::take_task_by_fd(int fd)
 {
-	for (std::shared_ptr<Task> q : m->tasks) {
-		if (q->upstream_fd == fd) {
-			assert(q->upstream_fd == q->ev->data.fd);
-			Task ret(*q);
-			clean_transaction(q->local_transaction_id);
-			return std::make_shared<Task>(ret);
+	for (size_t i = 0; i < m->tasks.size(); i++) {
+		if (m->tasks[i]->upstream_fd == fd) {
+			return take_task_item(&m->tasks, i);
 		}
 	}
 	return {};
 }
 
-void Behind::push_task(std::shared_ptr<Task> task, int timeout)
+void Behind::push_task(std::shared_ptr<Task> task, int timeout, uint32_t epoll_events)
 {
-	take_task_by_id(task->upstream_id);
+	{
+		auto t = take_task_by_id(task->upstream_id);
+		delete_socket(t);
+	}
+
+	init_epoll_event(task.get(), task->upstream_fd, epoll_events);
+	ctl_add(task->upstream_fd, task->ev.get(), true, false);
 
 	task->timestamp = misc::get_tick_count();
 	task->timeout = timeout;
@@ -1496,9 +1513,7 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 		}
 		t->request_name = question.name;
 		t->forward_name = query_name;
-		init_epoll_event(t.get(), t->upstream_fd, EPOLLIN | EPOLLERR | EPOLLHUP);
-		ctl_add(t->upstream_fd, t->ev.get(), true, false);
-		push_task(t, 1000);
+		push_task(t, 1000, EPOLLIN | EPOLLERR | EPOLLHUP);
 	}
 }
 
@@ -1559,9 +1574,7 @@ void Behind::forward_tcp(InternalData *d, ProtocolFamilyType const &client_proto
 				task->connect_in_progress = true;
 				task->upstream_proto = upstream_proto;
 				task->upstream_fd = sock;
-				init_epoll_event(task.get(), sock, EPOLLOUT | EPOLLERR | EPOLLHUP);
-				ctl_add(sock, task->ev.get(), false, true);
-				push_task(task, 1000);
+				push_task(task, 1000, EPOLLOUT | EPOLLERR | EPOLLHUP);
 			} else {
 				logprintf(LOG_DEFAULT, "connect: %s\n", strerror(errno));
 			}
@@ -1797,25 +1810,21 @@ void Behind::process_response(InternalData *d, ProtocolFamilyType const &upstrea
 	}
 }
 
-bool Behind::process_receive(InternalData *d, int upstream_fd)
+void Behind::process_receive(InternalData *d, int upstream_fd)
 {
-	std::shared_ptr<Task> task;
-	
-	auto Done = [&](bool ret){
-		delete_socket(upstream_fd, task ? task->ev.get() : nullptr);
-		return ret;
-	};
-	
-	task = take_task_by_fd(upstream_fd);
+	std::shared_ptr<Task> task = take_task_by_fd(upstream_fd);
 	if (task) {
-		
 		assert(task->upstream_fd == upstream_fd);
+
+		auto Done = [&](bool deletesocket){
+			if (deletesocket) {
+				delete_socket(task);
+			}
+		};
 		
 		if (task->op == Operation::READING_FROM_CLIENT) {
-			if (!process(d, task->upstream_proto)) {
-				closesocket(task->upstream_fd);
-			}
-			return true;
+			process(d, task->upstream_proto);
+			return Done(true);
 		}
 		
 		if (task->op == Operation::FORWARD_TO_UPSTREAM_TCP) {
@@ -1829,14 +1838,12 @@ bool Behind::process_receive(InternalData *d, int upstream_fd)
 						ctl_del(upstream_fd, task->ev.get());
 						task->connect_in_progress = false;
 						task->op = Operation::REPLY_TO_CLIENT_TCP;
-						init_epoll_event(task.get(), upstream_fd, EPOLLIN | EPOLLERR | EPOLLHUP);
-						ctl_add(upstream_fd, task->ev.get(), true, false);
-						push_task(task, 1000);
-						return true;
+						push_task(task, 1000, EPOLLIN | EPOLLERR | EPOLLHUP);
+						return Done(false);
 					}
 				}
 			}
-			return Done(false);
+			return Done(true);
 		}
 		
 		if (task->op == Operation::REPLY_TO_CLIENT_TCP) {
@@ -1896,7 +1903,7 @@ bool Behind::process_receive(InternalData *d, int upstream_fd)
 		}
 	}
 	
-	return Done(false);
+	delete_socket(upstream_fd, nullptr);
 }
 
 void Behind::drop_aa_flag(dns::Message *msg)
@@ -1958,9 +1965,7 @@ void Behind::process_tcp(InternalData *d, sa_family_t family)
 		std::shared_ptr<Task> task = make_task(Operation::READING_FROM_CLIENT, next_local_transaction_id());
 		task->upstream_fd = sock;
 		task->upstream_proto = {family, SOCK_STREAM};
-		init_epoll_event(task.get(), sock, EPOLLIN | EPOLLERR | EPOLLHUP);
-		ctl_add(sock, task->ev.get(), true, false);
-		push_task(task, 3000);
+		push_task(task, 3000, EPOLLIN | EPOLLERR | EPOLLHUP);
 	}
 }
 
@@ -2087,7 +2092,6 @@ void Behind::update_hosts(std::vector<Option::Host> const &hosts, std::vector<Op
 				}
 			}
 		}
-
 	}
 }
 
@@ -2169,17 +2173,13 @@ void Behind::main()
 			for (int fd : infdvec) {
 				if (FD_ISSET(fd, &infds)) {
 					FD_CLR(fd, &infds);
-					if (!process_receive(&d, fd)) {
-						delete_socket(fd, nullptr);
-					}
+					process_receive(&d, fd);
 				}
 			}
 			for (int fd : outfdvec) {
 				if (FD_ISSET(fd, &outfds)) {
 					FD_CLR(fd, &outfds);
-					if (!process_receive(&d, fd)) {
-						delete_socket(fd, nullptr);
-					}
+					process_receive(&d, fd);
 				}
 			}
 			uptime();
@@ -2233,9 +2233,7 @@ void Behind::main()
 				} else if (fd == d.in6_tcp.listener_fd) {
 					process_tcp(&d, AF_INET6);
 				} else {
-					if (!process_receive(&d, fd)) {
-						delete_socket(fd, nullptr);
-					}
+					process_receive(&d, fd);
 				}
 			}
 			uptime();
@@ -2244,15 +2242,20 @@ void Behind::main()
 		::close(m->epoll_fd);
 	}
 	
+	auto CloseSockets = [](std::vector<int> *v){
+		for (int fd : *v) {
+			closesocket(fd);
+		}
+		v->clear();
+	};
+
+	CloseSockets(&m->select_in_fds);
+	CloseSockets(&m->select_out_fds);
+
 	closesocket(d.in4_udp.fd);
 	closesocket(d.in6_udp.fd);
 	closesocket(d.in4_udp.listener_fd);
 	closesocket(d.in6_udp.listener_fd);
-	
-	for (int fd : m->select_in_fds) {
-		closesocket(fd);
-	}
-	m->select_in_fds.clear();
 }
 
 // test

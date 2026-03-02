@@ -226,7 +226,7 @@ private:
 	void clean();
 	void clean_transaction(uint32_t id);
 	std::shared_ptr<Task> take_task_by_id(uint16_t upstream_id);
-	void push_task(std::shared_ptr<Task> task, int timeout);
+	void push_task(std::shared_ptr<Task> task, int timeout, uint32_t epoll_events);
 	static void parse_dns_message(char const *begin, char const *end, dns::Message *msg);
 
 	bool is_nxdomain(std::string const &name) const;
@@ -249,6 +249,7 @@ private:
 	int ctl_add(int fd, epoll_event *e, bool in, bool out);
 	int ctl_del(int fd, epoll_event *e);
 	void delete_socket(int fd, struct epoll_event *e);
+	void delete_socket(std::shared_ptr<Task> task);
 	bool accept_dns_type(DNS_TYPE t);
 
 	void forward_tcp(InternalData *d, const ProtocolFamilyType &client_proto, uint16_t client_request_id, dns::Header const &header, const dns::Question &question, uint32_t local_transaction_id, const Forwarder &forwarder);
@@ -260,7 +261,7 @@ private:
 	void process_query_tcp(InternalData *d, const ProtocolFamilyType &client_proto, const dns::Message &received, const dns::Question &q);
 	void process_response(InternalData *d, const ProtocolFamilyType &upstream_proto, const dns::Message &received);
 	uint16_t next_txid();
-	bool process_receive(InternalData *d, int upstream_fd);
+	void process_receive(InternalData *d, int upstream_fd);
 	std::shared_ptr<Task> take_task_by_fd(int fd);
 
 	void reply_to_client_udp(InternalData *d, std::shared_ptr<Task> task, const dns::Message &received);
@@ -269,6 +270,7 @@ private:
 	void init_epoll_event(Task *task, int fd, uint32_t events);
 	void uptime();
 	void drop_aa_flag(dns::Message *msg);
+	std::shared_ptr<Task> take_task_item(std::vector<std::shared_ptr<Behind::Task> > *tasks, size_t index);
 public:
 	Behind(Option const &opt);
 	~Behind();
