@@ -68,10 +68,13 @@ inline bool operator == (const ProtocolFamilyType &l, const ProtocolFamilyType &
 
 class Hosts {
 private:
-	std::unordered_map<std::string, InetResolver::Addr> map_;
 public:
-	InetResolver::Addr const *find(std::string const &name);
-	InetResolver::Addr &operator [] (std::string const &name);
+	std::string path;
+	time_t mtime = 0;
+	std::unordered_map<std::string, InetResolver::Addr> map_;
+	InetResolver::Addr const *find(std::string const &name) const;
+	void set(std::string const &name, InetResolver::Addr const &addr);
+
 	void clear()
 	{
 		map_.clear();
@@ -182,7 +185,10 @@ private:
 private:
 	static inline bool eqi(std::string const &l, std::string const &r);
 	uint16_t listen_port() const;
-	int ttl() const;
+	int cache_min_ttl() const
+	{
+		return 10;
+	}
 	static void write(std::vector<char> *out, char c);
 	static void write(std::vector<char> *out, char const *src, int len);
 	static void write_us(std::vector<char> *out, uint16_t v);
@@ -243,8 +249,8 @@ private:
 
 	bool init_socket(void *private_in, ProtocolFamilyType proto);
 
-	const InetResolver::Addr *find_host(std::string const &name) const;
-	void update_hosts(const std::vector<Option::Host> &hosts, const std::vector<Option::HostsFile> &hostsfiles);
+	const InetResolver::Addr *find_host(std::string const &name);
+	void initialize_hosts();
 	uint32_t next_local_transaction_id();
 	int ctl_add(int fd, epoll_event *e, bool in, bool out);
 	int ctl_del(int fd, epoll_event *e);
@@ -271,6 +277,8 @@ private:
 	void uptime();
 	void drop_aa_flag(dns::Message *msg);
 	std::shared_ptr<Task> take_task_item(std::vector<std::shared_ptr<Behind::Task> > *tasks, size_t index);
+	Hosts load_hosts_file(const std::string &suffix, const std::string &path);
+	void update_hosts_files(bool force);
 public:
 	Behind(Option const &opt);
 	~Behind();

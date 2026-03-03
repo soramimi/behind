@@ -18,6 +18,7 @@
 #include <mutex>
 #include <thread>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #define stricmp(A, B) strcasecmp(A, B)
 #define STRERROR(S) (std::string(S) + strerror(errno))
@@ -290,7 +291,7 @@ public:
 		}
 		return std::nullopt;
 	}
-	void insert(std::string const &name, Message const &msg)
+	void insert(std::string const &name, Message const &msg, int cache_min_ttl)
 	{
 		auto now = misc::get_tick_count();
 		auto key = make_key(name);
@@ -325,7 +326,8 @@ public:
 		item->answers = msg.answers;
 		item->authorities = msg.authorities;
 		for (size_t i = 0; i < item->answers.size(); i++) {
-			item->answers[i].expire = now + item->answers[i].ttl * 1000;
+			uint32_t ttl =std::max(item->answers[i].ttl, (uint32_t)cache_min_ttl);
+			item->answers[i].expire = now + ttl * 1000;
 			item->expire = std::min(item->expire, item->answers[i].expire);
 		}
 	}
@@ -382,7 +384,7 @@ struct Behind::Private {
 	uint64_t start_time = 0;
 	uint64_t last_uptime_min = 0;
 
-	Hosts hosts;
+	std::vector<Hosts> hosts;
 	uint32_t local_transaction_id = 0;
 	TransactionIdGenerator txid_gen;
 	InetResolver resolver;
@@ -394,7 +396,6 @@ struct Behind::Private {
 	std::vector<int> select_out_fds;
 	std::vector<epoll_event> epoll_events{100};
 	
-	int ttl = 5 * 60;
 	struct {
 		dns::Cache a;
 		dns::Cache aaaa;
@@ -406,7 +407,7 @@ struct Behind::Private {
 	std::vector<Forwarder> forwarders;
 };
 
-const InetResolver::Addr *Hosts::find(const std::string &name)
+const InetResolver::Addr *Hosts::find(const std::string &name) const
 {
 	std::string key = misc::strtolower(name);
 	auto it = map_.find(key);
@@ -416,9 +417,9 @@ const InetResolver::Addr *Hosts::find(const std::string &name)
 	return nullptr;
 }
 
-InetResolver::Addr &Hosts::operator [](const std::string &name)
+void Hosts::set(const std::string &name, const InetResolver::Addr &addr)
 {
-	return map_[misc::strtolower(name)];
+	map_[misc::strtolower(name)] = addr;
 }
 
 Behind::Behind(const Option &opt)
@@ -444,10 +445,7 @@ uint16_t Behind::listen_port() const
 	return m->option.listen_port;
 }
 
-int Behind::ttl() const
-{
-	return m->ttl;
-}
+
 
 void Behind::write(std::vector<char> *out, char c)
 {
@@ -1356,9 +1354,15 @@ bool Behind::send_dns_message(InternalData *d, ProtocolFamilyType const &proto, 
 
 
 
-InetResolver::Addr const *Behind::find_host(std::string const &name) const
+InetResolver::Addr const *Behind::find_host(std::string const &name)
 {
-	return m->hosts.find(name);
+	update_hosts_files(false);
+
+	for (Hosts const &hosts : m->hosts) {
+		InetResolver::Addr const *ret = hosts.find(name);
+		if (ret) return ret;
+	}
+	return nullptr;
 }
 
 uint32_t Behind::next_local_transaction_id()
@@ -1657,14 +1661,14 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 		}
 		logprintf(LOG_DEFAULT, "Q: %s %s\n", q.name.c_str(), dns_type_to_string(q.type));
 		// check known hosts
-		InetResolver::Addr const *addr = m->hosts.find(q.name);
+		InetResolver::Addr const *addr = find_host(q.name);
 		if (addr) {
 			std::vector<dns::Record> rec;
 			if ((q.type == DNS_TYPE::A && addr->type == InetResolver::IN4) || (q.type == DNS_TYPE::AAAA && addr->type == InetResolver::IN6)) {
 				dns::Record r;
 				r.name = q.name;
 				r.type = q.type;
-				r.ttl = ttl();
+				r.ttl = cache_min_ttl();
 				for (std::vector<uint8_t> const &a : addr->addr) {
 					r.bin = a;
 					rec.push_back(r);
@@ -1777,7 +1781,7 @@ void Behind::reply_to_client_udp(InternalData *d, std::shared_ptr<Task> task, dn
 		// cahce
 		dns::Cache *cache = get_cache(task->type);
 		if (cache) {
-			cache->insert(task->forward_name, sending);
+			cache->insert(task->forward_name, sending, cache_min_ttl());
 		}
 	}
 }
@@ -1865,7 +1869,7 @@ void Behind::process_receive(InternalData *d, int upstream_fd)
 						// cahce
 						dns::Cache *cache = get_cache(task->type);
 						if (cache) {
-							cache->insert(task->forward_name, sending);
+							cache->insert(task->forward_name, sending, cache_min_ttl());
 						}
 					}
 				}
@@ -2037,18 +2041,94 @@ bool Behind::init_socket(void *private_in, ProtocolFamilyType proto)
 	return true;
 }
 
-void Behind::update_hosts(std::vector<Option::Host> const &hosts, std::vector<Option::HostsFile> const &hostsfiles)
+static std::string make_host_name(std::string name, std::string suffix)
 {
-	m->hosts.clear();
+	if (name[name.size() - 1] == '.') {
+		// thru
+	} else if (!suffix.empty()) {
+		name = name + '.' + suffix;
+	}
+	return name;
+}
 
-	auto Name = [](std::string name, std::string suffix){
-		if (name[name.size() - 1] == '.') {
-			// thru
-		} else if (!suffix.empty()) {
-			name = name + '.' + suffix;
+Hosts Behind::load_hosts_file(std::string const &suffix, std::string const &path)
+{
+	Hosts hosts;
+	hosts.path = path;
+
+	LineReader reader;
+	reader.open(path);
+	std::string line;
+	while (reader.getline(&line)) {
+		std::vector<std::string_view> words = misc::split(line);
+		if (words.size() >= 2) {
+			std::string_view ip = words[0];
+			InetAddrPort addrport = InetAddrPort::parse(std::string(ip));
+			if (addrport) {
+				for (size_t i = 1; i < words.size(); i++) {
+					std::string name(words[i]);
+					name = make_host_name(name, suffix);
+					hosts.set(name, addrport.addr);
+				}
+			} else {
+				logprintf(LOG_DEFAULT, "invalid IP address in hosts file %s: %s\n", path.c_str(), ip.data());
+			}
 		}
-		return name;
-	};
+	}
+
+	return hosts;
+}
+
+void Behind::update_hosts_files(bool force)
+{
+	std::vector<Option::HostsFile> const &hostsfiles = m->option.hostsfiles;
+
+	for (Option::HostsFile const &hf : hostsfiles) {
+
+		struct stat st;
+		if (stat(hf.path.c_str(), &st) != 0) {
+			logprintf(LOG_DEFAULT, "cannot stat hosts file %s: %s\n", hf.path.c_str(), strerror(errno));
+			continue;
+		}
+
+		enum {
+			None,
+			Insert,
+			Update,
+		} perform = Insert;
+
+		size_t index = 0;
+
+		for (index = 0; index < m->hosts.size(); index++) {
+			Hosts const &hosts = m->hosts[index];
+			if (hosts.path == hf.path) {
+				if (force || hosts.mtime < st.st_mtime) {
+					perform = Update;
+				} else {
+					perform = None;
+				}
+				break;
+			}
+		}
+
+		if (perform != None) {
+			Hosts hosts = load_hosts_file(hf.suffix, hf.path);
+			hosts.mtime = st.st_mtime;
+			if (perform == Insert) {
+				m->hosts.push_back(std::move(hosts));
+			} else if (perform == Update) {
+				m->hosts[index] = std::move(hosts);
+			}
+		}
+	}
+}
+
+void Behind::initialize_hosts()
+{
+	std::vector<Option::Host> const &hosts = m->option.hosts;
+	std::vector<Option::HostsFile> const &hostsfiles = m->option.hostsfiles;
+
+	m->hosts.clear();
 
 	for (Option::Host const &host : hosts) {
 		std::string name = host.name;
@@ -2060,7 +2140,7 @@ void Behind::update_hosts(std::vector<Option::Host> const &hosts, std::vector<Op
 			if (name[name.size() - 1] == '.') {
 				// thru
 			} else if (!host.suffix.empty()) {
-				name = Name(name, host.suffix);
+				name = make_host_name(name, host.suffix);
 			}
 			std::string value = host.address;
 			auto addrport = InetAddrPort::parse(value);
@@ -2068,31 +2148,14 @@ void Behind::update_hosts(std::vector<Option::Host> const &hosts, std::vector<Op
 				logprintf(LOG_DEFAULT, "invalid address in hosts: %s\n", value.c_str());
 				continue;
 			}
-			m->hosts[name] = addrport.addr;
+			if (m->hosts.empty()) {
+				m->hosts.emplace_back();
+			}
+			m->hosts.back().set(name, addrport.addr);
 		}
 	}
 
-	for (Option::HostsFile const &hf : hostsfiles) {
-		LineReader reader;
-		reader.open(hf.path);
-		std::string line;
-		while (reader.getline(&line)) {
-			std::vector<std::string_view> words = misc::split(line);
-			if (words.size() >= 2) {
-				std::string_view ip = words[0];
-				InetAddrPort addrport = InetAddrPort::parse(std::string(ip));
-				if (addrport) {
-					for (size_t i = 1; i < words.size(); i++) {
-						std::string name(words[i]);
-						name = Name(name, hf.suffix);
-						m->hosts[name] = addrport.addr;
-					}
-				} else {
-					logprintf(LOG_DEFAULT, "invalid IP address in hosts file %s: %s\n", hf.path.c_str(), ip.data());
-				}
-			}
-		}
-	}
+	update_hosts_files(true);
 }
 
 int ev_fd(struct epoll_event *e)
@@ -2102,7 +2165,7 @@ int ev_fd(struct epoll_event *e)
 
 void Behind::main()
 {
-	update_hosts(m->option.hosts, m->option.hostsfiles);
+	initialize_hosts();
 
 	m->start_time = misc::get_tick_count();
 
