@@ -5,6 +5,16 @@
 
 std::string domain_suffix_key(std::string const &name)
 {
+	static struct KnownSuffix {
+		std::vector<std::string> vec;
+		KnownSuffix()
+		{
+			vec.push_back("lan");
+			vec.push_back("arpa");
+			vec.push_back("local");
+		}
+	} known_suffix;
+
 	std::vector<std::string_view> parts;
 	{
 		size_t i = 0;
@@ -23,6 +33,7 @@ std::string domain_suffix_key(std::string const &name)
 		}
 	}
 	std::string key;
+
 	{
 		size_t i = parts.size();
 		while (i > 0) {
@@ -32,6 +43,18 @@ std::string domain_suffix_key(std::string const &name)
 			}
 			key = std::string(parts[i]) + key;
 			if (i + 2 == parts.size()) break;
+		}
+
+		for (std::string const &s : known_suffix.vec) {
+			if (key.size() > s.size()) {
+				if (strcmp(key.c_str() + key.size() - s.size(), s.c_str()) == 0) {
+					size_t i = key.size() - s.size() - 1;
+					if (key[i] == '.') {
+						key = key.substr(i + 1);
+						break;
+					}
+				}
+			}
 		}
 	}
 	return key;
