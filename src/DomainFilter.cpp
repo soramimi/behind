@@ -10,7 +10,6 @@ std::string domain_suffix_key(std::string const &name)
 		KnownSuffix()
 		{
 			vec.push_back("lan");
-			vec.push_back("arpa");
 			vec.push_back("local");
 		}
 	} known_suffix;
