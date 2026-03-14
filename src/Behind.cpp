@@ -1577,16 +1577,14 @@ void Behind::forward_tcp(InternalData *d, ProtocolFamilyType const &client_proto
 	bool done = false;
 	if (sa) {
 		auto e = connect(sock, sa, salen);
-		if (e < 0) {
-			if (errno == EINPROGRESS) {
-				task->connect_in_progress = true;
-				task->upstream_proto = upstream_proto;
-				task->upstream_fd = sock;
-				push_task(task, 1000, EPOLLOUT | EPOLLERR | EPOLLHUP);
-				done = true;
-			} else {
-				logprintf(LOG_DEFAULT, "connect: %s\n", strerror(errno));
-			}
+		if (e == 0 || (e < 0 && errno == EINPROGRESS)) {
+			task->connect_in_progress = true;
+			task->upstream_proto = upstream_proto;
+			task->upstream_fd = sock;
+			push_task(task, 1000, EPOLLOUT | EPOLLERR | EPOLLHUP);
+			done = true;
+		} else {
+			logprintf(LOG_DEFAULT, "connect: %s\n", strerror(errno));
 		}
 	}
 	if (!done) {
@@ -2021,6 +2019,7 @@ bool Behind::init_socket(void *private_in, ProtocolFamilyType proto)
 	};
 	
 	if (!Bind(in, proto, sock)) {
+		closesocket(sock);
 		// throw STRERROR("bind: ");
 		return false;
 	}
@@ -2032,6 +2031,7 @@ bool Behind::init_socket(void *private_in, ProtocolFamilyType proto)
 		proto_str = "udp";
 	} else if (proto.is_stream()) {
 		if (listen(sock, 5) == SOCKET_ERROR) {
+			closesocket(sock);
 			throw STRERROR("listen: ");
 		}
 		in->listener_fd = sock;
