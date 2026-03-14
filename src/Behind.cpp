@@ -1518,6 +1518,8 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 		t->request_name = question.name;
 		t->forward_name = query_name;
 		push_task(t, 1000, EPOLLIN | EPOLLERR | EPOLLHUP);
+	} else {
+		closesocket(sock);
 	}
 }
 
@@ -1571,6 +1573,8 @@ void Behind::forward_tcp(InternalData *d, ProtocolFamilyType const &client_proto
 		sa = (sockaddr *)&sa6;
 		salen = sizeof(sa6);
 	}
+
+	bool done = false;
 	if (sa) {
 		auto e = connect(sock, sa, salen);
 		if (e < 0) {
@@ -1579,10 +1583,14 @@ void Behind::forward_tcp(InternalData *d, ProtocolFamilyType const &client_proto
 				task->upstream_proto = upstream_proto;
 				task->upstream_fd = sock;
 				push_task(task, 1000, EPOLLOUT | EPOLLERR | EPOLLHUP);
+				done = true;
 			} else {
 				logprintf(LOG_DEFAULT, "connect: %s\n", strerror(errno));
 			}
 		}
+	}
+	if (!done) {
+		closesocket(sock);
 	}
 }
 
