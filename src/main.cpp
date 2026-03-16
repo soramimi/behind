@@ -164,19 +164,10 @@ std::string getcwd()
 #include <assert.h>
 #define EXPECT_EQ(a, b) assert((a) == (b))
 
-int main(int argc, char **argv)
+extern bool sighup_caught;
+
+void main2(int argc, char **argv)
 {
-	Global g;
-	global = &g;
-
-	misc::get_tick_count(); // dummy read for initialize
-
-	Logger::start();
-	Logger::pause(true);
-	logprintf(LOG_DEFAULT, "=== Starting BEHIND DNS Server ===\n");
-	for (int i = 1; i < argc; i++) {
-		logprintf(LOG_DEFAULT, "argv[%d] = %s\n", i, argv[i]);
-	}
 
 	Option opt;
 	parse_option(argc, argv, &opt);
@@ -193,12 +184,33 @@ int main(int argc, char **argv)
 
 	Behind behind(opt);
 
-	try {
-		behind.test();
-		behind.main();
-	} catch (std::string const &e) {
-		logprintf(LOG_DEFAULT, "%s\n", e.c_str());
-		fprintf(stderr, "%s\n", e.c_str());
+	behind.test();
+	behind.main();
+}
+
+int main(int argc, char **argv)
+{
+	Global g;
+	global = &g;
+
+	misc::get_tick_count(); // dummy read for initialize
+
+	Logger::start();
+	Logger::pause(true);
+	logprintf(LOG_DEFAULT, "=== Starting BEHIND DNS Server ===\n");
+	for (int i = 1; i < argc; i++) {
+		logprintf(LOG_DEFAULT, "argv[%d] = %s\n", i, argv[i]);
+	}
+
+	while (1) {
+		main2(argc, argv);
+
+		if (sighup_caught) {
+			sighup_caught = false;
+			continue;
+		} else {
+			break;
+		}
 	}
 
 	Logger::stop();

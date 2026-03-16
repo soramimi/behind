@@ -1479,7 +1479,8 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 	{
 		sock = socket(forwarder.af_type, SOCK_DGRAM, 0);
 		if (sock == INVALID_SOCKET) {
-			throw STRERROR("socket: ");
+			logprintf(LOG_DEFAULT, "socket: %s\n", strerror(errno));
+			return;
 		}
 		
 		fcntl(sock, F_SETFL, O_NONBLOCK);
@@ -1987,7 +1988,8 @@ bool Behind::init_socket(void *private_in, ProtocolFamilyType proto)
 	
 	int sock = socket(proto.family(), proto.socktype(), 0);
 	if (sock == INVALID_SOCKET) {
-		throw STRERROR("socket: ");
+		logprintf(LOG_DEFAULT, "socket: %s\n", strerror(errno));
+		return false;
 	}
 	
 	fcntl(sock, F_SETFL, O_NONBLOCK);
@@ -2020,7 +2022,6 @@ bool Behind::init_socket(void *private_in, ProtocolFamilyType proto)
 	
 	if (!Bind(in, proto, sock)) {
 		closesocket(sock);
-		// throw STRERROR("bind: ");
 		return false;
 	}
 
@@ -2031,8 +2032,9 @@ bool Behind::init_socket(void *private_in, ProtocolFamilyType proto)
 		proto_str = "udp";
 	} else if (proto.is_stream()) {
 		if (listen(sock, 5) == SOCKET_ERROR) {
+			logprintf(LOG_DEFAULT, "listen: %s\n", strerror(errno));
 			closesocket(sock);
-			throw STRERROR("listen: ");
+			return false;
 		}
 		in->listener_fd = sock;
 		proto_str = "tcp";
@@ -2171,8 +2173,28 @@ int ev_fd(struct epoll_event *e)
 	return e->data.fd;
 }
 
+#include <signal.h>
+
+bool sighup_caught = false;
+bool sigint_caught = false;
+
+void on_sighup(int signum)
+{
+	logprintf(LOG_DEFAULT, "=== SIGHUP ===\n");
+	sighup_caught = true;
+}
+
+void on_sigint(int signum)
+{
+	logprintf(LOG_DEFAULT, "=== SIGINT ===\n");
+	sigint_caught = true;
+}
+
 void Behind::main()
 {
+	signal(SIGHUP, on_sighup);
+	signal(SIGINT, on_sigint);
+
 	initialize_hosts();
 
 	m->start_time = misc::get_tick_count();
@@ -2255,62 +2277,70 @@ void Behind::main()
 			}
 			uptime();
 			clean();
+
+			if (sighup_caught) break;
+			if (sigint_caught) break;
 		}
 	} else if (m->socket_mode == SocketMode::EPOLL) {
 		logprintf(LOG_DEFAULT, "mode: EPOLL\n");
 		
 		m->epoll_fd = epoll_create1(0);
 		if (m->epoll_fd == -1) {
-			throw STRERROR("epoll_create1: ");
+			logprintf(LOG_DEFAULT, "socket: %s\n", strerror(errno));
+		} else {
+			auto AddEpoll = [this](Behind::InternalData::In *in, int socktype){
+				int fd = -1;
+				in->ev = {};
+				in->ev.events = EPOLLIN;
+				if (socktype == SOCK_DGRAM) {
+					fd = in->fd;
+				} else if (socktype == SOCK_STREAM) {
+					fd = in->listener_fd;
+				}
+				in->ev.data.fd = fd;
+				if (fd != -1) {
+					if (ctl_add(fd, &in->ev, true, false) == -1) {
+						logprintf(LOG_DEFAULT, "epoll_ctl: %s\n", strerror(errno));
+					}
+				}
+			};
+			AddEpoll(&d.in4_udp, SOCK_DGRAM);
+			AddEpoll(&d.in6_udp, SOCK_DGRAM);
+			AddEpoll(&d.in4_tcp, SOCK_STREAM);
+			AddEpoll(&d.in6_tcp, SOCK_STREAM);
+
+			while (1) {
+				int n = epoll_wait(m->epoll_fd, m->epoll_events.data(), m->epoll_events.size(), interval_ms);
+				if (n == -1) {
+					if (errno == EINTR) {
+						continue;
+					}
+					logprintf(LOG_DEFAULT, "epoll_wait: %s\n", strerror(errno));
+					break;
+				}
+				for (int i = 0; i < n; i++) {
+					auto fd = m->epoll_events[i].data.fd;
+					if (fd == d.in4_udp.fd) {
+						process_udp(&d, AF_INET);
+					} else if (fd == d.in6_udp.fd) {
+						process_udp(&d, AF_INET6);
+					} else if (fd == d.in4_tcp.listener_fd) {
+						process_tcp(&d, AF_INET);
+					} else if (fd == d.in6_tcp.listener_fd) {
+						process_tcp(&d, AF_INET6);
+					} else {
+						process_receive(&d, fd);
+					}
+				}
+				uptime();
+				clean();
+
+				if (sighup_caught) break;
+				if (sigint_caught) break;
+			}
+			::close(m->epoll_fd);
+			m->epoll_fd = -1;
 		}
-		
-		auto AddEpoll = [this](Behind::InternalData::In *in, int socktype){
-			int fd = -1;
-			in->ev = {};
-			in->ev.events = EPOLLIN;
-			if (socktype == SOCK_DGRAM) {
-				fd = in->fd;
-			} else if (socktype == SOCK_STREAM) {
-				fd = in->listener_fd;
-			}
-			in->ev.data.fd = fd;
-			if (fd != -1) {
-				if (ctl_add(fd, &in->ev, true, false) == -1) {
-					logprintf(LOG_DEFAULT, "epoll_ctl: %s\n", strerror(errno));
-				}
-			}
-		};
-		AddEpoll(&d.in4_udp, SOCK_DGRAM);
-		AddEpoll(&d.in6_udp, SOCK_DGRAM);
-		AddEpoll(&d.in4_tcp, SOCK_STREAM);
-		AddEpoll(&d.in6_tcp, SOCK_STREAM);
-		
-		while (1) {
-			int n = epoll_wait(m->epoll_fd, m->epoll_events.data(), m->epoll_events.size(), interval_ms);
-			if (n == -1) {
-				if (errno == EINTR) {
-					continue;
-				}
-				throw STRERROR("epoll_wait: ");
-			}
-			for (int i = 0; i < n; i++) {
-				auto fd = m->epoll_events[i].data.fd;
-				if (fd == d.in4_udp.fd) {
-					process_udp(&d, AF_INET);
-				} else if (fd == d.in6_udp.fd) {
-					process_udp(&d, AF_INET6);
-				} else if (fd == d.in4_tcp.listener_fd) {
-					process_tcp(&d, AF_INET);
-				} else if (fd == d.in6_tcp.listener_fd) {
-					process_tcp(&d, AF_INET6);
-				} else {
-					process_receive(&d, fd);
-				}
-			}
-			uptime();
-			clean();
-		}
-		::close(m->epoll_fd);
 	}
 	
 	auto CloseSockets = [](std::vector<int> *v){
