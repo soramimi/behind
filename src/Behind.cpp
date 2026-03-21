@@ -1307,6 +1307,13 @@ bool Behind::send_dns_message(InternalData *d, ProtocolFamilyType const &proto, 
 					  , client.c_str()
 					  , comment
 					  );
+			logprintf(LOG_DEFAULT, "(resolve) <<%s %s %s>> to %s%s\n"
+					  , name.c_str()
+					  , qtype
+					  , addr_str.c_str()
+					  , client.c_str()
+					  , comment
+					  );
 		}
 	} else {
 		logprintf(LOG_DEFAULT, "R: <<%s %s NOANSWER>> to %s%s\n"
