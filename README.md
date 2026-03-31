@@ -97,14 +97,6 @@ forward-addr = 1.1.1.1
 
 When a query matches a specific zone, BEHIND will use the forwarders configured for that zone. Otherwise, it will use the default forwarders (configured without a zone name).
 
-#### [security]
-Enable DNS security features:
-
-```ini
-[security]
-case-randomize = yes  ; Enable DNS 0x20 encoding for spoofing protection
-```
-
 #### [filter]
 Block specific domains by returning NXDOMAIN. Supports exact match, prefix match, suffix match, and regex patterns:
 
@@ -201,7 +193,7 @@ BEHIND acts as a DNS proxy/forwarder with support for both UDP and TCP protocols
 6. Caches the response based on each record's TTL value (supports both UDP and TCP responses)
 7. Returns the response to the client with DNS name compression for efficiency
 
-The case randomization feature (when enabled) randomly changes the case of letters in domain names to help detect and prevent DNS spoofing attacks.
+The case randomization feature is always enabled and randomly changes the case of letters in domain names to help detect and prevent DNS spoofing attacks.
 
 ### Protocol Handling
 

@@ -92,7 +92,7 @@ struct Option {
 		std::string name;
 	};
 	std::vector<Zone> forward_addr;
-	bool case_randomize = false;
+	bool case_randomize = true; // always true
 	DomainFilter domain_filter;
 	struct Host {
 		std::string name;

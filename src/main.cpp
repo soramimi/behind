@@ -68,11 +68,6 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 			opt->forward_addr.push_back(z);
 			return true;
 		}
-	} else if (sec == "security") {
-		if (key == "case-randomize") {
-			opt->case_randomize = IsTrue(value);
-			return true;
-		}
 	} else if (sec == "filter") {
 		if (key == "nxdomain") {
 			opt->domain_filter.add_nxdomain(value);
