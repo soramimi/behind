@@ -57,7 +57,7 @@ bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 					if (!key) {
 						key = pre;
 					}
-				} else if (c == ';') {
+				} else if (c == ';' || c == '#') {
 					comment = pre;
 					break;
 				} else if (c == '[') {

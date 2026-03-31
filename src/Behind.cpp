@@ -1698,10 +1698,6 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 			SendNXDOMAIN();
 			return;
 		}
-		if (is_nxdomain(q.name)) {
-			SendNXDOMAIN();
-			return;
-		}
 		if (q.type == DNS_TYPE::AAAA && is_nodata_aaaa(q.name)) {
 			SendNODATA();
 			return;
@@ -1715,14 +1711,20 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 		clean_transaction(local_transaction_id);
 		
 		std::vector<Forwarder const *> forwarders = choose_forwarder(q.name, 2);
-		if (forwarders.empty()) {
-			logprintf(LOG_DEFAULT, "No forwarder configured.\n");
-			SendNODATA();
+		if (!forwarders.empty()) {
+			for (Forwarder const *f : forwarders) {
+				forward_udp(*d, client_proto, received.header, q, local_transaction_id, *f);
+			}
 			return;
 		}
-		for (Forwarder const *f : forwarders) {
-			forward_udp(*d, client_proto, received.header, q, local_transaction_id, *f);
+
+		if (is_nxdomain(q.name)) {
+			SendNXDOMAIN();
+			return;
 		}
+
+		logprintf(LOG_DEFAULT, "No forwarder configured.\n");
+		SendNODATA();
 		return;
 	}
 }
