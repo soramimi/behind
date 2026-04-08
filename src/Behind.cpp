@@ -1698,6 +1698,12 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 			SendNXDOMAIN();
 			return;
 		}
+
+		if (is_nxdomain(q.name)) {
+			SendNXDOMAIN();
+			return;
+		}
+
 		if (q.type == DNS_TYPE::AAAA && is_nodata_aaaa(q.name)) {
 			SendNODATA();
 			return;
@@ -1715,11 +1721,6 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 			for (Forwarder const *f : forwarders) {
 				forward_udp(*d, client_proto, received.header, q, local_transaction_id, *f);
 			}
-			return;
-		}
-
-		if (is_nxdomain(q.name)) {
-			SendNXDOMAIN();
 			return;
 		}
 
