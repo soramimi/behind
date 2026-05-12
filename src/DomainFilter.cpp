@@ -193,6 +193,11 @@ void DomainFilter::add_nxdomain(std::string const &name)
 	add_entry(name, Kind::NXDOMAIN);
 }
 
+void DomainFilter::add_nodata(const std::string &name)
+{
+	add_entry(name, Kind::NODATA);
+}
+
 void DomainFilter::add_nodata_aaaa(const std::string &name)
 {
 	add_entry(name, Kind::NODATA_AAAA);

@@ -235,6 +235,7 @@ private:
 	void push_task(std::shared_ptr<Task> task, int timeout, uint32_t epoll_events);
 	static void parse_dns_message(char const *begin, char const *end, dns::Message *msg);
 
+	bool is_nodata(std::string const &name) const;
 	bool is_nxdomain(std::string const &name) const;
 	bool is_nodata_aaaa(std::string const &name) const;
 

@@ -248,12 +248,16 @@ struct Message {
 
 class Cache {
 public:
+	struct Entry {
+		uint16_t flags = 0x8180;
+		std::vector<Record> answers;
+		std::vector<Record> authorities;
+	};
 	struct Item {
 		std::string key;
 		uint64_t timestamp = 0;
 		uint64_t expire = 0;
-		std::vector<Record> answers;
-		std::vector<Record> authorities;
+		Entry entry;
 	};
 private:
 	std::vector<Item> items_;
@@ -263,10 +267,6 @@ private:
 		return misc::strtolower(name);
 	}
 public:
-	struct Entry {
-		std::vector<Record> answers;
-		std::vector<Record> authorities;
-	};
 	std::optional<Entry> find(std::string const &name)
 	{
 		auto key = make_key(name);
@@ -276,8 +276,7 @@ public:
 			auto expire = items_[it->second].expire;
 			if (now < expire) {
 				Entry ret;
-				ret.answers = items_[it->second].answers;
-				ret.authorities = items_[it->second].authorities;
+				ret = items_[it->second].entry;
 				for (size_t i = 0; i < ret.answers.size(); i++) {
 					auto exp = ret.answers[i].expire;
 					if (now < exp) {
@@ -323,12 +322,13 @@ public:
 		item->key = key;
 		item->timestamp = now;
 		item->expire = now + 600 * 1000;
-		item->answers = msg.answers;
-		item->authorities = msg.authorities;
-		for (size_t i = 0; i < item->answers.size(); i++) {
-			uint32_t ttl =std::max(item->answers[i].ttl, (uint32_t)cache_min_ttl);
-			item->answers[i].expire = now + ttl * 1000;
-			item->expire = std::min(item->expire, item->answers[i].expire);
+		item->entry.flags = msg.header.flags;
+		item->entry.answers = msg.answers;
+		item->entry.authorities = msg.authorities;
+		for (size_t i = 0; i < item->entry.answers.size(); i++) {
+			uint32_t ttl =std::max(item->entry.answers[i].ttl, (uint32_t)cache_min_ttl);
+			item->entry.answers[i].expire = now + ttl * 1000;
+			item->expire = std::min(item->expire, item->entry.answers[i].expire);
 		}
 	}
 };
@@ -1160,6 +1160,11 @@ bool Behind::is_nxdomain(std::string const &name) const
 	return m->option.domain_filter.find(name) == DomainFilter::NXDOMAIN;
 }
 
+bool Behind::is_nodata(std::string const &name) const
+{
+	return m->option.domain_filter.find(name) == DomainFilter::NODATA;
+}
+
 bool Behind::is_nodata_aaaa(std::string const &name) const
 {
 	return m->option.domain_filter.find(name) == DomainFilter::NODATA_AAAA;
@@ -1631,7 +1636,7 @@ bool Behind::reply_from_cache(InternalData *d, ProtocolFamilyType const &client_
 		if (entry) {
 			dns::Message sending;
 			sending.header.id = header.id;
-			sending.header.flags = 0x8180;
+			sending.header.flags = entry->flags;
 			sending.questions = {q};
 			sending.answers = entry->answers;
 			sending.authorities = entry->authorities;
@@ -1645,18 +1650,10 @@ bool Behind::reply_from_cache(InternalData *d, ProtocolFamilyType const &client_
 
 void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client_proto, dns::Message const &received, dns::Question const &q)
 {
-	auto SendNXDOMAIN = [&](){
+	auto MakeMessage = [&](uint16_t flags){
 		dns::Message sending;
 		sending.header.id = received.header.id;
-		sending.header.flags = 0x8003;
-		sending.questions = {q};
-		send_dns_message(d, client_proto, sending, false, false);
-	};
-	
-	auto SendNODATA = [&](){
-		dns::Message sending;
-		sending.header.id = received.header.id;
-		sending.header.flags = 0x8000;
+		sending.header.flags = flags;
 		sending.questions = {q};
 		sending.authorities = {dns::Record()};
 		dns::Record *r = &sending.authorities.back();
@@ -1665,6 +1662,16 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 		r->clas = q.clas;
 		r->ttl = 60;
 		r->set_soa(fake_soa());
+		return sending;
+	};
+
+	auto SendNXDOMAIN = [&](){
+		dns::Message sending = MakeMessage(0x8003);
+		send_dns_message(d, client_proto, sending, false, false);
+	};
+	
+	auto SendNODATA = [&](){
+		dns::Message sending = MakeMessage(0x8000);
 		send_dns_message(d, client_proto, sending, false, false);
 	};
 	
@@ -1678,29 +1685,38 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 		InetResolver::Addr const *addr = find_host(q.name);
 		if (addr) {
 			std::vector<dns::Record> rec;
-			if ((q.type == DNS_TYPE::A && addr->type == InetResolver::IN4) || (q.type == DNS_TYPE::AAAA && addr->type == InetResolver::IN6)) {
-				dns::Record r;
-				r.name = q.name;
-				r.type = q.type;
-				r.ttl = cache_min_ttl();
-				for (std::vector<uint8_t> const &a : addr->addr) {
-					r.bin = a;
-					rec.push_back(r);
+			if (q.type == DNS_TYPE::A || InetResolver::IN6) {
+				if ((q.type == DNS_TYPE::A && addr->type == InetResolver::IN4) || (q.type == DNS_TYPE::AAAA && addr->type == InetResolver::IN6)) {
+					dns::Record r;
+					r.name = q.name;
+					r.type = q.type;
+					r.ttl = cache_min_ttl();
+					for (std::vector<uint8_t> const &a : addr->addr) {
+						r.bin = a;
+						rec.push_back(r);
+					}
+					dns::Message sending;
+					sending.header.id = received.header.id;
+					sending.header.flags = 0x8180;
+					sending.questions = {q};
+					sending.answers = rec;
+					send_dns_message(d, client_proto, sending, false, false);
+					return;
 				}
-				dns::Message sending;
-				sending.header.id = received.header.id;
-				sending.header.flags = 0x8180;
-				sending.questions = {q};
-				sending.answers = rec;
-				send_dns_message(d, client_proto, sending, false, false);
-				return;
+				SendNODATA();
+			} else {
+				SendNXDOMAIN();
 			}
-			SendNXDOMAIN();
 			return;
 		}
 
 		if (is_nxdomain(q.name)) {
 			SendNXDOMAIN();
+			return;
+		}
+
+		if (is_nodata(q.name)) {
+			SendNODATA();
 			return;
 		}
 

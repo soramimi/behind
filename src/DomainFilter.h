@@ -10,6 +10,7 @@ public:
 	enum Kind {
 		NORMAL,
 		NXDOMAIN,
+		NODATA,
 		NODATA_AAAA,
 	};
 private:
@@ -25,6 +26,7 @@ private:
 public:
 	Kind find(std::string const &name) const;
 	void add_nxdomain(std::string const &name);
+	void add_nodata(std::string const &name);
 	void add_nodata_aaaa(std::string const &name);
 };
 
