@@ -9,6 +9,7 @@
 #include <cassert>
 #include <cstring>
 #include <fcntl.h>
+#include <list>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <optional>
@@ -260,23 +261,55 @@ public:
 		Entry entry;
 	};
 private:
-	std::vector<Item> items_;
-	std::unordered_map<std::string, size_t> index_;
+	std::list<Item> items_;
+	std::unordered_map<std::string, std::list<Item>::iterator> index_;
+
+	static constexpr size_t MAX_SIZE = 4096;
+	static constexpr size_t TRIM_TARGET = 4000;
+
 	std::string make_key(std::string const &name) const
 	{
 		return misc::strtolower(name);
+	}
+
+	void evict_expired(size_t target_count)
+	{
+		auto Erase = [&](auto it){
+			index_.erase(it->key);
+			items_.erase(it);
+		};
+		auto now = misc::get_tick_count();
+		while (items_.size() > target_count) {
+			auto it = std::prev(items_.end());
+			if (now < it->expire) {
+				break; // back item is still valid, stop evicting
+			}
+			Erase(it);
+		}
+		if (items_.size() > target_count) {
+			// evict oldest valid entries if still over target
+			size_t remove = items_.size() - target_count;
+			for (size_t i = 0; i < remove; i++) {
+				auto it = std::prev(items_.end());
+				Erase(it);
+			}
+		}
 	}
 public:
 	std::optional<Entry> find(std::string const &name)
 	{
 		auto key = make_key(name);
-		auto it = index_.find(key);
-		if (it != index_.end()) {
+		auto map_it = index_.find(key);
+		if (map_it != index_.end()) {
+			auto list_it = map_it->second;
 			auto now = misc::get_tick_count();
-			auto expire = items_[it->second].expire;
-			if (now < expire) {
-				Entry ret;
-				ret = items_[it->second].entry;
+			if (now < list_it->expire) {
+				// move to front (most recently used)
+				items_.splice(items_.begin(), items_, list_it);
+				// update iterator in map after splice
+				map_it->second = items_.begin();
+
+				Entry ret = list_it->entry;
 				for (size_t i = 0; i < ret.answers.size(); i++) {
 					auto exp = ret.answers[i].expire;
 					if (now < exp) {
@@ -293,42 +326,37 @@ public:
 	void insert(std::string const &name, Message const &msg, int cache_min_ttl)
 	{
 		auto now = misc::get_tick_count();
-		auto key = make_key(name);
-		auto it = index_.find(key);
-		if (it == index_.end()) {
-			size_t n = items_.size();
-			if (n >= 4096) {
-				std::sort(items_.begin(), items_.end(), [](Item const &l, Item const &r){
-					return l.timestamp > r.timestamp; // newest first
-				});
-				while (n > 0) {
-					if (now < items_[n - 1].expire) {
-						break;
-					}
-					n--;
-				}
-				n = std::min(n, size_t(4000));
-				items_.resize(n);
-				index_.clear();
-				for (size_t i = 0; i < n; i++) {
-					index_[items_[i].key] = i;
-				}
+		auto SetItem = [&](Item *item){
+			item->timestamp = now;
+			item->expire = now + 600 * 1000;
+			item->entry.flags = msg.header.flags;
+			item->entry.answers = msg.answers;
+			item->entry.authorities = msg.authorities;
+			for (size_t i = 0; i < item->entry.answers.size(); i++) {
+				uint32_t ttl = std::max(item->entry.answers[i].ttl, (uint32_t)cache_min_ttl);
+				item->entry.answers[i].expire = now + ttl * 1000;
+				item->expire = std::min(item->expire, item->entry.answers[i].expire);
 			}
-			it = index_.insert(index_.end(), std::pair<std::string, size_t>(key, n));
-			items_.emplace_back();
-		}
-		
-		Item *item = &items_[it->second];
-		item->key = key;
-		item->timestamp = now;
-		item->expire = now + 600 * 1000;
-		item->entry.flags = msg.header.flags;
-		item->entry.answers = msg.answers;
-		item->entry.authorities = msg.authorities;
-		for (size_t i = 0; i < item->entry.answers.size(); i++) {
-			uint32_t ttl =std::max(item->entry.answers[i].ttl, (uint32_t)cache_min_ttl);
-			item->entry.answers[i].expire = now + ttl * 1000;
-			item->expire = std::min(item->expire, item->entry.answers[i].expire);
+		};
+		auto key = make_key(name);
+		auto map_it = index_.find(key);
+		if (map_it != index_.end()) {
+			// update existing entry and move to front
+			auto list_it = map_it->second;
+			SetItem(&*list_it);
+			items_.splice(items_.begin(), items_, list_it);
+			map_it->second = items_.begin();
+		} else {
+			// evict if at capacity
+			if (items_.size() >= MAX_SIZE) {
+				evict_expired(TRIM_TARGET);
+			}
+			// insert new entry at front
+			items_.emplace_front();
+			auto list_it = items_.begin();
+			list_it->key = key;
+			SetItem(&*list_it);
+			index_[key] = list_it;
 		}
 	}
 };
