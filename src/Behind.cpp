@@ -247,27 +247,30 @@ struct Message {
 	std::vector<Record> additionals;
 };
 
-class Cache {
+struct CacheEntry {
+	uint16_t flags = 0x8180;
+	std::vector<Record> answers;
+	std::vector<Record> authorities;
+};
+
+template <typename T> struct CacheItem {
+	std::string key;
+	uint64_t timestamp = 0;
+	uint64_t expire = 0;
+	T value;
+};
+
+template <typename KEY, typename VALUE> class T_Cache {
 public:
-	struct Entry {
-		uint16_t flags = 0x8180;
-		std::vector<Record> answers;
-		std::vector<Record> authorities;
-	};
-	struct Item {
-		std::string key;
-		uint64_t timestamp = 0;
-		uint64_t expire = 0;
-		Entry entry;
-	};
 private:
-	std::list<Item> items_;
-	std::unordered_map<std::string, std::list<Item>::iterator> index_;
+	using ItemType = CacheItem<VALUE>;
+	std::list<ItemType> items_;
+	std::unordered_map<KEY, typename std::list<ItemType>::iterator> index_;
 
 	static constexpr size_t MAX_SIZE = 4096;
 	static constexpr size_t TRIM_TARGET = 4000;
 
-	std::string make_key(std::string const &name) const
+	std::string make_key(KEY const &name) const
 	{
 		return misc::strtolower(name);
 	}
@@ -296,46 +299,33 @@ private:
 		}
 	}
 public:
-	std::optional<Entry> find(std::string const &name)
+	std::optional<VALUE> find(KEY const &name, uint64_t now)
 	{
 		auto key = make_key(name);
 		auto map_it = index_.find(key);
 		if (map_it != index_.end()) {
 			auto list_it = map_it->second;
-			auto now = misc::get_tick_count();
 			if (now < list_it->expire) {
 				// move to front (most recently used)
 				items_.splice(items_.begin(), items_, list_it);
 				// update iterator in map after splice
 				map_it->second = items_.begin();
-
-				Entry ret = list_it->entry;
-				for (size_t i = 0; i < ret.answers.size(); i++) {
-					auto exp = ret.answers[i].expire;
-					if (now < exp) {
-						ret.answers[i].ttl = (uint32_t)((exp - now) / 1000);
-					} else {
-						ret.answers[i].ttl = 0;
-					}
-				}
-				return ret;
+				return list_it->value;
 			}
 		}
 		return std::nullopt;
 	}
-	void insert(std::string const &name, Message const &msg, int cache_min_ttl)
+	void insert(KEY const &name, VALUE const &value, int cache_min_ttl)
 	{
 		auto now = misc::get_tick_count();
-		auto SetItem = [&](Item *item){
+		auto SetItem = [&](ItemType *item){
 			item->timestamp = now;
 			item->expire = now + 600 * 1000;
-			item->entry.flags = msg.header.flags;
-			item->entry.answers = msg.answers;
-			item->entry.authorities = msg.authorities;
-			for (size_t i = 0; i < item->entry.answers.size(); i++) {
-				uint32_t ttl = std::max(item->entry.answers[i].ttl, (uint32_t)cache_min_ttl);
-				item->entry.answers[i].expire = now + ttl * 1000;
-				item->expire = std::min(item->expire, item->entry.answers[i].expire);
+			item->value = value;
+			for (size_t i = 0; i < item->value.answers.size(); i++) {
+				uint32_t ttl = std::max(item->value.answers[i].ttl, (uint32_t)cache_min_ttl);
+				item->value.answers[i].expire = now + ttl * 1000;
+				item->expire = std::min(item->expire, item->value.answers[i].expire);
 			}
 		};
 		auto key = make_key(name);
@@ -358,6 +348,27 @@ public:
 			SetItem(&*list_it);
 			index_[key] = list_it;
 		}
+	}
+};
+
+class Cache : public T_Cache<std::string, Message> {
+public:
+	std::optional<Message> find(std::string const &name)
+	{
+		auto now = misc::get_tick_count();
+		auto ret = T_Cache::find(name, now);
+		if (ret) {
+			for (size_t i = 0; i < ret->answers.size(); i++) {
+				auto exp = ret->answers[i].expire;
+				if (now < exp) {
+					ret->answers[i].ttl = (uint32_t)((exp - now) / 1000);
+				} else {
+					ret->answers[i].ttl = 0;
+				}
+			}
+
+		}
+		return ret;
 	}
 };
 
@@ -1660,14 +1671,14 @@ bool Behind::reply_from_cache(InternalData *d, ProtocolFamilyType const &client_
 {
 	dns::Cache *cache = get_cache(q.type);
 	if (cache) {
-		auto entry = cache->find(q.name);
-		if (entry) {
+		auto item = cache->find(q.name);
+		if (item) {
 			dns::Message sending;
 			sending.header.id = header.id;
-			sending.header.flags = entry->flags;
+			sending.header.flags = item->header.flags;
 			sending.questions = {q};
-			sending.answers = entry->answers;
-			sending.authorities = entry->authorities;
+			sending.answers = item->answers;
+			sending.authorities = item->authorities;
 			set_edns0(&sending);
 			send_dns_message(d, client_proto, sending, false, true);
 			return true;
