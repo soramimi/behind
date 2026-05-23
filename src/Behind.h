@@ -2,7 +2,6 @@
 #define BEHIND_H
 
 #include "DomainFilter.h"
-#include "Global.h"
 #include "RandomNumber.h"
 #include "inetresolver.h"
 #include <map>

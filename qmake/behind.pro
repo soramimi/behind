@@ -13,7 +13,6 @@ SOURCES += \
     ../src/Behind.cpp \
     ../src/ConfigParser.cpp \
     ../src/DomainFilter.cpp \
-    ../src/Global.cpp \
     ../src/LineReader.cpp \
     ../src/Logger.cpp \
     ../src/RandomNumber.cpp \
@@ -28,7 +27,6 @@ HEADERS += \
     ../src/Behind.h \
     ../src/ConfigParser.h \
     ../src/DomainFilter.h \
-    ../src/Global.h \
     ../src/LineReader.h \
     ../src/Logger.h \
     ../src/RandomNumber.h \
@@ -39,4 +37,4 @@ HEADERS += \
     ../src/rwfile.h
 
 DISTFILES += \
-	../scripts/behind.conf
+    ../scripts/behind.conf

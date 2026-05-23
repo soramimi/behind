@@ -83,7 +83,7 @@ LineReader::~LineReader()
 	close_all();
 }
 
-const std::string &LineReader::file() const
+std::string LineReader::file() const
 {
 	if (files_.empty()) return {};
 	return files_.back().path;

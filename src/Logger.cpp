@@ -1,6 +1,5 @@
 
 #include "Logger.h"
-#include "Global.h"
 #include <cstdio>
 #include <cctype>
 #include <cstdlib>

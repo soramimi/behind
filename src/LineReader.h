@@ -24,7 +24,7 @@ private:
 public:
 	LineReader();
 	~LineReader();
-	std::string const &file() const;
+	std::string file() const;
 	int line() const;
 	bool open(std::string const &path);
 	bool getline(std::string *out);

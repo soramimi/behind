@@ -189,9 +189,6 @@ void main2(int argc, char **argv)
 
 int main(int argc, char **argv)
 {
-	Global g;
-	global = &g;
-
 	misc::get_tick_count(); // dummy read for initialize
 
 	Logger::start();
