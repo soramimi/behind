@@ -253,22 +253,20 @@ struct CacheEntry {
 	std::vector<Record> authorities;
 };
 
-template <typename T> struct CacheItem {
-	std::string key;
-	uint64_t timestamp = 0;
-	uint64_t expire = 0;
-	T value;
-};
-
 template <typename KEY, typename VALUE> class T_Cache {
-public:
 private:
-	using ItemType = CacheItem<VALUE>;
-	std::list<ItemType> items_;
-	std::unordered_map<KEY, typename std::list<ItemType>::iterator> index_;
-
 	static constexpr size_t MAX_SIZE = 4096;
 	static constexpr size_t TRIM_TARGET = 4000;
+
+	struct CacheItem {
+		KEY key;
+		uint64_t timestamp = 0;
+		uint64_t expire = 0;
+		VALUE value;
+	};
+
+	std::list<CacheItem> items_;
+	std::unordered_map<KEY, typename std::list<CacheItem>::iterator> index_;
 
 	std::string make_key(KEY const &name) const
 	{
@@ -318,7 +316,7 @@ public:
 	void insert(KEY const &name, VALUE const &value, int cache_min_ttl)
 	{
 		auto now = misc::get_tick_count();
-		auto SetItem = [&](ItemType *item){
+		auto SetItem = [&](CacheItem *item){
 			item->timestamp = now;
 			item->expire = now + 600 * 1000;
 			item->value = value;
