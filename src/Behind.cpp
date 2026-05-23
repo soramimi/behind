@@ -1573,7 +1573,7 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 	}
 }
 
-void Behind::forward_tcp(InternalData *d, ProtocolFamilyType const &client_proto, uint16_t client_request_id, dns::Header const &header, dns::Question const &question, uint32_t local_transaction_id, Forwarder const &forwarder)
+Behind::ConnectionStatus Behind::forward_tcp(InternalData *d, ProtocolFamilyType const &client_proto, uint16_t client_request_id, dns::Header const &header, dns::Question const &question, uint32_t local_transaction_id, Forwarder const &forwarder)
 {
 	std::shared_ptr<Task> task = make_task(Operation::FORWARD_TO_UPSTREAM_TCP, local_transaction_id);
 
@@ -1590,7 +1590,7 @@ void Behind::forward_tcp(InternalData *d, ProtocolFamilyType const &client_proto
 	} else if (task->fwdata->forwarder.is_inet6()) {
 		task->client_sa6 = d->in6_udp.sa6;
 	} else {
-		return;
+		return ConnectionStatus::ERROR;
 	}
 	
 	task->requester_id = client_request_id;
@@ -1603,7 +1603,7 @@ void Behind::forward_tcp(InternalData *d, ProtocolFamilyType const &client_proto
 	int sock = socket(task->fwdata->forwarder.af_type, SOCK_STREAM, 0);
 	if (sock == INVALID_SOCKET) {
 		logprintf(LOG_DEFAULT, "socket: %s\n", strerror(errno));
-		return;
+		return ConnectionStatus::ERROR;
 	}
 	fcntl(sock, F_SETFL, O_NONBLOCK);
 	
@@ -1624,7 +1624,7 @@ void Behind::forward_tcp(InternalData *d, ProtocolFamilyType const &client_proto
 		salen = sizeof(sa6);
 	}
 
-	bool done = false;
+	ConnectionStatus ret = ConnectionStatus::ERROR;
 	if (sa) {
 		auto e = connect(sock, sa, salen);
 		if (e == 0 || (e < 0 && errno == EINPROGRESS)) {
@@ -1632,14 +1632,15 @@ void Behind::forward_tcp(InternalData *d, ProtocolFamilyType const &client_proto
 			task->upstream_proto = upstream_proto;
 			task->upstream_fd = sock;
 			push_task(task, 1000, EPOLLOUT | EPOLLERR | EPOLLHUP);
-			done = true;
+			ret = ConnectionStatus::CONTINUE;
 		} else {
 			logprintf(LOG_DEFAULT, "connect: %s\n", strerror(errno));
 		}
 	}
-	if (!done) {
+	if (ret == ConnectionStatus::ERROR) {
 		closesocket(sock);
 	}
+	return ret;
 }
 
 void Behind::set_edns0(dns::Message *msg)
@@ -1783,21 +1784,21 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 	}
 }
 
-void Behind::process_query_tcp(InternalData *d, ProtocolFamilyType const &client_proto, dns::Message const &received, dns::Question const &q)
+Behind::ConnectionStatus Behind::process_query_tcp(InternalData *d, ProtocolFamilyType const &client_proto, dns::Message const &received, dns::Question const &q)
 {
 	std::vector<Forwarder const *> forwarders = choose_forwarder(q.name, 1);
 	if (forwarders.empty()) {
 		logprintf(LOG_DEFAULT, "No forwarder configured for TCP.\n");
-		return;
+		return ConnectionStatus::ERROR;
 	}
 	
 	if (reply_from_cache(d, client_proto, received.header, q)) {
-		return;
+		return ConnectionStatus::DONE;
 	}
 	
 	const uint32_t local_transaction_id = next_local_transaction_id();
 	Forwarder const *f = forwarders.front();
-	forward_tcp(d, client_proto, received.header.id, received.header, q, local_transaction_id, *f);
+	return forward_tcp(d, client_proto, received.header.id, received.header, q, local_transaction_id, *f);
 }
 
 void Behind::reply_to_client_udp(InternalData *d, std::shared_ptr<Task> task, dns::Message const &received)
@@ -1897,7 +1898,10 @@ void Behind::process_receive(InternalData *d, int upstream_fd)
 		};
 		
 		if (task->op == Operation::READING_FROM_CLIENT) {
-			process(d, task->upstream_proto);
+			auto ret = process(d, task->upstream_proto);
+			if (ret == ConnectionStatus::CONTINUE) {
+				return Done(false); // don't close, keep waiting for more data
+			}
 			return Done(true);
 		}
 		
@@ -1985,13 +1989,13 @@ void Behind::drop_aa_flag(dns::Message *msg)
 	msg->header.flags &= ~0x0400;
 }
 
-bool Behind::process(InternalData *d, ProtocolFamilyType const &client_proto)
+Behind::ConnectionStatus Behind::process(InternalData *d, ProtocolFamilyType const &client_proto)
 {
 	if (client_proto.is_inet4() || client_proto.is_inet6()) {
 		std::vector<char> buf;
 		buf = read(d, client_proto);
-		if (buf.empty()) return false;
-		if (buf.size() < 12) return true;
+		if (buf.empty()) return ConnectionStatus::ERROR;
+		if (buf.size() < 12) return ConnectionStatus::CONTINUE;
 		
 		dns::Message received;
 		parse_dns_message(buf.data(), buf.data() + buf.size(), &received);
@@ -2001,20 +2005,19 @@ bool Behind::process(InternalData *d, ProtocolFamilyType const &client_proto)
 				dns::Question const &q = *it;
 				if (client_proto.is_dgram()) {
 					process_query_udp(d, client_proto, received, q);
-					return true;
+					return ConnectionStatus::DONE;
 				}
 				if (client_proto.is_stream()) {
-					process_query_tcp(d, client_proto, received, q);
-					return true;
+					return process_query_tcp(d, client_proto, received, q);
 				}
 			}
 		} else if (received.header.flags & 0x8000) { // response
 			drop_aa_flag(&received);
 			process_response(d, client_proto, received);
-			return true;
+			return ConnectionStatus::DONE;
 		}
 	}
-	return false;
+	return ConnectionStatus::ERROR;
 }
 
 void Behind::process_udp(InternalData *d, sa_family_t family)

@@ -244,7 +244,13 @@ private:
 	bool send_dns_message(InternalData *d, const ProtocolFamilyType &proto, dns::Message const &msg, bool forward, bool from_cache);
 	void set_edns0(dns::Message *msg);
 
-	bool process(InternalData *d, const ProtocolFamilyType &proto);
+	enum class ConnectionStatus {
+		ERROR,
+		DONE,
+		CONTINUE,
+	};
+
+	ConnectionStatus process(InternalData *d, const ProtocolFamilyType &proto);
 	void process_udp(InternalData *d, sa_family_t family);
 	void process_tcp(InternalData *d, sa_family_t family);
 
@@ -259,13 +265,13 @@ private:
 	void delete_socket(std::shared_ptr<Task> task);
 	bool accept_dns_type(DNS_TYPE t);
 
-	void forward_tcp(InternalData *d, const ProtocolFamilyType &client_proto, uint16_t client_request_id, dns::Header const &header, const dns::Question &question, uint32_t local_transaction_id, const Forwarder &forwarder);
+	ConnectionStatus forward_tcp(InternalData *d, const ProtocolFamilyType &client_proto, uint16_t client_request_id, dns::Header const &header, const dns::Question &question, uint32_t local_transaction_id, const Forwarder &forwarder);
 	void forward_udp(const InternalData &d, const ProtocolFamilyType &proto, const dns::Header &header, const dns::Question &q, uint32_t local_transaction_id, const Forwarder &forwarder);
 
 	std::vector<char> read(InternalData *d, const ProtocolFamilyType &proto);
 	dns::Cache *get_cache(DNS_TYPE type);
 	void process_query_udp(InternalData *d, const ProtocolFamilyType &proto, const dns::Message &received, const dns::Question &question);
-	void process_query_tcp(InternalData *d, const ProtocolFamilyType &client_proto, const dns::Message &received, const dns::Question &q);
+	ConnectionStatus process_query_tcp(InternalData *d, const ProtocolFamilyType &client_proto, const dns::Message &received, const dns::Question &q);
 	void process_response(InternalData *d, const ProtocolFamilyType &upstream_proto, const dns::Message &received);
 	uint16_t next_txid();
 	void process_receive(InternalData *d, int upstream_fd);
