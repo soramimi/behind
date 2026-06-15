@@ -1723,7 +1723,7 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 		InetResolver::Addr const *addr = find_host(q.name);
 		if (addr) {
 			std::vector<dns::Record> rec;
-			if (q.type == DNS_TYPE::A || InetResolver::IN6) {
+			if (q.type == DNS_TYPE::A || q.type == DNS_TYPE::AAAA) {
 				if ((q.type == DNS_TYPE::A && addr->type == InetResolver::IN4) || (q.type == DNS_TYPE::AAAA && addr->type == InetResolver::IN6)) {
 					dns::Record r;
 					r.name = q.name;
