@@ -29,6 +29,20 @@
 #define SOCKET_ERROR (-1)
 #define closesocket(S) close(S)
 
+static inline uint16_t ntohs_p(void const *p)
+{
+	uint16_t v;
+	memcpy(&v, p, 2);
+	return ntohs(v);
+}
+
+static inline uint32_t ntohl_p(void const *p)
+{
+	uint32_t v;
+	memcpy(&v, p, 4);
+	return ntohl(v);
+}
+
 std::string randomize_case(std::string qname)
 {
 	for (size_t i = 0; i < qname.size(); i++) {
@@ -332,8 +346,15 @@ public:
 	{
 		if (max_entry_size_ > 0) {
 			size_t sz = 0;
-			for (auto const &r : value.answers) sz += r.bin.size();
-			for (auto const &r : value.authorities) sz += r.bin.size();
+			for (auto const &r : value.answers) {
+				sz += r.bin.size();
+			}
+			for (auto const &r : value.authorities) {
+				sz += r.bin.size();
+			}
+			for (auto const &r : value.questions) {
+				sz += r.name.size() + 4; // name + type + class
+			}
 			if (sz > max_entry_size_) {
 				return; // too large to cache
 			}
@@ -1047,13 +1068,13 @@ void Behind::parse_dns_message(const char *begin, const char *end, dns::Message 
 
 	uint16_t tmp[6];
 	memcpy(tmp, ptr, 12);
+	msg->header.id = ntohs_p(ptr + 0);
+	msg->header.flags = ntohs_p(ptr + 2);
+	msg->header.qdcount = ntohs_p(ptr + 4);
+	msg->header.ancount = ntohs_p(ptr + 6);
+	msg->header.nscount = ntohs_p(ptr + 8);
+	msg->header.arcount = ntohs_p(ptr + 10);
 	ptr += 12;
-	msg->header.id = ntohs(tmp[0]);
-	msg->header.flags = ntohs(tmp[1]);
-	msg->header.qdcount = ntohs(tmp[2]);
-	msg->header.ancount = ntohs(tmp[3]);
-	msg->header.nscount = ntohs(tmp[4]);
-	msg->header.arcount = ntohs(tmp[5]);
 
 	for (int i = 0; i < msg->header.qdcount; i++) {
 		dns::Question q;
@@ -1075,13 +1096,10 @@ void Behind::parse_dns_message(const char *begin, const char *end, dns::Message 
 			}
 			ptr += n;
 			if (ptr + 10 > end) return;
-			uint16_t tmp[5];
-			memcpy(tmp, ptr, 10);
-			a.type = (DNS_TYPE)ntohs(tmp[0]);
-			a.clas = (DNS_CLASS)ntohs(tmp[1]);
-			memcpy(&a.ttl, tmp + 2, 4);
-			a.ttl = ntohl(a.ttl);
-			uint16_t rdlen = ntohs(tmp[4]);
+			a.type = (DNS_TYPE)ntohs_p(ptr + 0);
+			a.clas = (DNS_CLASS)ntohs_p(ptr + 2);
+			a.ttl = ntohl_p(ptr + 4);
+			uint16_t rdlen = ntohs_p(ptr + 8);
 			ptr += 10;
 			if (ptr + rdlen > end) return;
 			auto it = answers->insert(answers->end(), dns::Record());
@@ -1113,7 +1131,7 @@ void Behind::parse_dns_message(const char *begin, const char *end, dns::Message 
 			} else if (a.type == DNS_TYPE::MX) {
 				std::shared_ptr<dns::MX> mx = std::make_shared<dns::MX>();
 				if (rdlen >= 2) {
-					mx->preference = ntohs(*(uint16_t *)ptr);
+					mx->preference = ntohs_p(ptr);
 					ptr += 2;
 					int n = decode_name(begin, end, ptr, &mx->exchange);
 					if (n > 0) {
@@ -1144,14 +1162,12 @@ void Behind::parse_dns_message(const char *begin, const char *end, dns::Message 
 					}
 				}
 				if (ok && ptr + 20 <= end) {
-					uint32_t tmp[5];
-					memcpy(tmp, ptr, 20);
+					soa->serial = ntohl_p(ptr + 0);
+					soa->refresh = ntohl_p(ptr + 4);
+					soa->retry = ntohl_p(ptr + 8);
+					soa->expire = ntohl_p(ptr + 12);
+					soa->minimum = ntohl_p(ptr + 16);
 					ptr += 20;
-					soa->serial = ntohl(tmp[0]);
-					soa->refresh = ntohl(tmp[1]);
-					soa->retry = ntohl(tmp[2]);
-					soa->expire = ntohl(tmp[3]);
-					soa->minimum = ntohl(tmp[4]);
 					soa->nname = misc::strtolower(soa->nname);
 					soa->rname = misc::strtolower(soa->rname);
 					it->set_soa(soa);
@@ -1159,7 +1175,7 @@ void Behind::parse_dns_message(const char *begin, const char *end, dns::Message 
 				if (!ok) return;
 			} else if (a.type == DNS_TYPE::HTTPS && rdlen >= 2) {
 				std::shared_ptr<dns::HTTPS> https = std::make_shared<dns::HTTPS>();
-				https->priority = ntohs(*(uint16_t *)ptr);
+				https->priority = ntohs_p(ptr);
 				ptr += 2;
 				int n = decode_name(begin, end, ptr, &https->name);
 				if (n > 0) {
@@ -1457,6 +1473,7 @@ bool Behind::send_dns_message(InternalData *d, ProtocolFamilyType const &proto, 
 	}
 	
 	char const *qtype = dns_type_to_string(packet.q.type);
+	(void)qtype;
 	if (forward) {
 		logprintf(LOG_DEFAULT, "F: %s\n", packet.q.name.c_str());
 	} else if ((msg.header.flags & 0x000f) == 3) { // NXDOMAIN
@@ -1687,7 +1704,8 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 
 		// bind to a random high port for source port randomization
 		bool bound = false;
-		for (int attempt = 0; attempt < 8 && !bound; attempt++) {
+		constexpr int MAX_BIND_ATTEMPTS = 32;
+		for (int attempt = 0; attempt < MAX_BIND_ATTEMPTS && !bound; attempt++) {
 			uint16_t port = m->txid_gen.random_port();
 			if (forwarder.is_inet4()) {
 				struct sockaddr_in bind_sa = {};

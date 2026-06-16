@@ -1,18 +1,18 @@
 
 #include "Behind.h"
-#include "Logger.h"
 #include "ConfigParser.h"
+#include "Logger.h"
 #include "misc.h"
 #include "network.h"
 #include "rwfile.h"
+#include <cerrno>
 #include <optional>
 #include <string.h>
 #include <unistd.h>
-#include <cerrno>
 
 bool set_option(std::string const &section, std::string const &key, std::string const &value, Option *opt)
 {
-	auto IsTrue = [](std::string const &val){
+	auto IsTrue = [](std::string const &val) {
 		if (val == "yes") return true;
 		if (val == "true") return true;
 		if (val == "no") return false;
@@ -150,18 +150,26 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 bool parse_option(int argc, char **argv, Option *opt)
 {
 	bool ok = true;
-	*opt = {};
+	*opt = { };
 	int argi = 1;
 	while (argi < argc) {
 		char const *arg = argv[argi++];
 		if (arg[0] == '-') {
 			if (strcmp(arg, "-C") == 0 || strcmp(arg, "--conf") == 0) {
 				if (argi < argc) {
-					std::string confpath = argv[argi++];
-					ok = ConfigParser::parse(confpath.c_str(), [](std::string const &section, std::string const &key, std::string const &value, void *cookie){
-						Option *opt = static_cast<Option *>(cookie);
-						set_option(section, key, value, opt);
-					}, opt);
+					std::string confpath;
+					{
+						std::string path = argv[argi++];
+						confpath = misc::realpath(path);
+						if (confpath.empty()) {
+							fprintf(stderr, "invalid config path: %s\n", path.c_str());
+							ok = false;
+						}
+					}
+					ok = ConfigParser::parse(confpath.c_str(), [](std::string const &section, std::string const &key, std::string const &value, void *cookie) {
+							Option *opt = static_cast<Option *>(cookie);
+							set_option(section, key, value, opt);
+							}, opt);
 					if (!ok) {
 						fprintf(stderr, "failed to open config file: %s\n", confpath.c_str());
 						ok = false;
@@ -192,7 +200,7 @@ std::string getcwd()
 	if (::getcwd(buf, sizeof(buf))) {
 		return std::string(buf);
 	}
-	return {};
+	return { };
 }
 
 #include "DomainFilter.h"
@@ -263,4 +271,3 @@ int main(int argc, char **argv)
 
 	return 0;
 }
-

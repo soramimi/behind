@@ -6,12 +6,14 @@ struct TransactionIdGenerator::Private {
 	RandomNumber random;
 	std::uniform_int_distribution<int> dist64k;
 	std::uniform_int_distribution<int> dist32k;
+	std::uniform_int_distribution<int> distport;
 	uint16_t pool[65536];
 	int index = 0;
 
 	Private()
 		: dist64k(0, 0xffff)
 		, dist32k(0, 0x7fff)
+		, distport(1024, 65535)
 	{
 	}
 };
@@ -42,6 +44,5 @@ uint16_t TransactionIdGenerator::next()
 
 uint16_t TransactionIdGenerator::random_port()
 {
-	std::uniform_int_distribution<int> dist(1024, 65535);
-	return (uint16_t)dist(m->random.gen);
+	return (uint16_t)m->distport(m->random.gen);
 }
