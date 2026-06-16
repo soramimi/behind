@@ -139,3 +139,33 @@ size_t misc::parse_int(char const *p, int *out)
 	return i;
 }
 
+bool misc::is_valid_domain(std::string_view const &s)
+{
+	if (s.empty()) return false;
+	if (s == ".") return true; // root
+
+	std::string_view v = s;
+	if (v.back() == '.') {
+		v.remove_suffix(1);
+	}
+	if (v.empty()) return false;
+	if (v.size() > 253) return false;
+	if (v.front() == '.' || v.back() == '.') return false;
+
+	size_t label_len = 0;
+	for (size_t i = 0; i < v.size(); i++) {
+		char c = v[i];
+		if (c == '.') {
+			if (label_len == 0 || label_len > 63) return false;
+			label_len = 0;
+		} else {
+			if (!(isalnum((unsigned char)c) || c == '-' || c == '_')) return false;
+			if (label_len == 0 && c == '-') return false; // label cannot start with '-'
+			label_len++;
+			if (label_len > 63) return false;
+		}
+	}
+	if (label_len == 0 || label_len > 63) return false;
+	return true;
+}
+

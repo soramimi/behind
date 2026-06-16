@@ -39,3 +39,9 @@ uint16_t TransactionIdGenerator::next()
 	m->index = (m->index + 1) & 0xffff;
 	return id;
 }
+
+uint16_t TransactionIdGenerator::random_port()
+{
+	std::uniform_int_distribution<int> dist(1024, 65535);
+	return (uint16_t)dist(m->random.gen);
+}

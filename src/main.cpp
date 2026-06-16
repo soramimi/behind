@@ -8,6 +8,7 @@
 #include <optional>
 #include <string.h>
 #include <unistd.h>
+#include <cerrno>
 
 bool set_option(std::string const &section, std::string const &key, std::string const &value, Option *opt)
 {
@@ -27,6 +28,42 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 		if (key == "directory") {
 			opt->working_dir = value;
 			return true;
+		}
+		if (key == "max-tasks") {
+			int v = 0;
+			if (misc::parse_int(value.c_str(), &v) > 0 && v > 0) {
+				opt->max_tasks = (size_t)v;
+				return true;
+			}
+			logprintf(LOG_DEFAULT, "invalid max-tasks: %s\n", value.c_str());
+			return false;
+		}
+		if (key == "max-cache-entry-size") {
+			int v = 0;
+			if (misc::parse_int(value.c_str(), &v) > 0 && v > 0) {
+				opt->max_cache_entry_size = (size_t)v;
+				return true;
+			}
+			logprintf(LOG_DEFAULT, "invalid max-cache-entry-size: %s\n", value.c_str());
+			return false;
+		}
+		if (key == "max-ttl") {
+			int v = 0;
+			if (misc::parse_int(value.c_str(), &v) > 0 && v > 0) {
+				opt->max_ttl = (uint32_t)v;
+				return true;
+			}
+			logprintf(LOG_DEFAULT, "invalid max-ttl: %s\n", value.c_str());
+			return false;
+		}
+		if (key == "edns0-buffer-size") {
+			int v = 0;
+			if (misc::parse_int(value.c_str(), &v) > 0 && v >= 512 && v <= 65535) {
+				opt->edns0_buffer_size = (uint16_t)v;
+				return true;
+			}
+			logprintf(LOG_DEFAULT, "invalid edns0-buffer-size: %s\n", value.c_str());
+			return false;
 		}
 		if (key == "listen") {
 			auto addrport = InetAddrPort::parse(value);
@@ -96,7 +133,6 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 				opt->hosts.push_back(h);
 			}
 		} else if (key == "file") {
-			logprintf(LOG_STDERR, "--- file = %s\n", value.c_str());
 			Option::HostsFile hf;
 			hf.suffix = suffix;
 			hf.path = value;
@@ -163,20 +199,27 @@ std::string getcwd()
 #include <assert.h>
 #define EXPECT_EQ(a, b) assert((a) == (b))
 
-extern bool sighup_caught;
+#include <atomic>
+extern std::atomic<bool> sighup_caught;
+extern std::atomic<bool> sigint_caught;
 
-void main2(int argc, char **argv)
+bool main2(int argc, char **argv)
 {
 
 	Option opt;
-	parse_option(argc, argv, &opt);
+	if (!parse_option(argc, argv, &opt)) {
+		return false;
+	}
 
 	Logger::open(opt.log_file);
 	Logger::pause(false);
 	logprintf(LOG_BOTH, "log file: %s\n", misc::realpath(opt.log_file.c_str()).c_str());
 
 	if (!opt.working_dir.empty()) {
-		chdir(opt.working_dir.c_str());
+		if (chdir(opt.working_dir.c_str()) != 0) {
+			logprintf(LOG_BOTH, "failed to chdir to %s: %s\n", opt.working_dir.c_str(), strerror(errno));
+			return false;
+		}
 	}
 	std::string cwd = getcwd();
 	logprintf(LOG_BOTH, "current working directory: %s\n", cwd.c_str());
@@ -185,6 +228,7 @@ void main2(int argc, char **argv)
 
 	behind.test();
 	behind.main();
+	return true;
 }
 
 int main(int argc, char **argv)
@@ -199,14 +243,20 @@ int main(int argc, char **argv)
 	}
 
 	while (1) {
-		main2(argc, argv);
-
-		if (sighup_caught) {
-			sighup_caught = false;
-			continue;
-		} else {
+		bool ok = main2(argc, argv);
+		if (!ok) {
 			break;
 		}
+
+		if (sighup_caught.load(std::memory_order_relaxed)) {
+			sighup_caught.store(false, std::memory_order_relaxed);
+			logprintf(LOG_DEFAULT, "=== SIGHUP ===\n");
+			continue;
+		}
+		if (sigint_caught.load(std::memory_order_relaxed)) {
+			logprintf(LOG_DEFAULT, "=== SIGINT ===\n");
+		}
+		break;
 	}
 
 	Logger::stop();

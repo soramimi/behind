@@ -28,6 +28,8 @@ std::string realpath(std::string const &path);
 
 size_t parse_int(char const *p, int *out);
 
+bool is_valid_domain(std::string_view const &s);
+
 }
 
 #endif // MISC_H

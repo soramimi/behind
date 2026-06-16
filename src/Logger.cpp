@@ -71,7 +71,8 @@ void Logger::write(LogItem const &item)
 		auto dur = item.tp.time_since_epoch();
 		auto msec = std::chrono::duration_cast<std::chrono::milliseconds>(dur).count();
 		time_t t = msec / 1000;
-		struct tm *tm = localtime(&t);
+		struct tm tm_buf;
+		struct tm *tm = localtime_r(&t, &tm_buf);
 		char *text = nullptr;
 		std::string msg = item.message;
 		if (FILELINE) {

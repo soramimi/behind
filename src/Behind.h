@@ -104,6 +104,11 @@ struct Option {
 		std::string path;
 	};
 	std::vector<HostsFile> hostsfiles;
+	// resource limits and security tuning
+	size_t max_tasks = 1000;
+	size_t max_cache_entry_size = 65535;
+	uint32_t max_ttl = 86400;
+	uint16_t edns0_buffer_size = 1232;
 };
 
 enum class DNS_CLASS : uint16_t {
@@ -237,6 +242,7 @@ private:
 	bool is_nodata(std::string const &name) const;
 	bool is_nxdomain(std::string const &name) const;
 	bool is_nodata_aaaa(std::string const &name) const;
+	bool is_valid_response(std::shared_ptr<Task> task, dns::Message const &received) const;
 
 	struct Packet;
 	static Packet make_dns_packet(dns::Message const &msg, bool tcp);
@@ -248,6 +254,15 @@ private:
 		DONE,
 		CONTINUE,
 	};
+
+	enum class TcpReadResult {
+		READY,
+		NEED_MORE,
+		ERROR,
+	};
+
+	InternalData make_client_data(InternalData const &d, ProtocolFamilyType const &proto, int fd) const;
+	TcpReadResult read_tcp_message(std::shared_ptr<Task> task, dns::Message *out);
 
 	ConnectionStatus process(InternalData *d, const ProtocolFamilyType &proto);
 	void process_udp(InternalData *d, sa_family_t family);
@@ -264,13 +279,13 @@ private:
 	void delete_socket(std::shared_ptr<Task> task);
 	bool accept_dns_type(DNS_TYPE t);
 
-	ConnectionStatus forward_tcp(InternalData *d, const ProtocolFamilyType &client_proto, uint16_t client_request_id, dns::Header const &header, const dns::Question &question, uint32_t local_transaction_id, const Forwarder &forwarder);
+	ConnectionStatus forward_tcp(InternalData *d, const ProtocolFamilyType &client_proto, int client_fd, uint16_t client_request_id, dns::Header const &header, const dns::Question &question, uint32_t local_transaction_id, const Forwarder &forwarder);
 	void forward_udp(const InternalData &d, const ProtocolFamilyType &proto, const dns::Header &header, const dns::Question &q, uint32_t local_transaction_id, const Forwarder &forwarder);
 
 	std::vector<char> read(InternalData *d, const ProtocolFamilyType &proto);
 	dns::Cache *get_cache(DNS_TYPE type);
 	void process_query_udp(InternalData *d, const ProtocolFamilyType &proto, const dns::Message &received, const dns::Question &question);
-	ConnectionStatus process_query_tcp(InternalData *d, const ProtocolFamilyType &client_proto, const dns::Message &received, const dns::Question &q);
+	ConnectionStatus process_query_tcp(InternalData *d, const ProtocolFamilyType &client_proto, int client_fd, const dns::Message &received, const dns::Question &q);
 	void process_response(InternalData *d, const ProtocolFamilyType &upstream_proto, const dns::Message &received);
 	uint16_t next_txid();
 	void process_receive(InternalData *d, int upstream_fd);

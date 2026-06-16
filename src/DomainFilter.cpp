@@ -176,6 +176,9 @@ void DomainFilter::add_entry(std::string const &name, Kind kind)
 		} else {
 			item.name = loname;
 		}
+		if (!misc::is_valid_domain(item.name)) {
+			return;
+		}
 		std::string key = domain_suffix_key(loname);
 		if (!key.empty()) {
 			auto it = suffix_map_.find(key);
