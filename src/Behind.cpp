@@ -100,6 +100,10 @@ struct CNAME {
 	std::string cname;
 };
 
+struct PTR {
+	std::string ptr;
+};
+
 struct NS {
 	std::string nsname;
 };
@@ -170,6 +174,20 @@ struct Record {
 		return const_cast<Record *>(this)->cname();
 	}
 	
+	// ptr
+
+	void set_ptr(std::shared_ptr<PTR> ptr)
+	{
+		sp = ptr;
+	}
+	PTR const *ptr() const
+	{
+		if (type == DNS_TYPE::PTR && sp) {
+			return std::static_pointer_cast<PTR>(sp).get();
+		}
+		return nullptr;
+	}
+
 	// ns
 	
 	void set_ns(std::shared_ptr<NS> ns)
@@ -240,6 +258,11 @@ struct Record {
 			CNAME const *p = cname();
 			if (p) {
 				return p->cname;
+			}
+		} else if (type == DNS_TYPE::PTR && ptr()) {
+			PTR const *p = ptr();
+			if (p) {
+				return p->ptr;
 			}
 		}
 		return {};
@@ -488,6 +511,7 @@ struct Behind::Private {
 	struct {
 		dns::Cache a;
 		dns::Cache aaaa;
+		dns::Cache ptr;
 		dns::Cache soa;
 		dns::Cache txt;
 		dns::Cache https;
@@ -520,6 +544,8 @@ Behind::Behind(const Option &opt)
 	m->dns_cache.a.set_max_ttl(opt.max_ttl);
 	m->dns_cache.aaaa.set_max_entry_size(opt.max_cache_entry_size);
 	m->dns_cache.aaaa.set_max_ttl(opt.max_ttl);
+	m->dns_cache.ptr.set_max_entry_size(opt.max_cache_entry_size);
+	m->dns_cache.ptr.set_max_ttl(opt.max_ttl);
 	m->dns_cache.soa.set_max_entry_size(opt.max_cache_entry_size);
 	m->dns_cache.soa.set_max_ttl(opt.max_ttl);
 	m->dns_cache.txt.set_max_entry_size(opt.max_cache_entry_size);
@@ -710,7 +736,11 @@ bool Behind::write_dns_answer_rr(std::vector<char> *out, NameMap *namemap, std::
 	
 	size_t i = out->size();
 	write_us(out, 0);
-	if (item.type == DNS_TYPE::CNAME) {
+	if (item.type == DNS_TYPE::PTR) {
+		dns::PTR const *aptr = item.ptr();
+		if (!aptr) return false;
+		write_name(out, namemap, aptr->ptr);
+	} else if (item.type == DNS_TYPE::CNAME) {
 		dns::CNAME const *cname = item.cname();
 		if (!cname) return false;
 		write_name(out, namemap, cname->cname);
@@ -1114,6 +1144,16 @@ void Behind::parse_dns_message(const char *begin, const char *end, dns::Message 
 				if (n > 0) {
 					cname->cname = misc::strtolower(cname->cname);
 					it->set_cname(cname);
+				} else {
+					return;
+				}
+				ptr += rdlen;
+			} else if (a.type == DNS_TYPE::PTR && rdlen > 0 && rdlen <= 255) {
+				std::shared_ptr<dns::PTR> aptr = std::make_shared<dns::PTR>();
+				int n = decode_name(begin, end, ptr, &aptr->ptr);
+				if (n > 0) {
+					aptr->ptr = misc::strtolower(aptr->ptr);
+					it->set_ptr(aptr);
 				} else {
 					return;
 				}
@@ -1627,6 +1667,7 @@ dns::Cache *Behind::get_cache(DNS_TYPE type)
 	switch (type) {
 	case DNS_TYPE::A:     return &m->dns_cache.a;
 	case DNS_TYPE::AAAA:  return &m->dns_cache.aaaa;
+	case DNS_TYPE::PTR:   return &m->dns_cache.ptr;
 	case DNS_TYPE::SOA:   return &m->dns_cache.soa;
 	case DNS_TYPE::TXT:   return &m->dns_cache.txt;
 	case DNS_TYPE::HTTPS: return &m->dns_cache.https;
@@ -1641,6 +1682,7 @@ bool Behind::accept_dns_type(DNS_TYPE t)
 	case DNS_TYPE::NS:
 	case DNS_TYPE::AAAA:
 	case DNS_TYPE::CNAME:
+	case DNS_TYPE::PTR:
 	case DNS_TYPE::SOA:
 	case DNS_TYPE::MX:
 	case DNS_TYPE::TXT:
@@ -1913,8 +1955,8 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 		InetResolver::Addr const *addr = find_host(q.name);
 		if (addr) {
 			std::vector<dns::Record> rec;
-			if (q.type == DNS_TYPE::A || q.type == DNS_TYPE::AAAA) {
-				if ((q.type == DNS_TYPE::A && addr->type == InetResolver::IN4) || (q.type == DNS_TYPE::AAAA && addr->type == InetResolver::IN6)) {
+			if (q.type == DNS_TYPE::A || q.type == DNS_TYPE::AAAA || q.type == DNS_TYPE::PTR) {
+				if ((q.type == DNS_TYPE::A && addr->type == InetResolver::IN4) || (q.type == DNS_TYPE::AAAA && addr->type == InetResolver::IN6) || q.type == DNS_TYPE::PTR) {
 					dns::Record r;
 					r.name = q.name;
 					r.type = q.type;
