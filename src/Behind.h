@@ -237,7 +237,7 @@ private:
 	void clean_transaction(uint32_t id);
 	std::shared_ptr<Task> take_task_by_id(uint16_t upstream_id);
 	void push_task(std::shared_ptr<Task> task, int timeout, uint32_t epoll_events);
-	static void parse_dns_message(char const *begin, char const *end, dns::Message *msg);
+	static bool parse_dns_message(char const *begin, char const *end, dns::Message *msg);
 
 	bool is_nodata(std::string const &name) const;
 	bool is_nxdomain(std::string const &name) const;
@@ -271,6 +271,7 @@ private:
 	bool init_socket(void *private_in, ProtocolFamilyType proto);
 
 	const InetResolver::Addr *find_host(std::string const &name);
+	std::string find_host_name_by_addr(InetResolver::Addr const &addr) const;
 	void initialize_hosts();
 	uint32_t next_local_transaction_id();
 	int ctl_add(int fd, epoll_event *e, bool in, bool out);

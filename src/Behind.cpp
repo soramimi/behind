@@ -43,13 +43,21 @@ static inline uint32_t ntohl_p(void const *p)
 	return ntohl(v);
 }
 
-std::string randomize_case(std::string qname)
+std::string randomize_case(std::string qname, TransactionIdGenerator *gen)
 {
+	uint16_t bits = 0;
+	int remaining = 0;
 	for (size_t i = 0; i < qname.size(); i++) {
 		if (isalpha((unsigned char)qname[i])) {
-			if (rand() & 0x4000) {
+			if (remaining == 0) {
+				bits = gen ? gen->next() : (uint16_t)rand();
+				remaining = 16;
+			}
+			if (bits & 1) {
 				qname[i] ^= 0x20;
 			}
+			bits >>= 1;
+			remaining--;
 		}
 	}
 	return qname;
@@ -368,12 +376,34 @@ public:
 	void insert(KEY const &name, VALUE const &value, int cache_min_ttl)
 	{
 		if (max_entry_size_ > 0) {
+			auto RecordSize = [](dns::Record const &r){
+				size_t sz = r.name.size() + 10 + r.bin.size();
+				if (auto p = r.cname()) {
+					sz += p->cname.size() + 1;
+				}
+				if (auto p = r.ptr()) {
+					sz += p->ptr.size() + 1;
+				}
+				if (auto p = r.ns()) {
+					sz += p->nsname.size() + 1;
+				}
+				if (auto p = r.mx()) {
+					sz += 2 + p->exchange.size() + 1;
+				}
+				if (auto p = r.soa()) {
+					sz += p->nname.size() + p->rname.size() + 22;
+				}
+				if (auto p = r.https()) {
+					sz += 2 + p->name.size() + 1 + p->data.size();
+				}
+				return sz;
+			};
 			size_t sz = 0;
 			for (auto const &r : value.answers) {
-				sz += r.bin.size();
+				sz += RecordSize(r);
 			}
 			for (auto const &r : value.authorities) {
-				sz += r.bin.size();
+				sz += RecordSize(r);
 			}
 			for (auto const &r : value.questions) {
 				sz += r.name.size() + 4; // name + type + class
@@ -453,6 +483,7 @@ struct Behind::Task {
 	uint16_t upstream_id = 0;
 	uint16_t requester_id = 0;
 	DNS_TYPE type = DNS_TYPE::A;
+	DNS_CLASS clas = DNS_CLASS::IN;
 	ProtocolFamilyType client_proto;
 	ProtocolFamilyType upstream_proto;
 	int upstream_fd = -1;
@@ -465,6 +496,7 @@ struct Behind::Task {
 	};
 	std::string request_name;
 	std::string forward_name;
+	Forwarder forwarder;
 	// TCP stream reassembly state
 	std::vector<char> recv_buffer;
 	size_t recv_expected = 0;
@@ -729,7 +761,7 @@ std::shared_ptr<dns::SOA> fake_soa()
 
 bool Behind::write_dns_answer_rr(std::vector<char> *out, NameMap *namemap, std::string const &name, const dns::Record &item)
 {
-	write_name(out, namemap, name);
+	if (!write_name(out, namemap, name)) return false;
 	write_us(out, (int)item.type);
 	write_us(out, (int)item.clas);
 	write_ul(out, item.ttl);
@@ -739,38 +771,39 @@ bool Behind::write_dns_answer_rr(std::vector<char> *out, NameMap *namemap, std::
 	if (item.type == DNS_TYPE::PTR) {
 		dns::PTR const *aptr = item.ptr();
 		if (!aptr) return false;
-		write_name(out, namemap, aptr->ptr);
+		if (!write_name(out, namemap, aptr->ptr)) return false;
 	} else if (item.type == DNS_TYPE::CNAME) {
 		dns::CNAME const *cname = item.cname();
 		if (!cname) return false;
-		write_name(out, namemap, cname->cname);
+		if (!write_name(out, namemap, cname->cname)) return false;
 	} else if (item.type == DNS_TYPE::NS) {
 		dns::NS const *ns = item.ns();
 		if (!ns) return false;
-		write_name(out, namemap, ns->nsname);
+		if (!write_name(out, namemap, ns->nsname)) return false;
 	} else if (item.type == DNS_TYPE::MX) {
 		dns::MX const *mx = item.mx();
 		if (!mx) return false;
 		write_us(out, mx->preference);
-		write_name(out, namemap, mx->exchange);
+		if (!write_name(out, namemap, mx->exchange)) return false;
 	} else if (item.type == DNS_TYPE::SOA) {
 		auto WriteSOA = [&](dns::SOA const &soa){
-			write_name(out, namemap, soa.nname);
-			write_name(out, namemap, soa.rname);
+			if (!write_name(out, namemap, soa.nname)) return false;
+			if (!write_name(out, namemap, soa.rname)) return false;
 			write_ul(out, soa.serial);
 			write_ul(out, soa.refresh);
 			write_ul(out, soa.retry);
 			write_ul(out, soa.expire);
 			write_ul(out, soa.minimum);
+			return true;
 		};
 		if (item.soa()) {
-			WriteSOA(*item.soa());
+			if (!WriteSOA(*item.soa())) return false;
 		}
 	} else if (item.type == DNS_TYPE::HTTPS) {
 		dns::HTTPS const *https = item.https();
 		if (!https) return false;
 		write_us(out, https->priority);
-		write_name(out, namemap, https->name);
+		if (!write_name(out, namemap, https->name)) return false;
 		if (!https->data.empty()) {
 			write(out, https->data.data(), https->data.size());
 		}
@@ -927,9 +960,15 @@ void Behind::init_forwarder()
 		int port = STANDARD_DNS_PORT;
 		
 		auto addrport = InetAddrPort::parse(z.name);
+		if (addrport.port > 0) {
+			port = addrport.port;
+		}
 		InetResolver::Type type = addrport.addr.type;
-
-		m->resolver.resolve(z.name.c_str(), type, &addr);
+		if (addrport.addr) {
+			addr = addrport.addr;
+		} else {
+			m->resolver.resolve(z.name.c_str(), type, &addr);
+		}
 		
 		Forwarder forwarder;
 		forwarder.port = port;
@@ -1024,7 +1063,7 @@ void Behind::clean()
 	size_t i = m->tasks.size();
 	while (i > 0) {
 		i--;
-		if (now - m->tasks[i]->timestamp >= m->tasks[i]->timeout) {
+			if (now - m->tasks[i]->timestamp >= (uint64_t)m->tasks[i]->timeout) {
 			delete_socket(m->tasks[i]);
 			m->tasks.erase(m->tasks.begin() + i);
 		}
@@ -1088,11 +1127,12 @@ void Behind::push_task(std::shared_ptr<Task> task, int timeout, uint32_t epoll_e
 	m->tasks.push_back(task);
 }
 
-void Behind::parse_dns_message(const char *begin, const char *end, dns::Message *msg)
+bool Behind::parse_dns_message(const char *begin, const char *end, dns::Message *msg)
 {
+	if (!msg) return false;
 	*msg = {};
 
-	if (end - begin < 12) return;
+	if (!begin || !end || begin > end || end - begin < 12) return false;
 
 	char const *ptr = begin;
 
@@ -1106,6 +1146,11 @@ void Behind::parse_dns_message(const char *begin, const char *end, dns::Message 
 	msg->header.arcount = ntohs_p(ptr + 10);
 	ptr += 12;
 
+	constexpr uint16_t MAX_SECTION_COUNT = 100;
+	if (msg->header.qdcount > MAX_SECTION_COUNT || msg->header.ancount > MAX_SECTION_COUNT || msg->header.nscount > MAX_SECTION_COUNT || msg->header.arcount > MAX_SECTION_COUNT) {
+		return false;
+	}
+
 	for (int i = 0; i < msg->header.qdcount; i++) {
 		dns::Question q;
 		int n = parse_question_section(begin, end, ptr, &q);
@@ -1113,7 +1158,7 @@ void Behind::parse_dns_message(const char *begin, const char *end, dns::Message 
 			ptr += n;
 			msg->questions.push_back(q);
 		} else {
-			break;
+			return false;
 		}
 	}
 
@@ -1122,72 +1167,72 @@ void Behind::parse_dns_message(const char *begin, const char *end, dns::Message 
 			dns::Record a;
 			int n = decode_name(begin, end, ptr, &a.name);
 			if (n <= 0 || a.name.empty()) {
-				return;
+				return false;
 			}
 			ptr += n;
-			if (ptr + 10 > end) return;
+			if (ptr + 10 > end) return false;
 			a.type = (DNS_TYPE)ntohs_p(ptr + 0);
 			a.clas = (DNS_CLASS)ntohs_p(ptr + 2);
 			a.ttl = ntohl_p(ptr + 4);
 			uint16_t rdlen = ntohs_p(ptr + 8);
 			ptr += 10;
-			if (ptr + rdlen > end) return;
-			auto it = answers->insert(answers->end(), dns::Record());
-			*it = a;
+			if (ptr + rdlen > end) return false;
+			char const *rdata_begin = ptr;
+			char const *rdata_end = ptr + rdlen;
 			if ((a.type == DNS_TYPE::A && rdlen == 4) || (a.type == DNS_TYPE::AAAA && rdlen == 16)) {
-				it->bin.resize(rdlen);
-				memcpy(it->bin.data(), ptr, rdlen);
-				ptr += rdlen;
+				a.bin.resize(rdlen);
+				memcpy(a.bin.data(), ptr, rdlen);
+				ptr = rdata_end;
 			} else if (a.type == DNS_TYPE::CNAME && rdlen > 0 && rdlen <= 255) {
 				std::shared_ptr<dns::CNAME> cname = std::make_shared<dns::CNAME>();
 				int n = decode_name(begin, end, ptr, &cname->cname);
-				if (n > 0) {
+				if (n > 0 && rdata_begin + n <= rdata_end) {
 					cname->cname = misc::strtolower(cname->cname);
-					it->set_cname(cname);
+					a.set_cname(cname);
 				} else {
-					return;
+					return false;
 				}
-				ptr += rdlen;
+				ptr = rdata_end;
 			} else if (a.type == DNS_TYPE::PTR && rdlen > 0 && rdlen <= 255) {
 				std::shared_ptr<dns::PTR> aptr = std::make_shared<dns::PTR>();
 				int n = decode_name(begin, end, ptr, &aptr->ptr);
-				if (n > 0) {
+				if (n > 0 && rdata_begin + n <= rdata_end) {
 					aptr->ptr = misc::strtolower(aptr->ptr);
-					it->set_ptr(aptr);
+					a.set_ptr(aptr);
 				} else {
-					return;
+					return false;
 				}
-				ptr += rdlen;
+				ptr = rdata_end;
 			} else if (a.type == DNS_TYPE::NS && rdlen > 0 && rdlen <= 255) {
 				std::shared_ptr<dns::NS> ns = std::make_shared<dns::NS>();
 				int n = decode_name(begin, end, ptr, &ns->nsname);
-				if (n > 0) {
+				if (n > 0 && rdata_begin + n <= rdata_end) {
 					ns->nsname = misc::strtolower(ns->nsname);
-					it->set_ns(ns);
+					a.set_ns(ns);
 				} else {
-					return;
+					return false;
 				}
-				ptr += rdlen;
+				ptr = rdata_end;
 			} else if (a.type == DNS_TYPE::MX) {
 				std::shared_ptr<dns::MX> mx = std::make_shared<dns::MX>();
 				if (rdlen >= 2) {
 					mx->preference = ntohs_p(ptr);
 					ptr += 2;
 					int n = decode_name(begin, end, ptr, &mx->exchange);
-					if (n > 0) {
+					if (n > 0 && ptr + n <= rdata_end) {
 						mx->exchange = misc::strtolower(mx->exchange);
-						it->set_mx(mx);
+						a.set_mx(mx);
 					} else {
-						return;
+						return false;
 					}
 				}
-				ptr += rdlen;
+				ptr = rdata_end;
 			} else if (a.type == DNS_TYPE::SOA) {
 				std::shared_ptr<dns::SOA> soa = std::make_shared<dns::SOA>();
 				bool ok = true;
 				if (rdlen > 0) {
 					int n = decode_name(begin, end, ptr, &soa->nname);
-					if (n > 0) {
+					if (n > 0 && ptr + n <= rdata_end) {
 						ptr += n;
 					} else {
 						ok = false;
@@ -1195,13 +1240,13 @@ void Behind::parse_dns_message(const char *begin, const char *end, dns::Message 
 				}
 				if (ok && rdlen > 0) {
 					int n = decode_name(begin, end, ptr, &soa->rname);
-					if (n > 0) {
+					if (n > 0 && ptr + n <= rdata_end) {
 						ptr += n;
 					} else {
 						ok = false;
 					}
 				}
-				if (ok && ptr + 20 <= end) {
+				if (ok && ptr + 20 == rdata_end) {
 					soa->serial = ntohl_p(ptr + 0);
 					soa->refresh = ntohl_p(ptr + 4);
 					soa->retry = ntohl_p(ptr + 8);
@@ -1210,19 +1255,21 @@ void Behind::parse_dns_message(const char *begin, const char *end, dns::Message 
 					ptr += 20;
 					soa->nname = misc::strtolower(soa->nname);
 					soa->rname = misc::strtolower(soa->rname);
-					it->set_soa(soa);
+					a.set_soa(soa);
+				} else {
+					ok = false;
 				}
-				if (!ok) return;
+				if (!ok) return false;
 			} else if (a.type == DNS_TYPE::HTTPS && rdlen >= 2) {
 				std::shared_ptr<dns::HTTPS> https = std::make_shared<dns::HTTPS>();
 				https->priority = ntohs_p(ptr);
 				ptr += 2;
 				int n = decode_name(begin, end, ptr, &https->name);
-				if (n > 0) {
+				if (n > 0 && ptr + n <= rdata_end) {
 					https->name = misc::strtolower(https->name);
 					ptr += n;
 				} else {
-					return;
+					return false;
 				}
 				int consumed = 2 + n;
 				if (consumed < (int)rdlen) {
@@ -1231,21 +1278,25 @@ void Behind::parse_dns_message(const char *begin, const char *end, dns::Message 
 					memcpy(https->data.data(), ptr, remaining);
 					ptr += remaining;
 				}
-				it->set_https(https);
+				if (ptr != rdata_end) return false;
+				a.set_https(https);
 			} else if (a.type == DNS_TYPE::TXT) {
 				if (rdlen > 0) {
-					it->bin.resize(rdlen);
-					memcpy(it->bin.data(), ptr, rdlen);
+					a.bin.resize(rdlen);
+					memcpy(a.bin.data(), ptr, rdlen);
 				}
-				ptr += rdlen;
+				ptr = rdata_end;
 			} else {
 				// Unknown / unhandled type: skip rdata
-				ptr += rdlen;
+				ptr = rdata_end;
 			}
+			answers->push_back(a);
 		}
+		return true;
 	};
-	ParseRecord(msg->header.ancount, &msg->answers);
-	ParseRecord(msg->header.nscount, &msg->authorities);
+	if (!ParseRecord(msg->header.ancount, &msg->answers)) return false;
+	if (!ParseRecord(msg->header.nscount, &msg->authorities)) return false;
+	return true;
 }
 
 static void init_sa4(struct sockaddr_in *sa4, in_addr const *addr, int port)
@@ -1299,18 +1350,23 @@ struct Sender {
 	{
 	}
 	ssize_t send(Behind::InternalData *d, void const *buf, size_t len)
-	{
-		int flags = 0;
-		auto [sock, addr_str] = sock_and_address(d, proto);
-		(void)addr_str;
-		if (sock != -1) {
-			if (proto.is_dgram()) {
-				if (proto.is_inet4()) {
-					return ::sendto(sock, buf, len, flags, (struct sockaddr *)&d->in4_udp.sa4, sizeof(sockaddr_in));
-				} else if (proto.is_inet6()) {
-					return ::sendto(sock, buf, len, flags, (struct sockaddr *)&d->in6_udp.sa6, sizeof(sockaddr_in6));
-				}
-			} else if (proto.is_stream()) {
+		{
+			int flags = 0;
+			auto [sock, addr_str] = sock_and_address(d, proto);
+			(void)addr_str;
+			if (sock != -1) {
+				if (proto.is_dgram()) {
+					sockaddr_storage peer = {};
+					socklen_t peer_len = sizeof(peer);
+					if (getpeername(sock, (sockaddr *)&peer, &peer_len) == 0) {
+						return ::send(sock, buf, len, flags);
+					}
+					if (proto.is_inet4()) {
+						return ::sendto(sock, buf, len, flags, (struct sockaddr *)&d->in4_udp.sa4, sizeof(sockaddr_in));
+					} else if (proto.is_inet6()) {
+						return ::sendto(sock, buf, len, flags, (struct sockaddr *)&d->in6_udp.sa6, sizeof(sockaddr_in6));
+					}
+				} else if (proto.is_stream()) {
 				return ::send(sock, buf, len, flags);
 			}
 		}
@@ -1335,10 +1391,23 @@ bool Behind::is_nodata_aaaa(std::string const &name) const
 
 bool Behind::is_valid_response(std::shared_ptr<Task> task, dns::Message const &received) const
 {
+	if (!task) {
+		return false;
+	}
+	if ((received.header.flags & 0x8000) == 0) {
+		return false;
+	}
+	if (received.header.flags & 0x0200) {
+		return false;
+	}
 	if (received.questions.size() != 1) {
 		return false;
 	}
-	if (stricmp(received.questions.front().name.c_str(), task->forward_name.c_str()) != 0) {
+	dns::Question const &q = received.questions.front();
+	if (q.name != task->forward_name) {
+		return false;
+	}
+	if (q.type != task->type || q.clas != task->clas) {
 		return false;
 	}
 	return true;
@@ -1599,6 +1668,88 @@ InetResolver::Addr const *Behind::find_host(std::string const &name)
 	return nullptr;
 }
 
+static std::vector<std::string> split_domain_labels(std::string const &name)
+{
+	std::vector<std::string> labels;
+	size_t start = 0;
+	while (start <= name.size()) {
+		size_t dot = name.find('.', start);
+		if (dot == std::string::npos) {
+			if (start < name.size()) {
+				labels.push_back(name.substr(start));
+			}
+			break;
+		}
+		labels.push_back(name.substr(start, dot - start));
+		start = dot + 1;
+	}
+	return labels;
+}
+
+static std::optional<InetResolver::Addr> parse_ptr_query_addr(std::string const &name)
+{
+	std::string loname = misc::strtolower(name);
+	if (!loname.empty() && loname.back() == '.') {
+		loname.pop_back();
+	}
+	std::vector<std::string> labels = split_domain_labels(loname);
+
+	if (labels.size() == 6 && labels[4] == "in-addr" && labels[5] == "arpa") {
+		uint8_t bytes[4] = {};
+		for (size_t i = 0; i < 4; i++) {
+			int v = 0;
+			if (misc::parse_int(labels[i].c_str(), &v) != labels[i].size() || v < 0 || v > 255) {
+				return std::nullopt;
+			}
+			bytes[3 - i] = (uint8_t)v;
+		}
+		InetResolver::Addr addr;
+		addr.type = InetResolver::IN4;
+		addr.addr.emplace_back(bytes, bytes + 4);
+		return addr;
+	}
+
+	if (labels.size() == 34 && labels[32] == "ip6" && labels[33] == "arpa") {
+		uint8_t bytes[16] = {};
+		for (size_t i = 0; i < 32; i++) {
+			if (labels[i].size() != 1 || !isxdigit((unsigned char)labels[i][0])) {
+				return std::nullopt;
+			}
+			int v = isdigit((unsigned char)labels[i][0]) ? labels[i][0] - '0' : tolower((unsigned char)labels[i][0]) - 'a' + 10;
+			size_t nibble = 31 - i;
+			if ((nibble & 1) == 0) {
+				bytes[nibble / 2] |= (uint8_t)(v << 4);
+			} else {
+				bytes[nibble / 2] |= (uint8_t)v;
+			}
+		}
+		InetResolver::Addr addr;
+		addr.type = InetResolver::IN6;
+		addr.addr.emplace_back(bytes, bytes + 16);
+		return addr;
+	}
+
+	return std::nullopt;
+}
+
+std::string Behind::find_host_name_by_addr(InetResolver::Addr const &addr) const
+{
+	for (Hosts const &hosts : m->hosts) {
+		for (auto const &item : hosts.map_) {
+			InetResolver::Addr const &candidate = item.second;
+			if (candidate.type != addr.type) continue;
+			for (auto const &candidate_bytes : candidate.addr) {
+				for (auto const &addr_bytes : addr.addr) {
+					if (candidate_bytes == addr_bytes) {
+						return item.first;
+					}
+				}
+			}
+		}
+	}
+	return {};
+}
+
 uint32_t Behind::next_local_transaction_id()
 {
 	return m->local_transaction_id++;
@@ -1717,7 +1868,7 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 
 	std::string query_name = question.name;
 	if (m->option.case_randomize) {
-		query_name = randomize_case(query_name);
+		query_name = randomize_case(query_name, &m->txid_gen);
 	}
 	
 	dns::Message sending;
@@ -1775,12 +1926,24 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 	}
 
 	InternalData d2;
+	sockaddr *sa = nullptr;
+	socklen_t salen = 0;
 	if (forwarder.is_inet4()) {
 		init_sa4(&d2.in4_udp.sa4, (in_addr const *)forwarder.addr, forwarder.port);
 		d2.in4_udp.fd = sock;
+		sa = (sockaddr *)&d2.in4_udp.sa4;
+		salen = sizeof(d2.in4_udp.sa4);
 	} else if (forwarder.is_inet6()) {
 		init_sa6(&d2.in6_udp.sa6, (in6_addr const *)forwarder.addr, forwarder.port);
 		d2.in6_udp.fd = sock;
+		sa = (sockaddr *)&d2.in6_udp.sa6;
+		salen = sizeof(d2.in6_udp.sa6);
+	}
+
+	if (!sa || connect(sock, sa, salen) != 0) {
+		logprintf(LOG_DEFAULT, "connect udp: %s\n", strerror(errno));
+		closesocket(sock);
+		return;
 	}
 	
 	if (send_dns_message(&d2, {forwarder.af_type, SOCK_DGRAM}, sending, true, false)) {
@@ -1789,8 +1952,10 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 		t->requester_id = header.id;
 		t->upstream_id = sending.header.id;
 		t->type = question.type;
+		t->clas = question.clas;
 		t->client_proto = client_proto;
 		t->upstream_proto = {forwarder.af_type, SOCK_DGRAM};
+		t->forwarder = forwarder;
 		if (client_proto.is_inet4()) {
 			t->client_sa4 = d.in4_udp.sa4;
 		} else if (client_proto.is_inet6()) {
@@ -1812,10 +1977,6 @@ Behind::ConnectionStatus Behind::forward_tcp(InternalData *d, ProtocolFamilyType
 	task->fwdata->d = *d;
 	task->fwdata->forwarder = forwarder;
 
-	task->fwdata->msg.header.id = header.id;
-	task->fwdata->msg.header.flags = 0x0100;
-	task->fwdata->msg.questions = {question};
-
 	if (client_proto.is_inet4()) {
 		task->client_sa4 = d->in4_tcp.sa4;
 	} else if (client_proto.is_inet6()) {
@@ -1828,9 +1989,16 @@ Behind::ConnectionStatus Behind::forward_tcp(InternalData *d, ProtocolFamilyType
 	task->requester_id = client_request_id;
 	task->upstream_id = header.id;
 	task->request_name = question.name;
-	task->forward_name = m->option.case_randomize ? randomize_case(question.name) : question.name;
+	task->forward_name = m->option.case_randomize ? randomize_case(question.name, &m->txid_gen) : question.name;
 	task->type = question.type;
+	task->clas = question.clas;
 	task->client_proto = client_proto;
+	task->forwarder = forwarder;
+
+	task->fwdata->msg.header.id = header.id;
+	task->fwdata->msg.header.flags = 0x0100;
+	task->fwdata->msg.questions = {question};
+	task->fwdata->msg.questions.front().name = task->forward_name;
 	
 	int sock = socket(task->fwdata->forwarder.af_type, SOCK_STREAM, 0);
 	if (sock == INVALID_SOCKET) {
@@ -1952,14 +2120,41 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 		}
 		logprintf(LOG_DEFAULT, "Q: %s %s\n", q.name.c_str(), dns_type_to_string(q.type));
 		// check known hosts
+		if (q.type == DNS_TYPE::PTR) {
+			auto addr = parse_ptr_query_addr(q.name);
+			if (addr) {
+				update_hosts_files(false);
+				std::string host_name = find_host_name_by_addr(*addr);
+				if (!host_name.empty()) {
+					dns::Record r;
+					r.name = q.name;
+					r.type = DNS_TYPE::PTR;
+					r.clas = q.clas;
+					r.ttl = cache_min_ttl();
+					std::shared_ptr<dns::PTR> ptr = std::make_shared<dns::PTR>();
+					ptr->ptr = host_name;
+					r.set_ptr(ptr);
+
+					dns::Message sending;
+					sending.header.id = received.header.id;
+					sending.header.flags = 0x8180;
+					sending.questions = {q};
+					sending.answers = {r};
+					send_dns_message(d, client_proto, sending, false, false);
+					return;
+				}
+			}
+		}
+
 		InetResolver::Addr const *addr = find_host(q.name);
 		if (addr) {
 			std::vector<dns::Record> rec;
-			if (q.type == DNS_TYPE::A || q.type == DNS_TYPE::AAAA || q.type == DNS_TYPE::PTR) {
-				if ((q.type == DNS_TYPE::A && addr->type == InetResolver::IN4) || (q.type == DNS_TYPE::AAAA && addr->type == InetResolver::IN6) || q.type == DNS_TYPE::PTR) {
+			if (q.type == DNS_TYPE::A || q.type == DNS_TYPE::AAAA) {
+				if ((q.type == DNS_TYPE::A && addr->type == InetResolver::IN4) || (q.type == DNS_TYPE::AAAA && addr->type == InetResolver::IN6)) {
 					dns::Record r;
 					r.name = q.name;
 					r.type = q.type;
+					r.clas = q.clas;
 					r.ttl = cache_min_ttl();
 					for (std::vector<uint8_t> const &a : addr->addr) {
 						r.bin = a;
@@ -2065,7 +2260,11 @@ Behind::TcpReadResult Behind::read_tcp_message(std::shared_ptr<Task> task, dns::
 		} else {
 			size_t need = task->recv_expected - task->recv_buffer.size();
 			if (need == 0) {
-				parse_dns_message(task->recv_buffer.data(), task->recv_buffer.data() + task->recv_buffer.size(), out);
+				if (!parse_dns_message(task->recv_buffer.data(), task->recv_buffer.data() + task->recv_buffer.size(), out)) {
+					task->recv_expected = 0;
+					task->recv_buffer.clear();
+					return TcpReadResult::ERROR;
+				}
 				task->recv_expected = 0;
 				task->recv_buffer.clear();
 				return TcpReadResult::READY;
@@ -2110,7 +2309,8 @@ void Behind::reply_to_client_udp(InternalData *d, std::shared_ptr<Task> task, dn
 			return misc::strtolower(name);
 		}
 	};
-	if (received.questions.size() == 1 && received.questions.front().name == task->forward_name) {
+	if (received.questions.size() == 1 && received.questions.front().name == task->forward_name && received.questions.front().type == task->type && received.questions.front().clas == task->clas) {
+		bool valid_for_cache = is_valid_response(task, received);
 		dns::Message sending;
 		sending.header.id = task->requester_id;
 		sending.header.flags = received.header.flags;
@@ -2151,7 +2351,7 @@ void Behind::reply_to_client_udp(InternalData *d, std::shared_ptr<Task> task, dn
 		send_dns_message(&d2, task->client_proto, sending, false, false);
 		// cahce
 		dns::Cache *cache = get_cache(task->type);
-		if (cache && is_valid_response(task, sending)) {
+		if (cache && valid_for_cache) {
 			cache->insert(task->forward_name, sending, cache_min_ttl());
 		}
 	}
@@ -2161,6 +2361,9 @@ void Behind::process_response(InternalData *d, ProtocolFamilyType const &upstrea
 {
 	std::shared_ptr<Task> task = take_task_by_id(received.header.id);
 	if (!task) return;
+	if ((received.header.flags & 0x8000) == 0 || received.questions.size() != 1) return;
+	dns::Question const &rq = received.questions.front();
+	if (rq.name != task->forward_name || rq.type != task->type || rq.clas != task->clas) return;
 	if (task->upstream_proto == upstream_proto && accept_dns_type(task->type)) {
 		bool tc = bool(received.header.flags & 0x0200);
 		if (tc) { // truncated
@@ -2173,9 +2376,9 @@ void Behind::process_response(InternalData *d, ProtocolFamilyType const &upstrea
 					header.id = next_txid();
 					header.flags = received.header.flags & ~0x0200;
 					dns::Question q;
-					if (!received.questions.empty()) {
-						q = received.questions.front();
-					}
+					q.name = task->request_name;
+					q.type = task->type;
+					q.clas = task->clas;
 					auto local_transaction_id = next_local_transaction_id();
 					forward_tcp(d, task->client_proto, task->client_fd, task->requester_id, header, q, local_transaction_id, *forwarders.front());
 				}
@@ -2248,13 +2451,41 @@ void Behind::process_receive(InternalData *d, int upstream_fd)
 			auto r = read_tcp_message(task, &received);
 			if (r == TcpReadResult::READY) {
 				drop_aa_flag(&received);
-				received.header.id = task->requester_id;
+				if (!is_valid_response(task, received)) {
+					return Done(true);
+				}
+				auto AmendName = [&task](std::string const &name){
+					if (stricmp(task->request_name.c_str(), name.c_str()) == 0 || stricmp(task->forward_name.c_str(), name.c_str()) == 0) {
+						return task->request_name;
+					}
+					return misc::strtolower(name);
+				};
+				dns::Message sending = received;
+				sending.header.id = task->requester_id;
+				for (dns::Question &q : sending.questions) {
+					q.name = AmendName(q.name);
+				}
+				for (dns::Record &a : sending.answers) {
+					if (a.clas == DNS_CLASS::IN) {
+						if (accept_dns_type(a.type)) {
+							a.name = AmendName(a.name);
+						}
+						if (a.type == DNS_TYPE::CNAME && a.cname()) {
+							a.cname()->cname = AmendName(a.cname()->cname);
+						} else if (a.type == DNS_TYPE::SOA && a.soa()) {
+							a.soa()->nname = AmendName(a.soa()->nname);
+							a.soa()->rname = AmendName(a.soa()->rname);
+						} else if (a.type == DNS_TYPE::HTTPS && a.https()) {
+							a.https()->name = AmendName(a.https()->name);
+						}
+					}
+				}
 				auto d2 = make_client_data(*d, task->client_proto, task->client_fd);
-				send_dns_message(&d2, task->client_proto, received, false, false);
+				send_dns_message(&d2, task->client_proto, sending, false, false);
 				// cahce
 				dns::Cache *cache = get_cache(task->type);
-				if (cache && is_valid_response(task, received)) {
-					cache->insert(task->forward_name, received, cache_min_ttl());
+				if (cache) {
+					cache->insert(task->forward_name, sending, cache_min_ttl());
 				}
 			}
 			return Done(true);
@@ -2265,23 +2496,13 @@ void Behind::process_receive(InternalData *d, int upstream_fd)
 			int n = recv(upstream_fd, buf, sizeof(buf), 0);
 			if (n > 0) {
 				dns::Message received;
-				parse_dns_message(buf, buf + n, &received);
+				if (!parse_dns_message(buf, buf + n, &received)) {
+					return Done(true);
+				}
 				drop_aa_flag(&received);
 				bool tc = bool(received.header.flags & 0x0200);
 				if (tc) {
-					std::string qname = task->forward_name;
-					std::vector<Forwarder const *> forwarders = choose_forwarder(qname, 1);
-					if (!forwarders.empty()) {
-						dns::Header header;
-						header.id = next_txid();
-						header.flags = received.header.flags & ~0x0200;
-						dns::Question q;
-						if (!received.questions.empty()) {
-							q = received.questions.front();
-						}
-					auto local_transaction_id = next_local_transaction_id();
-					forward_tcp(d, task->client_proto, task->client_fd, task->requester_id, header, q, local_transaction_id, *forwarders.front());
-					}
+					reply_to_client_udp(d, task, received);
 				} else {
 					reply_to_client_udp(d, task, received);
 				}
@@ -2307,7 +2528,9 @@ Behind::ConnectionStatus Behind::process(InternalData *d, ProtocolFamilyType con
 		if (buf.size() < 12) return ConnectionStatus::CONTINUE;
 		
 		dns::Message received;
-		parse_dns_message(buf.data(), buf.data() + buf.size(), &received);
+		if (!parse_dns_message(buf.data(), buf.data() + buf.size(), &received)) {
+			return ConnectionStatus::ERROR;
+		}
 		
 		if ((received.header.flags & 0xf800) == 0x0000) { // standard query
 			for (auto it = received.questions.begin(); it != received.questions.end(); it++) {
@@ -2521,7 +2744,6 @@ void Behind::update_hosts_files(bool force)
 void Behind::initialize_hosts()
 {
 	std::vector<Option::Host> const &hosts = m->option.hosts;
-	std::vector<Option::HostsFile> const &hostsfiles = m->option.hostsfiles;
 
 	m->hosts.clear();
 
@@ -2824,6 +3046,63 @@ void Behind::test()
 		EXPECT_EQ(filter.find("example.com"), DomainFilter::NXDOMAIN);
 		EXPECT_EQ(filter.find("ads.example.com"), DomainFilter::NXDOMAIN);
 	}
+
+	// PTR serializer/deserializer test
+
+	{
+		dns::Message msg;
+		msg.header.flags = 0x8180;
+		dns::Question q;
+		q.name = "1.0.0.127.in-addr.arpa";
+		q.type = DNS_TYPE::PTR;
+		q.clas = DNS_CLASS::IN;
+		msg.questions.push_back(q);
+
+		dns::Record r;
+		r.name = q.name;
+		r.type = DNS_TYPE::PTR;
+		r.clas = DNS_CLASS::IN;
+		r.ttl = 60;
+		std::shared_ptr<dns::PTR> ptr = std::make_shared<dns::PTR>();
+		ptr->ptr = "localhost";
+		r.set_ptr(ptr);
+		msg.answers.push_back(r);
+
+		Packet response = make_dns_packet(msg, false);
+		EXPECT_EQ(bool(response), true);
+
+		dns::Message msg2;
+		EXPECT_EQ(parse_dns_message(response.buffer.data(), response.buffer.data() + response.buffer.size(), &msg2), true);
+		EXPECT_EQ(msg2.questions.size(), 1);
+		EXPECT_EQ(msg2.answers.size(), 1);
+		EXPECT_EQ(msg2.questions[0].type, DNS_TYPE::PTR);
+		EXPECT_EQ(msg2.answers[0].type, DNS_TYPE::PTR);
+		EXPECT_EQ(msg2.answers[0].ptr()->ptr, "localhost");
+	}
+
+	// malformed PTR RDATA must not read past rdlen
+
+	{
+		std::vector<char> bad;
+		NameMap namemap;
+		dns::Header h;
+		h.flags = 0x8180;
+		h.qdcount = 1;
+		h.ancount = 1;
+		write_dns_header(&bad, h);
+		write_dns_question_rr(&bad, &namemap, "1.0.0.127.in-addr.arpa", DNS_TYPE::PTR, DNS_CLASS::IN);
+		write_name(&bad, &namemap, "1.0.0.127.in-addr.arpa");
+		write_us(&bad, (uint16_t)DNS_TYPE::PTR);
+		write_us(&bad, (uint16_t)DNS_CLASS::IN);
+		write_ul(&bad, 60);
+		write_us(&bad, 2); // rdata claims only two bytes
+		write(&bad, '\x01');
+		write(&bad, 'a');
+		write(&bad, '\x00'); // decode_name would need this byte, but it is outside rdlen
+
+		dns::Message msg;
+		EXPECT_EQ(parse_dns_message(bad.data(), bad.data() + bad.size(), &msg), false);
+	}
 	
 	// serializer/desirializer test
 	
@@ -2835,7 +3114,7 @@ void Behind::test()
 		dns::Message msg;
 		char const *begin = buf.data();
 		char const *end = begin + buf.size();
-		parse_dns_message(begin, end, &msg);
+		EXPECT_EQ(parse_dns_message(begin, end, &msg), true);
 		logprintf(LOG_DEFAULT, "TEST: parsed <%s>, %d questions and %d answers\n", file, (int)msg.questions.size(), (int)msg.answers.size());
 		
 		EXPECT_EQ(msg.header.flags, 0x8180);
@@ -2860,7 +3139,7 @@ void Behind::test()
 			dns::Message msg2;
 			char const *begin = response.buffer.data();
 			char const *end = begin + response.buffer.size();
-			parse_dns_message(begin, end, &msg2);
+			EXPECT_EQ(parse_dns_message(begin, end, &msg2), true);
 			
 			EXPECT_EQ(msg2.header.flags, 0x8180);
 			EXPECT_EQ(msg2.header.ancount, 1);
@@ -2876,7 +3155,7 @@ void Behind::test()
 		dns::Message msg;
 		char const *begin = buf.data();
 		char const *end = begin + buf.size();
-		parse_dns_message(begin, end, &msg);
+		EXPECT_EQ(parse_dns_message(begin, end, &msg), true);
 		logprintf(LOG_DEFAULT, "TEST: parsed <%s>, %d msg.questions and %d msg.answers\n", file, (int)msg.questions.size(), (int)msg.answers.size());
 		
 		EXPECT_EQ(msg.header.flags, 0x8180);
@@ -2913,7 +3192,7 @@ void Behind::test()
 			dns::Message msg2;
 			char const *begin = response.buffer.data();
 			char const *end = begin + response.buffer.size();
-			parse_dns_message(begin, end, &msg2);
+			EXPECT_EQ(parse_dns_message(begin, end, &msg2), true);
 			
 			EXPECT_EQ(msg2.header.flags, 0x8180);
 			EXPECT_EQ(msg2.header.ancount, 3);
@@ -2929,7 +3208,7 @@ void Behind::test()
 		dns::Message msg;
 		char const *begin = buf.data();
 		char const *end = begin + buf.size();
-		parse_dns_message(begin, end, &msg);
+		EXPECT_EQ(parse_dns_message(begin, end, &msg), true);
 		logprintf(LOG_DEFAULT, "TEST: parsed <%s>, %d msg.questions and %d msg.answers\n", file, (int)msg.questions.size(), (int)msg.answers.size());
 		
 		EXPECT_EQ(msg.header.flags, 0x8003); // NXDOMAIN
@@ -2943,4 +3222,3 @@ void Behind::test()
 		EXPECT_EQ(msg.questions[0].name, "doubleclick.net");
 	}
 }
-

@@ -12,15 +12,6 @@
 
 bool set_option(std::string const &section, std::string const &key, std::string const &value, Option *opt)
 {
-	auto IsTrue = [](std::string const &val) {
-		if (val == "yes") return true;
-		if (val == "true") return true;
-		if (val == "no") return false;
-		if (val == "false") return false;
-		logprintf(LOG_DEFAULT, "invalid boolean value: %s\n", val.c_str());
-		return false;
-	};
-
 	std::vector<std::string_view> section_parts = misc::split(section);
 	std::string const &sec = section_parts.empty() ? section : std::string(section_parts.front());
 
