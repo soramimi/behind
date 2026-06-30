@@ -225,7 +225,7 @@ bool main2(int argc, char **argv)
 
 	Behind behind(opt);
 
-	behind.test();
+	behind.self_test();
 	behind.main();
 	return true;
 }

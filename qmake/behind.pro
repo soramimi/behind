@@ -15,8 +15,7 @@ SOURCES += \
     ../src/DomainFilter.cpp \
     ../src/LineReader.cpp \
     ../src/Logger.cpp \
-    ../src/RandomNumber.cpp \
-    ../src/TransactionIdGenerator.cpp \
+    ../src/RandomNumberGenerator.cpp \
     ../src/inetresolver.cpp \
     ../src/main.cpp \
     ../src/misc.cpp \
@@ -29,8 +28,7 @@ HEADERS += \
     ../src/DomainFilter.h \
     ../src/LineReader.h \
     ../src/Logger.h \
-    ../src/RandomNumber.h \
-    ../src/TransactionIdGenerator.h \
+    ../src/RandomNumberGenerator.h \
     ../src/inetresolver.h \
     ../src/misc.h \
     ../src/network.h \

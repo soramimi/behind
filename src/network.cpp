@@ -8,7 +8,6 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
-
 std::string get_host_name()
 {
 	char tmp[300];

@@ -2,15 +2,15 @@
 #define BEHIND_H
 
 #include "DomainFilter.h"
-#include "RandomNumber.h"
+#include "RandomNumberGenerator.h"
 #include "inetresolver.h"
 #include <map>
+#include <memory>
+#include <optional>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unordered_map>
-#include <optional>
 #include <unordered_set>
-#include <memory>
 
 #define STANDARD_DNS_PORT 53
 #define DEFAUT_LISTEN_PORT 5300
@@ -305,7 +305,7 @@ public:
 	Behind(Option const &opt);
 	~Behind();
 	void main();
-	void test();
+	void self_test();
 };
 
 #endif // BEHIND_H

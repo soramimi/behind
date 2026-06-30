@@ -1,7 +1,7 @@
 #include "Behind.h"
 #include "LineReader.h"
 #include "Logger.h"
-#include "TransactionIdGenerator.h"
+#include "RandomNumberGenerator.h"
 #include "misc.h"
 #include "rwfile.h"
 #include <algorithm>
@@ -43,7 +43,7 @@ static inline uint32_t ntohl_p(void const *p)
 	return ntohl(v);
 }
 
-std::string randomize_case(std::string qname, TransactionIdGenerator *gen)
+std::string randomize_case(std::string qname, RandomNumberGenerator *gen)
 {
 	uint32_t bits = 0;
 	int remaining = 0;
@@ -530,7 +530,7 @@ struct Behind::Private {
 
 	std::vector<Hosts> hosts;
 	uint32_t local_transaction_id = 0;
-	TransactionIdGenerator txid_gen;
+	RandomNumberGenerator txid_gen;
 	InetResolver resolver;
 	
 	Behind::SocketMode socket_mode;
@@ -572,18 +572,18 @@ Behind::Behind(const Option &opt)
 {
 	m->option = opt;
 
-	m->dns_cache.a.set_max_entry_size(opt.max_cache_entry_size);
-	m->dns_cache.a.set_max_ttl(opt.max_ttl);
-	m->dns_cache.aaaa.set_max_entry_size(opt.max_cache_entry_size);
-	m->dns_cache.aaaa.set_max_ttl(opt.max_ttl);
-	m->dns_cache.ptr.set_max_entry_size(opt.max_cache_entry_size);
-	m->dns_cache.ptr.set_max_ttl(opt.max_ttl);
-	m->dns_cache.soa.set_max_entry_size(opt.max_cache_entry_size);
-	m->dns_cache.soa.set_max_ttl(opt.max_ttl);
-	m->dns_cache.txt.set_max_entry_size(opt.max_cache_entry_size);
-	m->dns_cache.txt.set_max_ttl(opt.max_ttl);
-	m->dns_cache.https.set_max_entry_size(opt.max_cache_entry_size);
-	m->dns_cache.https.set_max_ttl(opt.max_ttl);
+	dns::Cache *table[] = {
+		&m->dns_cache.a,
+		&m->dns_cache.aaaa,
+		&m->dns_cache.ptr,
+		&m->dns_cache.soa,
+		&m->dns_cache.txt,
+		&m->dns_cache.https,
+	};
+	for (auto *t : table) {
+		t->set_max_entry_size(opt.max_cache_entry_size);
+		t->set_max_ttl(opt.max_ttl);
+	}
 
 	init_forwarder();
 }
@@ -769,9 +769,9 @@ bool Behind::write_dns_answer_rr(std::vector<char> *out, NameMap *namemap, std::
 	size_t i = out->size();
 	write_us(out, 0);
 	if (item.type == DNS_TYPE::PTR) {
-		dns::PTR const *aptr = item.ptr();
-		if (!aptr) return false;
-		if (!write_name(out, namemap, aptr->ptr)) return false;
+		dns::PTR const *p = item.ptr();
+		if (!p) return false;
+		if (!write_name(out, namemap, p->ptr)) return false;
 	} else if (item.type == DNS_TYPE::CNAME) {
 		dns::CNAME const *cname = item.cname();
 		if (!cname) return false;
@@ -894,7 +894,7 @@ std::vector<Forwarder const *> Behind::choose_forwarder(std::string const &name,
 
 uint16_t Behind::next_txid()
 {
-	return m->txid_gen.next();
+	return m->txid_gen.next_txid();
 }
 
 size_t parse_space(char const *p)
@@ -1194,11 +1194,11 @@ bool Behind::parse_dns_message(const char *begin, const char *end, dns::Message 
 				}
 				ptr = rdata_end;
 			} else if (a.type == DNS_TYPE::PTR && rdlen > 0 && rdlen <= 255) {
-				std::shared_ptr<dns::PTR> aptr = std::make_shared<dns::PTR>();
-				int n = decode_name(begin, end, ptr, &aptr->ptr);
+				std::shared_ptr<dns::PTR> p = std::make_shared<dns::PTR>();
+				int n = decode_name(begin, end, ptr, &p->ptr);
 				if (n > 0 && rdata_begin + n <= rdata_end) {
-					aptr->ptr = misc::strtolower(aptr->ptr);
-					a.set_ptr(aptr);
+					p->ptr = misc::strtolower(p->ptr);
+					a.set_ptr(p);
 				} else {
 					return false;
 				}
@@ -1655,8 +1655,6 @@ bool Behind::send_dns_message(InternalData *d, ProtocolFamilyType const &proto, 
 	return ok;
 }
 
-
-
 InetResolver::Addr const *Behind::find_host(std::string const &name)
 {
 	update_hosts_files(false);
@@ -1818,10 +1816,10 @@ dns::Cache *Behind::get_cache(DNS_TYPE type)
 	switch (type) {
 	case DNS_TYPE::A:     return &m->dns_cache.a;
 	case DNS_TYPE::AAAA:  return &m->dns_cache.aaaa;
+	case DNS_TYPE::HTTPS: return &m->dns_cache.https;
 	case DNS_TYPE::PTR:   return &m->dns_cache.ptr;
 	case DNS_TYPE::SOA:   return &m->dns_cache.soa;
 	case DNS_TYPE::TXT:   return &m->dns_cache.txt;
-	case DNS_TYPE::HTTPS: return &m->dns_cache.https;
 	}
 	return nullptr;
 }
@@ -1830,15 +1828,15 @@ bool Behind::accept_dns_type(DNS_TYPE t)
 {
 	switch (t) {
 	case DNS_TYPE::A:
-	case DNS_TYPE::NS:
 	case DNS_TYPE::AAAA:
 	case DNS_TYPE::CNAME:
+	case DNS_TYPE::HTTPS:
+	case DNS_TYPE::MX:
+	case DNS_TYPE::NS:
+	case DNS_TYPE::OPT:
 	case DNS_TYPE::PTR:
 	case DNS_TYPE::SOA:
-	case DNS_TYPE::MX:
 	case DNS_TYPE::TXT:
-	case DNS_TYPE::HTTPS:
-	case DNS_TYPE::OPT:
 		return true;
 	}
 	return false;
@@ -2131,9 +2129,9 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 					r.type = DNS_TYPE::PTR;
 					r.clas = q.clas;
 					r.ttl = cache_min_ttl();
-					std::shared_ptr<dns::PTR> ptr = std::make_shared<dns::PTR>();
-					ptr->ptr = host_name;
-					r.set_ptr(ptr);
+					std::shared_ptr<dns::PTR> p = std::make_shared<dns::PTR>();
+					p->ptr = host_name;
+					r.set_ptr(p);
 
 					dns::Message sending;
 					sending.header.id = received.header.id;
@@ -2992,7 +2990,7 @@ std::string to_string(std::vector<uint8_t> const &buf)
 	return std::string((char const *)buf.data(), buf.size());
 }
 
-void Behind::test()
+void Behind::self_test()
 {
 	// split test
 	{
