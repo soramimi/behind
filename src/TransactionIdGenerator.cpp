@@ -1,11 +1,13 @@
 #include "TransactionIdGenerator.h"
 
 #include "RandomNumber.h"
+#include <limits>
 
 struct TransactionIdGenerator::Private {
 	RandomNumber random;
 	std::uniform_int_distribution<int> dist64k;
 	std::uniform_int_distribution<int> dist32k;
+	std::uniform_int_distribution<uint32_t> dist32bit;
 	std::uniform_int_distribution<int> distport;
 	uint16_t pool[65536];
 	int index = 0;
@@ -13,6 +15,7 @@ struct TransactionIdGenerator::Private {
 	Private()
 		: dist64k(0, 0xffff)
 		, dist32k(0, 0x7fff)
+		, dist32bit(0, std::numeric_limits<uint32_t>::max())
 		, distport(1024, 65535)
 	{
 	}
@@ -40,6 +43,11 @@ uint16_t TransactionIdGenerator::next()
 	uint16_t id = m->pool[m->index];
 	m->index = (m->index + 1) & 0xffff;
 	return id;
+}
+
+uint32_t TransactionIdGenerator::next_u32()
+{
+	return m->dist32bit(m->random.gen);
 }
 
 uint16_t TransactionIdGenerator::random_port()

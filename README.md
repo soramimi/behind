@@ -9,14 +9,15 @@ Designed for home networks and small organizations, BEHIND is typically deployed
 ## Features
 
 - **DNS Forwarding**: Forward DNS queries to upstream DNS servers with support for multiple forwarders and automatic random selection
-- **TCP/UDP Dual Protocol Support**: Support both UDP and TCP protocols for DNS queries. Automatically handles TCP fallback for large responses (>512 bytes) by setting the TC (truncation) flag
+- **TCP/UDP Dual Protocol Support**: Support both UDP and TCP protocols for DNS queries. Large UDP responses are truncated with the TC flag so clients can retry over TCP
 - **UDP Port Randomization**: Randomized source port selection for UDP forwarding to enhance security and prevent DNS spoofing attacks
 - **Dual Stack Support**: Full IPv4 and IPv6 support
-- **DNS Cache**: Intelligent response caching with per-record TTL tracking (up to 4096 entries), supporting both UDP and TCP responses
+- **PTR Record Support**: Forward and cache reverse DNS lookups, including static reverse lookups for hosts entries
+- **DNS Cache**: Intelligent response caching with per-record TTL tracking (up to 4096 entries), supporting A, AAAA, PTR, SOA, TXT, and HTTPS responses over both UDP and TCP
 - **DNS Compression**: DNS name compression in response packets for reduced bandwidth usage
-- **Security**: DNS 0x20 encoding (case randomization) to mitigate DNS spoofing attacks
+- **Security**: DNS 0x20 encoding (case randomization), randomized transaction IDs, randomized UDP source ports, upstream response validation, and malformed DNS packet rejection
 - **Advanced Domain Filtering**: Block domains using exact match, prefix match, suffix match, or regex patterns (useful for ad-blocking)
-- **Static Host Resolution**: Define custom hostname-to-IP mappings in the configuration
+- **Static Host Resolution**: Define custom hostname-to-IP mappings in the configuration, with reverse PTR answers generated from the same host table
 - **Modular Configuration**: Support for nested configuration files using include directives
 - **Logging**: Automatic log file rotation with date-based filenames
 - **High Performance**: epoll-based event handling with non-blocking I/O for improved scalability and minimal resource usage
@@ -55,11 +56,17 @@ Configuration files support the `include` directive to load additional configura
 ### Configuration Options
 
 #### [options]
-Specify working directory:
+Specify runtime behavior and resource limits:
 
 ```ini
 [options]
-directory = /var/lib/behind  ; Working directory for the server
+directory = /var/lib/behind    ; Working directory for the server
+listen = 127.0.0.1@5301        ; IPv4 listen address and port
+listen = ::1@5301              ; IPv6 listen address and port
+max-tasks = 1000               ; Maximum number of active forwarding tasks
+max-cache-entry-size = 65535   ; Maximum serialized cache entry size
+max-ttl = 86400                ; Maximum cached TTL in seconds
+edns0-buffer-size = 1232       ; EDNS0 UDP payload size advertised in responses
 ```
 
 #### [logging]
@@ -75,10 +82,12 @@ Specify one or more upstream DNS servers to forward queries to. When multiple se
 
 ```ini
 [forward-zone]
-forward-addr = 8.8.8.8              ; Google DNS (IPv4)
-forward-addr = 2001:4860:4860::8888  ; Google DNS (IPv6)
-forward-addr = 1.1.1.1              ; Cloudflare DNS (IPv4)
-forward-addr = 2606:4700:4700::1111  ; Cloudflare DNS (IPv6)
+forward-addr = 8.8.8.8                ; Google DNS (IPv4)
+forward-addr = 8.8.8.8@5353           ; IPv4 with explicit port
+forward-addr = 2001:4860:4860::8888   ; Google DNS (IPv6)
+forward-addr = [2001:4860:4860::8888]@5353  ; IPv6 with explicit port
+forward-addr = 1.1.1.1                ; Cloudflare DNS (IPv4)
+forward-addr = 2606:4700:4700::1111   ; Cloudflare DNS (IPv6)
 ```
 
 You can also specify different upstream DNS servers for specific zones by adding a zone name to the section header. This allows you to route queries for different domains to different DNS servers:
@@ -122,15 +131,21 @@ Define static hostname-to-IP address mappings:
 
 ```ini
 [hosts]
-printer1.lan = 192.168.123.123
-myserver.lan = 192.168.1.100
-ipv6host.lan = 2001:db8::1
+"printer1.lan" = 192.168.123.123
+"myserver.lan" = 192.168.1.100
+"ipv6host.lan" = 2001:db8::1
+
+[hosts "lan"]
+"printer1" = 192.168.123.123
+"myserver" = 192.168.1.100
+file = hosts.lan
 ```
 
 These mappings take precedence over DNS queries and are useful for:
 - Local network devices without proper DNS entries
 - Testing and development environments
 - Overriding public DNS records with local addresses
+- Serving PTR responses for reverse lookups such as `123.123.168.192.in-addr.arpa`
 
 **Note**: Avoid using `.local` domain names as they are reserved for mDNS (multicast DNS) and may cause conflicts.
 
@@ -183,28 +198,30 @@ sudo systemctl status behind
 BEHIND acts as a DNS proxy/forwarder with support for both UDP and TCP protocols:
 
 1. Listens for DNS queries on both UDP and TCP port 53 using epoll-based event handling for high performance
-2. Checks if there's a static host mapping in the [hosts] section
+2. Checks if there's a static host mapping in the [hosts] section, including reverse PTR lookups for configured host addresses
 3. Checks if the domain should be blocked using the domain filter (supports exact, prefix, suffix, and regex matching)
 4. Checks the local cache for recent responses (with per-record TTL tracking)
 5. If not cached, randomly selects one of the configured upstream DNS servers and forwards the query:
-   - **UDP forwarding**: Uses randomized source ports for enhanced security against DNS spoofing attacks
+   - **UDP forwarding**: Uses randomized source ports and connected UDP sockets for stronger upstream response validation
    - **TCP forwarding**: Uses non-blocking connections with epoll for efficient connection management
-   - Automatically falls back to TCP when UDP responses exceed 512 bytes (sets TC truncation flag)
+   - UDP responses that exceed 512 bytes are truncated at a record boundary and returned with the TC flag set
 6. Caches the response based on each record's TTL value (supports both UDP and TCP responses)
 7. Returns the response to the client with DNS name compression for efficiency
 
-The case randomization feature is always enabled and randomly changes the case of letters in domain names to help detect and prevent DNS spoofing attacks.
+The case randomization feature is always enabled and randomly changes the case of letters in domain names to help detect and prevent DNS spoofing attacks. Randomization uses a dedicated 32-bit uniform random stream rather than the transaction-ID sequence.
+
+Malformed DNS messages are rejected during parsing. BEHIND validates name RDATA boundaries, section counts, response QR/TC flags, question name, type, and class before forwarding responses into the cache.
 
 ### Protocol Handling
 
-- **UDP Protocol**: The primary protocol for DNS queries. BEHIND uses randomized source ports when forwarding UDP queries to upstream servers, which adds an extra layer of security by making it harder for attackers to predict and spoof DNS responses.
+- **UDP Protocol**: The primary protocol for DNS queries. BEHIND uses randomized source ports when forwarding UDP queries to upstream servers, and uses connected UDP sockets so responses are accepted only from the selected upstream endpoint.
 
 - **TCP Protocol**: Automatically used for:
   - Large DNS responses that exceed the UDP packet size limit (512 bytes)
   - Direct TCP queries from clients
   - TCP forwarding uses non-blocking connections managed by epoll, ensuring efficient handling of multiple simultaneous TCP connections without thread overhead
 
-- **Truncation Handling**: When a DNS response over UDP would exceed 512 bytes, BEHIND sets the TC (truncation) flag in the response, signaling the client to retry the query over TCP.
+- **Truncation Handling**: When a DNS response over UDP would exceed 512 bytes, BEHIND truncates at the last complete record that fits and sets the TC (truncation) flag, signaling the client to retry the query over TCP.
 
 ### Logging
 
@@ -213,4 +230,3 @@ BEHIND automatically manages log files:
 - The main log file is named `behind.log`
 - When rotation occurs, older logs are renamed with suffixes `.0` through `.9` (e.g., `behind.log.0`, `behind.log.1`)
 - All DNS queries and responses are logged for troubleshooting
-

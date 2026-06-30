@@ -45,13 +45,13 @@ static inline uint32_t ntohl_p(void const *p)
 
 std::string randomize_case(std::string qname, TransactionIdGenerator *gen)
 {
-	uint16_t bits = 0;
+	uint32_t bits = 0;
 	int remaining = 0;
 	for (size_t i = 0; i < qname.size(); i++) {
 		if (isalpha((unsigned char)qname[i])) {
 			if (remaining == 0) {
-				bits = gen ? gen->next() : (uint16_t)rand();
-				remaining = 16;
+				bits = gen ? gen->next_u32() : ((uint32_t)rand() << 16) ^ (uint32_t)rand();
+				remaining = 32;
 			}
 			if (bits & 1) {
 				qname[i] ^= 0x20;

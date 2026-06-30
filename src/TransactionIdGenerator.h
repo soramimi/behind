@@ -12,6 +12,7 @@ public:
 	TransactionIdGenerator();
 	~TransactionIdGenerator();
 	uint16_t next();
+	uint32_t next_u32();
 	uint16_t random_port();
 };
 
