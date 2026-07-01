@@ -98,11 +98,26 @@ int LineReader::line() const
 bool LineReader::open(const std::string &path)
 {
 	std::string abspath = misc::realpath(path);
+	if (abspath.empty()) {
+		return false;
+	}
+	// guard against runaway / cyclic include chains
+	constexpr size_t MAX_INCLUDE_DEPTH = 16;
+	if (files_.size() >= MAX_INCLUDE_DEPTH) {
+		logprintf(LOG_BOTH, "include depth limit exceeded, ignoring: %s\n", abspath.c_str());
+		return false;
+	}
+	for (File const &f : files_) {
+		if (f.path == abspath) {
+			logprintf(LOG_BOTH, "cyclic include detected, ignoring: %s\n", abspath.c_str());
+			return false;
+		}
+	}
 	int fd = ::open(abspath.c_str(), O_RDONLY);
 	if (fd != -1) {
 		logprintf(LOG_BOTH, "load config file: %s\n", abspath.c_str());
 		File file;
-		file.path = path;
+		file.path = abspath;
 		file.fd = fd;
 		file.line = 0;
 		files_.push_back(file);

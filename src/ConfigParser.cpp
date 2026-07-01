@@ -38,7 +38,7 @@ bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 				ptr++;
 			}
 			if (c == 0) {
-				if (key) {
+				if (key && eq) {
 					std::string_view k = misc::trimmed({key, (size_t)(eq - key)});
 					eq++; // skip '='
 					std::string_view v = misc::trimmed({eq, (size_t)((comment ? comment : pre) - eq)});

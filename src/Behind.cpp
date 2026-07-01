@@ -881,12 +881,12 @@ std::vector<Forwarder const *> Behind::choose_forwarder(std::string const &name,
 
 	{ // shuffle and resize
 		size_t n = forwarders->size();
-		size_t m = std::min((size_t)max, n);
-		for (size_t i = 0; i < m; i++) {
-			size_t j = i + rand() % (n - i);
+		size_t count = std::min((size_t)max, n);
+		for (size_t i = 0; i < count; i++) {
+			size_t j = i + (size_t)(m->txid_gen.next_u32() % (uint32_t)(n - i));
 			std::swap(forwarders->at(i), forwarders->at(j));
 		}
-		forwarders->resize(m);
+		forwarders->resize(count);
 	}
 
 	return *forwarders;
@@ -1037,6 +1037,15 @@ void Behind::delete_socket(std::shared_ptr<Task> task)
 {
 	if (task) {
 		delete_socket(task->upstream_fd, task->ev.get());
+		if (task->client_fd != -1 && task->client_fd != task->upstream_fd) {
+			// The accepted client TCP socket is registered in epoll under the
+			// original READING_FROM_CLIENT task and is not otherwise closed once
+			// forwarding starts. Release it whenever the owning task is torn down
+			// (reply sent, upstream error, or timeout in clean()) so that
+			// idle-after-query connections cannot leak file descriptors.
+			delete_socket(task->client_fd, nullptr);
+			task->client_fd = -1;
+		}
 	}
 }
 
@@ -2543,9 +2552,13 @@ Behind::ConnectionStatus Behind::process(InternalData *d, ProtocolFamilyType con
 				}
 			}
 		} else if (received.header.flags & 0x8000) { // response
-			drop_aa_flag(&received);
-			process_response(d, client_proto, received);
-			return ConnectionStatus::DONE;
+			// A response arriving on the listener socket has no legitimate source:
+			// genuine upstream replies are delivered on the connected per-task socket
+			// and handled by process_receive(). Accepting responses here would bypass
+			// the connected-socket source validation and let an off-path attacker inject
+			// (and cache) spoofed answers by guessing only the transaction id and 0x20
+			// case. Drop them.
+			return ConnectionStatus::ERROR;
 		}
 	}
 	return ConnectionStatus::ERROR;
@@ -2969,13 +2982,12 @@ void Behind::main()
 		v->clear();
 	};
 
+	// All listener/UDP sockets and live task sockets are tracked in select_in_fds
+	// (see ctl_add), so closing that set releases them. The previous explicit
+	// closesocket() calls here double-closed the UDP fds and closed the unused
+	// UDP listener_fd (-1) instead of the TCP listeners, so they are removed.
 	CloseSockets(&m->select_in_fds);
 	CloseSockets(&m->select_out_fds);
-
-	closesocket(d.in4_udp.fd);
-	closesocket(d.in6_udp.fd);
-	closesocket(d.in4_udp.listener_fd);
-	closesocket(d.in6_udp.listener_fd);
 }
 
 // test
