@@ -43,14 +43,14 @@ static inline uint32_t ntohl_p(void const *p)
 	return ntohl(v);
 }
 
-std::string randomize_case(std::string qname, RandomNumberGenerator *gen)
+std::string randomize_case(std::string qname, RandomNumberGenerator *rand)
 {
 	uint32_t bits = 0;
 	int remaining = 0;
 	for (size_t i = 0; i < qname.size(); i++) {
 		if (isalpha((unsigned char)qname[i])) {
 			if (remaining == 0) {
-				bits = gen ? gen->next_u32() : ((uint32_t)rand() << 16) ^ (uint32_t)rand();
+				bits = rand->next_u32();
 				remaining = 32;
 			}
 			if (bits & 1) {
@@ -524,13 +524,14 @@ struct Behind::ForwardingThreadData {
 
 struct Behind::Private {
 	Option option;
-
+	
+	RandomNumberGenerator rand;
+	
 	uint64_t start_time = 0;
 	uint64_t last_uptime_min = 0;
-
+	
 	std::vector<Hosts> hosts;
 	uint32_t local_transaction_id = 0;
-	RandomNumberGenerator txid_gen;
 	InetResolver resolver;
 	
 	Behind::SocketMode socket_mode;
@@ -883,7 +884,7 @@ std::vector<Forwarder const *> Behind::choose_forwarder(std::string const &name,
 		size_t n = forwarders->size();
 		size_t count = std::min((size_t)max, n);
 		for (size_t i = 0; i < count; i++) {
-			size_t j = i + (size_t)(m->txid_gen.next_u32() % (uint32_t)(n - i));
+			size_t j = i + (size_t)(m->rand.next_u32() % (uint32_t)(n - i));
 			std::swap(forwarders->at(i), forwarders->at(j));
 		}
 		forwarders->resize(count);
@@ -894,7 +895,7 @@ std::vector<Forwarder const *> Behind::choose_forwarder(std::string const &name,
 
 uint16_t Behind::next_txid()
 {
-	return m->txid_gen.next_txid();
+	return m->rand.next_txid();
 }
 
 size_t parse_space(char const *p)
@@ -1875,7 +1876,7 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 
 	std::string query_name = question.name;
 	if (m->option.case_randomize) {
-		query_name = randomize_case(query_name, &m->txid_gen);
+		query_name = randomize_case(query_name, &m->rand);
 	}
 	
 	dns::Message sending;
@@ -1906,7 +1907,7 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 		bool bound = false;
 		constexpr int MAX_BIND_ATTEMPTS = 32;
 		for (int attempt = 0; attempt < MAX_BIND_ATTEMPTS && !bound; attempt++) {
-			uint16_t port = m->txid_gen.random_port();
+			uint16_t port = m->rand.random_port();
 			if (forwarder.is_inet4()) {
 				struct sockaddr_in bind_sa = {};
 				bind_sa.sin_family = AF_INET;
@@ -1996,7 +1997,7 @@ Behind::ConnectionStatus Behind::forward_tcp(InternalData *d, ProtocolFamilyType
 	task->requester_id = client_request_id;
 	task->upstream_id = header.id;
 	task->request_name = question.name;
-	task->forward_name = m->option.case_randomize ? randomize_case(question.name, &m->txid_gen) : question.name;
+	task->forward_name = m->option.case_randomize ? randomize_case(question.name, &m->rand) : question.name;
 	task->type = question.type;
 	task->clas = question.clas;
 	task->client_proto = client_proto;

@@ -8,8 +8,8 @@ SRCS := \
     ../src/DomainFilter.cpp \
     ../src/LineReader.cpp \
     ../src/Logger.cpp \
-    ../src/RandomNumber.cpp \
-    ../src/TransactionIdGenerator.cpp \
+    ../src/RandomNumberGenerator.cpp \
+    ../src/ChaCha20.cpp \
     ../src/inetresolver.cpp \
     ../src/main.cpp \
     ../src/misc.cpp \

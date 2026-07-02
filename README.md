@@ -10,12 +10,12 @@ Designed for home networks and small organizations, BEHIND is typically deployed
 
 - **DNS Forwarding**: Forward DNS queries to upstream DNS servers with support for multiple forwarders and automatic random selection
 - **TCP/UDP Dual Protocol Support**: Support both UDP and TCP protocols for DNS queries. Large UDP responses are truncated with the TC flag so clients can retry over TCP
-- **UDP Port Randomization**: Randomized source port selection for UDP forwarding to enhance security and prevent DNS spoofing attacks
+- **UDP Port Randomization**: Randomized source port selection (IANA ephemeral range 49152-65535, per RFC 6056) for UDP forwarding to enhance security and prevent DNS spoofing attacks
 - **Dual Stack Support**: Full IPv4 and IPv6 support
 - **PTR Record Support**: Forward and cache reverse DNS lookups, including static reverse lookups for hosts entries
 - **DNS Cache**: Intelligent response caching with per-record TTL tracking (up to 4096 entries), supporting A, AAAA, PTR, SOA, TXT, and HTTPS responses over both UDP and TCP
 - **DNS Compression**: DNS name compression in response packets for reduced bandwidth usage
-- **Security**: DNS 0x20 encoding (case randomization), randomized transaction IDs, randomized UDP source ports, upstream response validation, and malformed DNS packet rejection
+- **Security**: DNS 0x20 encoding (case randomization), randomized transaction IDs, randomized UDP source ports, upstream response validation, and malformed DNS packet rejection. All randomness is derived from a ChaCha20-based CSPRNG seeded from the operating system (`getrandom`)
 - **Advanced Domain Filtering**: Block domains using exact match, prefix match, suffix match, or regex patterns (useful for ad-blocking)
 - **Static Host Resolution**: Define custom hostname-to-IP mappings in the configuration, with reverse PTR answers generated from the same host table
 - **Modular Configuration**: Support for nested configuration files using include directives
@@ -208,7 +208,9 @@ BEHIND acts as a DNS proxy/forwarder with support for both UDP and TCP protocols
 6. Caches the response based on each record's TTL value (supports both UDP and TCP responses)
 7. Returns the response to the client with DNS name compression for efficiency
 
-The case randomization feature is always enabled and randomly changes the case of letters in domain names to help detect and prevent DNS spoofing attacks. Randomization uses a dedicated 32-bit uniform random stream rather than the transaction-ID sequence.
+The case randomization feature is always enabled and randomly changes the case of letters in domain names to help detect and prevent DNS spoofing attacks.
+
+All security-sensitive randomness (transaction IDs, UDP source ports, and 0x20 case bits) is produced by a ChaCha20-based CSPRNG. Its key and nonce are seeded from the operating system's `getrandom` at startup; if the OS entropy source is unavailable, the server aborts rather than running with a predictable key.
 
 Malformed DNS messages are rejected during parsing. BEHIND validates name RDATA boundaries, section counts, response QR/TC flags, question name, type, and class before forwarding responses into the cache.
 

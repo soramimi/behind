@@ -11,6 +11,7 @@ gcc:QMAKE_CXXFLAGS += -Wall -Wextra -Werror=return-type -Werror=trigraphs -Wno-s
 
 SOURCES += \
     ../src/Behind.cpp \
+    ../src/ChaCha20.cpp \
     ../src/ConfigParser.cpp \
     ../src/DomainFilter.cpp \
     ../src/LineReader.cpp \
@@ -24,6 +25,7 @@ SOURCES += \
 
 HEADERS += \
     ../src/Behind.h \
+    ../src/ChaCha20.h \
     ../src/ConfigParser.h \
     ../src/DomainFilter.h \
     ../src/LineReader.h \
