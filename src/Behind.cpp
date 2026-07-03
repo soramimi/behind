@@ -16,6 +16,7 @@
 #include <optional>
 #include <regex>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <mutex>
 #include <thread>
@@ -529,7 +530,8 @@ struct Behind::Private {
 	
 	uint64_t start_time = 0;
 	uint64_t last_uptime_min = 0;
-	
+	uint64_t last_hosts_check = 0;
+
 	std::vector<Hosts> hosts;
 	uint32_t local_transaction_id = 0;
 	InetResolver resolver;
@@ -549,7 +551,14 @@ struct Behind::Private {
 		dns::Cache txt;
 		dns::Cache https;
 	} dns_cache;
-	std::vector<std::shared_ptr<Behind::Task>> tasks;
+	// Active forwarding tasks, indexed for O(1) dispatch.
+	// tasks_by_fd: upstream_fd -> task. Each task owns a unique socket, so the
+	//   fd is a unique key; this is the hot lookup in process_receive().
+	// fds_by_txid: local_transaction_id -> upstream_fd(s). A single UDP query
+	//   can fan out to two forwarder tasks that share one transaction id; when
+	//   one answers, clean_transaction() uses this to cancel the sibling.
+	std::unordered_map<int, std::shared_ptr<Behind::Task>> tasks_by_fd;
+	std::unordered_multimap<uint32_t, int> fds_by_txid;
 	std::vector<Forwarder> forwarders;
 };
 
@@ -713,6 +722,9 @@ int Behind::decode_name(const char *begin, const char *end, const char *ptr, std
 			if (n == 0) { // normal end
 				name->assign(buf, len);
 				return (firstjump ? firstjump : ptr) - start;
+			}
+			if (ptr + n > upper) { // label data extends past the input buffer
+				break;
 			}
 			if (len + 1 + n > sizeof(buf)) {
 				break;
@@ -1067,66 +1079,75 @@ void Behind::uptime()
 	}
 }
 
+// Remove a single (txid -> fd) entry from the multimap (a task can share its
+// txid with a sibling, so erase by the exact fd, not the whole key).
+static void erase_txid_fd(std::unordered_multimap<uint32_t, int> *mm, uint32_t txid, int fd)
+{
+	auto range = mm->equal_range(txid);
+	for (auto it = range.first; it != range.second; ++it) {
+		if (it->second == fd) {
+			mm->erase(it);
+			return;
+		}
+	}
+}
+
 void Behind::clean()
 {
 	uint64_t now = misc::get_tick_count();
-	size_t i = m->tasks.size();
-	while (i > 0) {
-		i--;
-			if (now - m->tasks[i]->timestamp >= (uint64_t)m->tasks[i]->timeout) {
-			delete_socket(m->tasks[i]);
-			m->tasks.erase(m->tasks.begin() + i);
+	for (auto it = m->tasks_by_fd.begin(); it != m->tasks_by_fd.end(); ) {
+		std::shared_ptr<Task> task = it->second;
+		if (now - task->timestamp >= (uint64_t)task->timeout) {
+			erase_txid_fd(&m->fds_by_txid, task->local_transaction_id, task->upstream_fd);
+			it = m->tasks_by_fd.erase(it);
+			delete_socket(task);
+		} else {
+			++it;
 		}
 	}
 }
 
 void Behind::clean_transaction(uint32_t id)
 {
-	size_t i = m->tasks.size();
-	while (i > 0) {
-		i--;
-		if (id == m->tasks[i]->local_transaction_id) {
-			delete_socket(m->tasks[i]);
-			m->tasks.erase(m->tasks.begin() + i);
+	auto range = m->fds_by_txid.equal_range(id);
+	std::vector<int> fds;
+	for (auto it = range.first; it != range.second; ++it) {
+		fds.push_back(it->second);
+	}
+	m->fds_by_txid.erase(id);
+	for (int fd : fds) {
+		auto it = m->tasks_by_fd.find(fd);
+		if (it != m->tasks_by_fd.end()) {
+			std::shared_ptr<Task> task = it->second;
+			m->tasks_by_fd.erase(it);
+			delete_socket(task);
 		}
 	}
-}
-
-std::shared_ptr<Behind::Task> Behind::take_task_item(std::vector<std::shared_ptr<Behind::Task>> *tasks, size_t index)
-{
-	std::shared_ptr<Behind::Task> item = std::move(tasks->at(index));
-	std::swap(tasks->at(index), tasks->back());
-	tasks->pop_back();
-	clean_transaction(item->local_transaction_id);
-	return item;
-}
-
-std::shared_ptr<Behind::Task> Behind::take_task_by_id(uint16_t upstream_id)
-{
-	for (size_t i = 0; i < m->tasks.size(); i++) {
-		if (m->tasks[i]->upstream_id == upstream_id) {
-			return take_task_item(&m->tasks, i);
-		}
-	}
-	return {};
 }
 
 std::shared_ptr<Behind::Task> Behind::take_task_by_fd(int fd)
 {
-	for (size_t i = 0; i < m->tasks.size(); i++) {
-		if (m->tasks[i]->upstream_fd == fd) {
-			return take_task_item(&m->tasks, i);
-		}
+	auto it = m->tasks_by_fd.find(fd);
+	if (it == m->tasks_by_fd.end()) {
+		return {};
 	}
-	return {};
+	std::shared_ptr<Task> item = it->second;
+	m->tasks_by_fd.erase(it);
+	erase_txid_fd(&m->fds_by_txid, item->local_transaction_id, fd);
+	// Cancel any sibling task that shares this transaction id (e.g. the second
+	// UDP forwarder for the same query); the first response wins.
+	clean_transaction(item->local_transaction_id);
+	return item;
 }
 
 void Behind::push_task(std::shared_ptr<Task> task, int timeout, uint32_t epoll_events)
 {
-	{
-		auto t = take_task_by_id(task->upstream_id);
-		delete_socket(t);
-	}
+	// Tasks are dispatched by their (unique, freshly-allocated) upstream_fd via
+	// take_task_by_fd(), so there is no need to evict by upstream_id here.
+	// Evicting by upstream_id was actively harmful: READING_FROM_CLIENT tasks
+	// leave upstream_id at 0 and TCP forward tasks use the client-supplied
+	// header.id, so registering one connection could tear down an unrelated
+	// one (a second TCP client, or a client that sent id 0).
 
 	init_epoll_event(task.get(), task->upstream_fd, epoll_events);
 	ctl_add(task->upstream_fd, task->ev.get(), true, false);
@@ -1134,7 +1155,8 @@ void Behind::push_task(std::shared_ptr<Task> task, int timeout, uint32_t epoll_e
 	task->timestamp = misc::get_tick_count();
 	task->timeout = timeout;
 
-	m->tasks.push_back(task);
+	m->tasks_by_fd[task->upstream_fd] = task;
+	m->fds_by_txid.insert({task->local_transaction_id, task->upstream_fd});
 }
 
 bool Behind::parse_dns_message(const char *begin, const char *end, dns::Message *msg)
@@ -1869,8 +1891,8 @@ void Behind::init_epoll_event(Behind::Task *task, int fd, uint32_t events)
 
 void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client_proto, dns::Header const &header, dns::Question const &question, uint32_t local_transaction_id, Forwarder const &forwarder)
 {
-	if (m->tasks.size() >= m->option.max_tasks) {
-		logprintf(LOG_DEFAULT, "too many tasks (%zu): dropping UDP query\n", m->tasks.size());
+	if (m->tasks_by_fd.size() >= m->option.max_tasks) {
+		logprintf(LOG_DEFAULT, "too many tasks (%zu): dropping UDP query\n", m->tasks_by_fd.size());
 		return;
 	}
 
@@ -2365,45 +2387,6 @@ void Behind::reply_to_client_udp(InternalData *d, std::shared_ptr<Task> task, dn
 	}
 }
 
-void Behind::process_response(InternalData *d, ProtocolFamilyType const &upstream_proto, dns::Message const &received)
-{
-	std::shared_ptr<Task> task = take_task_by_id(received.header.id);
-	if (!task) return;
-	if ((received.header.flags & 0x8000) == 0 || received.questions.size() != 1) return;
-	dns::Question const &rq = received.questions.front();
-	if (rq.name != task->forward_name || rq.type != task->type || rq.clas != task->clas) return;
-	if (task->upstream_proto == upstream_proto && accept_dns_type(task->type)) {
-		bool tc = bool(received.header.flags & 0x0200);
-		if (tc) { // truncated
-			if (task->client_proto.is_stream() && task->client_fd != -1) {
-				// TCP client: retry the query over TCP to get the full response
-				std::string qname = task->forward_name;
-				std::vector<Forwarder const *> forwarders = choose_forwarder(qname, 1);
-				if (!forwarders.empty()) {
-					dns::Header header;
-					header.id = next_txid();
-					header.flags = received.header.flags & ~0x0200;
-					dns::Question q;
-					q.name = task->request_name;
-					q.type = task->type;
-					q.clas = task->clas;
-					auto local_transaction_id = next_local_transaction_id();
-					forward_tcp(d, task->client_proto, task->client_fd, task->requester_id, header, q, local_transaction_id, *forwarders.front());
-				}
-			} else {
-				// UDP client: pass the truncated response as-is so the client retries over TCP
-				if (task->op == Operation::REPLY_TO_CLIENT_UDP) {
-					reply_to_client_udp(d, task, received);
-				}
-			}
-		} else {
-			if (task->op == Operation::REPLY_TO_CLIENT_UDP) {
-				reply_to_client_udp(d, task, received);
-			}
-		}
-	}
-}
-
 void Behind::process_receive(InternalData *d, int upstream_fd)
 {
 	std::shared_ptr<Task> task = take_task_by_fd(upstream_fd);
@@ -2427,6 +2410,14 @@ void Behind::process_receive(InternalData *d, int upstream_fd)
 					if (task->upstream_proto.is_stream()) {
 						auto ret = process_query_tcp(d, task->upstream_proto, task->upstream_fd, received, q);
 						if (ret == ConnectionStatus::CONTINUE) {
+							// Forwarding has started: ownership of the client fd has
+							// moved to the new FORWARD_TO_UPSTREAM_TCP task (as its
+							// client_fd), which will close it at teardown. Remove the
+							// client fd from epoll now, otherwise a stray client packet
+							// or FIN during the forwarding window would fire
+							// process_receive() with no matching task and close the
+							// socket out from under the forward task.
+							ctl_del(task->upstream_fd, task->ev.get());
 							return Done(false); // keep client connection alive
 						}
 					}
@@ -2583,8 +2574,8 @@ void Behind::process_tcp(InternalData *d, sa_family_t family)
 		d->in6_tcp.fd = sock;
 	}
 	if (sock != -1) {
-		if (m->tasks.size() >= m->option.max_tasks) {
-			logprintf(LOG_DEFAULT, "too many tasks (%zu): rejecting TCP connection\n", m->tasks.size());
+		if (m->tasks_by_fd.size() >= m->option.max_tasks) {
+			logprintf(LOG_DEFAULT, "too many tasks (%zu): rejecting TCP connection\n", m->tasks_by_fd.size());
 			closesocket(sock);
 			return;
 		}
@@ -2711,6 +2702,19 @@ Hosts Behind::load_hosts_file(std::string const &suffix, std::string const &path
 
 void Behind::update_hosts_files(bool force)
 {
+	// This runs on the hot query path (find_host / PTR lookups), so throttle
+	// the per-file stat() syscalls: an unforced check inspects the files at
+	// most once per interval. File changes are still picked up within that
+	// window via mtime. A forced check (startup / SIGHUP reload) always runs.
+	if (!force) {
+		constexpr uint64_t HOSTS_CHECK_INTERVAL_MS = 1000;
+		uint64_t now = misc::get_tick_count();
+		if (now - m->last_hosts_check < HOSTS_CHECK_INTERVAL_MS) {
+			return;
+		}
+		m->last_hosts_check = now;
+	}
+
 	std::vector<Option::HostsFile> const &hostsfiles = m->option.hostsfiles;
 
 	for (Option::HostsFile const &hf : hostsfiles) {
@@ -3046,7 +3050,38 @@ void Behind::self_test()
 		EXPECT_EQ(r, 0);
 		EXPECT_EQ(out, "");
 	}
-	
+
+	// decode_name out-of-bounds read test (guard page)
+	//
+	// A malformed name whose label length claims more bytes than remain in
+	// the message must not read past the end of the input buffer. We place a
+	// single length byte (0x3f = 63) at the very last readable byte before a
+	// PROT_NONE guard page. In current code decode_name advances past the
+	// length byte and memcpy()s 63 bytes from the guard page, causing SIGSEGV.
+	// Once the source bound is checked, decode_name must return 0 safely.
+	{
+		long page = sysconf(_SC_PAGESIZE);
+		if (page > 0) {
+			size_t pagesize = (size_t)page;
+			char *base = (char *)mmap(nullptr, pagesize * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			if (base != MAP_FAILED) {
+				// make the second page inaccessible
+				if (mprotect(base + pagesize, pagesize, PROT_NONE) == 0) {
+					char *lenbyte = base + pagesize - 1; // last readable byte
+					*lenbyte = 0x3f; // label length 63, but no data follows before the guard page
+					std::string out;
+					char const *begin = lenbyte;
+					char const *ptr = lenbyte;
+					char const *end = lenbyte + 2; // extends into the guard page; only used as a bound, never dereferenced
+					int r = decode_name(begin, end, ptr, &out);
+					EXPECT_EQ(r, 0);
+					EXPECT_EQ(out, "");
+				}
+				munmap(base, pagesize * 2);
+			}
+		}
+	}
+
 	// domain filter test
 	
 	{

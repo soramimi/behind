@@ -235,7 +235,6 @@ private:
 	void init_forwarder();
 	void clean();
 	void clean_transaction(uint32_t id);
-	std::shared_ptr<Task> take_task_by_id(uint16_t upstream_id);
 	void push_task(std::shared_ptr<Task> task, int timeout, uint32_t epoll_events);
 	static bool parse_dns_message(char const *begin, char const *end, dns::Message *msg);
 
@@ -287,7 +286,6 @@ private:
 	dns::Cache *get_cache(DNS_TYPE type);
 	void process_query_udp(InternalData *d, const ProtocolFamilyType &proto, const dns::Message &received, const dns::Question &question);
 	ConnectionStatus process_query_tcp(InternalData *d, const ProtocolFamilyType &client_proto, int client_fd, const dns::Message &received, const dns::Question &q);
-	void process_response(InternalData *d, const ProtocolFamilyType &upstream_proto, const dns::Message &received);
 	uint16_t next_txid();
 	void process_receive(InternalData *d, int upstream_fd);
 	std::shared_ptr<Task> take_task_by_fd(int fd);
@@ -298,7 +296,6 @@ private:
 	void init_epoll_event(Task *task, int fd, uint32_t events);
 	void uptime();
 	void drop_aa_flag(dns::Message *msg);
-	std::shared_ptr<Task> take_task_item(std::vector<std::shared_ptr<Behind::Task> > *tasks, size_t index);
 	Hosts load_hosts_file(const std::string &suffix, const std::string &path);
 	void update_hosts_files(bool force);
 public:

@@ -15,12 +15,12 @@ Designed for home networks and small organizations, BEHIND is typically deployed
 - **PTR Record Support**: Forward and cache reverse DNS lookups, including static reverse lookups for hosts entries
 - **DNS Cache**: Intelligent response caching with per-record TTL tracking (up to 4096 entries), supporting A, AAAA, PTR, SOA, TXT, and HTTPS responses over both UDP and TCP
 - **DNS Compression**: DNS name compression in response packets for reduced bandwidth usage
-- **Security**: DNS 0x20 encoding (case randomization), randomized transaction IDs, randomized UDP source ports, upstream response validation, and malformed DNS packet rejection. All randomness is derived from a ChaCha20-based CSPRNG seeded from the operating system (`getrandom`)
+- **Security**: DNS 0x20 encoding (case randomization), randomized transaction IDs, randomized UDP source ports, upstream response validation, and bounds-checked parsing that rejects malformed DNS packets. All randomness is derived from a ChaCha20-based CSPRNG seeded from the operating system (`getrandom`)
 - **Advanced Domain Filtering**: Block domains using exact match, prefix match, suffix match, or regex patterns (useful for ad-blocking)
 - **Static Host Resolution**: Define custom hostname-to-IP mappings in the configuration, with reverse PTR answers generated from the same host table
 - **Modular Configuration**: Support for nested configuration files using include directives
 - **Logging**: Automatic log file rotation with date-based filenames
-- **High Performance**: epoll-based event handling with non-blocking I/O for improved scalability and minimal resource usage
+- **High Performance**: epoll-based event handling with non-blocking I/O, and constant-time (O(1)) lookup of in-flight forwarding tasks, for improved scalability and minimal resource usage
 
 ## Building
 
