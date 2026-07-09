@@ -89,19 +89,19 @@ static void chacha20_init_state(uint32_t state[16], const uint8_t key[32], const
 void ChaCha20::seed_zero()
 {
 	memset(key_, 0, sizeof(key_));
-	memset(iv_, 0, sizeof(iv_));
+	memset(nonce_, 0, sizeof(nonce_));
 }
 
 void ChaCha20::seed_random()
 {
 	fill_random(key_, sizeof(key_));
-	fill_random(iv_, sizeof(iv_));
+	fill_random(nonce_, sizeof(nonce_));
 }
 
 ChaCha20::ChaCha20()
 {
 	seed_random();
-	chacha20_init_state(state_, key_, iv_, 0);
+	chacha20_init_state(state_, key_, nonce_, 0);
 }
 
 uint32_t ChaCha20::next_u32()

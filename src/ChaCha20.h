@@ -7,7 +7,7 @@ class ChaCha20 {
 private:
 	static constexpr int BUFFER_SIZE = 16;
 	uint8_t key_[32] = { 0 };
-	uint8_t iv_[12] = { 0 };
+	uint8_t nonce_[12] = { 0 };
 	uint32_t state_[BUFFER_SIZE] = { 0 };
 	uint32_t buffer_[BUFFER_SIZE] = { 0 };
 	int index_ = 0;

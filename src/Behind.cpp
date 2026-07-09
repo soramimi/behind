@@ -44,14 +44,14 @@ static inline uint32_t ntohl_p(void const *p)
 	return ntohl(v);
 }
 
-std::string randomize_case(std::string qname, RandomNumberGenerator *rand)
+std::string randomize_case(std::string qname, RandomNumberGenerator *rng)
 {
 	uint32_t bits = 0;
 	int remaining = 0;
 	for (size_t i = 0; i < qname.size(); i++) {
 		if (isalpha((unsigned char)qname[i])) {
 			if (remaining == 0) {
-				bits = rand->next_u32();
+				bits = rng->next_u32();
 				remaining = 32;
 			}
 			if (bits & 1) {
@@ -526,7 +526,7 @@ struct Behind::ForwardingThreadData {
 struct Behind::Private {
 	Option option;
 	
-	RandomNumberGenerator rand;
+	RandomNumberGenerator rng;
 	
 	uint64_t start_time = 0;
 	uint64_t last_uptime_min = 0;
@@ -603,49 +603,47 @@ Behind::~Behind()
 	delete m;
 }
 
-bool Behind::eqi(const std::string &l, const std::string &r)
+inline bool Behind::eqi(const std::string &l, const std::string &r)
 {
 	return stricmp(l.c_str(), r.c_str()) == 0;
 }
 
-uint16_t Behind::listen_port() const
+inline uint16_t Behind::listen_port() const
 {
 	return m->option.listen_port;
 }
 
-
-
-void Behind::write(std::vector<char> *out, char c)
+inline void Behind::write(std::vector<char> *out, char c)
 {
 	out->push_back(c);
 }
 
-void Behind::write(std::vector<char> *out, const char *src, int len)
+inline void Behind::write(std::vector<char> *out, const char *src, int len)
 {
 	if (src && len > 0) {
 		out->insert(out->end(), src, src + len);
 	}
 }
 
-void Behind::write_us(std::vector<char> *out, uint16_t v)
+inline void Behind::write_us(std::vector<char> *out, uint16_t v)
 {
 	v = htons(v);
 	write(out, (char const *)&v, 2);
 }
 
-void Behind::write_ul(std::vector<char> *out, uint32_t v)
+inline void Behind::write_ul(std::vector<char> *out, uint32_t v)
 {
 	v = htonl(v);
 	write(out, (char const *)&v, 4);
 }
 
-void Behind::write_us(void *out, uint16_t v)
+inline void Behind::write_us(void *out, uint16_t v)
 {
 	v = htons(v);
 	memcpy(out, (char const *)&v, 2);
 }
 
-void Behind::write_ul(void *out, uint32_t v)
+inline void Behind::write_ul(void *out, uint32_t v)
 {
 	v = htonl(v);
 	memcpy(out, (char const *)&v, 4);
@@ -896,7 +894,7 @@ std::vector<Forwarder const *> Behind::choose_forwarder(std::string const &name,
 		size_t n = forwarders->size();
 		size_t count = std::min((size_t)max, n);
 		for (size_t i = 0; i < count; i++) {
-			size_t j = i + (size_t)(m->rand.next_u32() % (uint32_t)(n - i));
+			size_t j = i + (size_t)(m->rng.next_u32() % (uint32_t)(n - i));
 			std::swap(forwarders->at(i), forwarders->at(j));
 		}
 		forwarders->resize(count);
@@ -907,7 +905,7 @@ std::vector<Forwarder const *> Behind::choose_forwarder(std::string const &name,
 
 uint16_t Behind::next_txid()
 {
-	return m->rand.next_txid();
+	return m->rng.next_txid();
 }
 
 size_t parse_space(char const *p)
@@ -925,8 +923,8 @@ InetAddrPort InetAddrPort::parse(std::string name)
 {
 	InetAddrPort ret;
 
-	std::regex re_ipv4(R"(^\s*((\d{1,3}\.){3}\d{1,3})(@(\d+))?\s*$)");
-	std::regex re_ipv6(R"(^\s*(\[[0-9a-fA-F:]+\]|[0-9a-fA-F:]+)(@(\d+))?\s*$)");
+	std::regex re_ipv4(R"---(^\s*((\d{1,3}\.){3}\d{1,3})(@(\d+))?\s*$)---");
+	std::regex re_ipv6(R"---(^\s*(\[[0-9a-fA-F:]+\]|[0-9a-fA-F:]+)(@(\d+))?\s*$)---");
 
 	auto ParsePortNumber = [](std::string const &s){
 		int v = 0;
@@ -1898,7 +1896,7 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 
 	std::string query_name = question.name;
 	if (m->option.case_randomize) {
-		query_name = randomize_case(query_name, &m->rand);
+		query_name = randomize_case(query_name, &m->rng);
 	}
 	
 	dns::Message sending;
@@ -1929,7 +1927,7 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 		bool bound = false;
 		constexpr int MAX_BIND_ATTEMPTS = 32;
 		for (int attempt = 0; attempt < MAX_BIND_ATTEMPTS && !bound; attempt++) {
-			uint16_t port = m->rand.random_port();
+			uint16_t port = m->rng.random_port();
 			if (forwarder.is_inet4()) {
 				struct sockaddr_in bind_sa = {};
 				bind_sa.sin_family = AF_INET;
@@ -2019,7 +2017,7 @@ Behind::ConnectionStatus Behind::forward_tcp(InternalData *d, ProtocolFamilyType
 	task->requester_id = client_request_id;
 	task->upstream_id = header.id;
 	task->request_name = question.name;
-	task->forward_name = m->option.case_randomize ? randomize_case(question.name, &m->rand) : question.name;
+	task->forward_name = m->option.case_randomize ? randomize_case(question.name, &m->rng) : question.name;
 	task->type = question.type;
 	task->clas = question.clas;
 	task->client_proto = client_proto;
@@ -2380,9 +2378,11 @@ void Behind::reply_to_client_udp(InternalData *d, std::shared_ptr<Task> task, dn
 		d2.in6_udp.sa6 = task->client_sa6;
 		send_dns_message(&d2, task->client_proto, sending, false, false);
 		// cahce
-		dns::Cache *cache = get_cache(task->type);
-		if (cache && valid_for_cache) {
-			cache->insert(task->forward_name, sending, cache_min_ttl());
+		if (valid_for_cache) {
+			dns::Cache *cache = get_cache(task->type);
+			if (cache) {
+				cache->insert(task->forward_name, sending, cache_min_ttl());
+			}
 		}
 	}
 }
@@ -2499,12 +2499,7 @@ void Behind::process_receive(InternalData *d, int upstream_fd)
 					return Done(true);
 				}
 				drop_aa_flag(&received);
-				bool tc = bool(received.header.flags & 0x0200);
-				if (tc) {
-					reply_to_client_udp(d, task, received);
-				} else {
-					reply_to_client_udp(d, task, received);
-				}
+				reply_to_client_udp(d, task, received);
 			}
 			return Done(true);
 		}
@@ -2586,8 +2581,6 @@ void Behind::process_tcp(InternalData *d, sa_family_t family)
 		push_task(task, 3000, EPOLLIN | EPOLLERR | EPOLLHUP);
 	}
 }
-
-
 
 bool Behind::init_socket(void *private_in, ProtocolFamilyType proto)
 {
@@ -2682,15 +2675,15 @@ Hosts Behind::load_hosts_file(std::string const &suffix, std::string const &path
 			std::string_view ip = words[0];
 			InetAddrPort addrport = InetAddrPort::parse(std::string(ip));
 			if (addrport) {
-			for (size_t i = 1; i < words.size(); i++) {
-				std::string name(words[i]);
-				name = make_host_name(name, suffix);
-				if (!misc::is_valid_domain(name)) {
-					logprintf(LOG_DEFAULT, "invalid host name in hosts file %s: %s\n", path.c_str(), name.c_str());
-					continue;
+				for (size_t i = 1; i < words.size(); i++) {
+					std::string name(words[i]);
+					name = make_host_name(name, suffix);
+					if (!misc::is_valid_domain(name)) {
+						logprintf(LOG_DEFAULT, "invalid host name in hosts file %s: %s\n", path.c_str(), name.c_str());
+						continue;
+					}
+					hosts.set(name, addrport.addr);
 				}
-				hosts.set(name, addrport.addr);
-			}
 			} else {
 				logprintf(LOG_DEFAULT, "invalid IP address in hosts file %s: %s\n", path.c_str(), ip.data());
 			}
