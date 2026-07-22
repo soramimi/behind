@@ -1,7 +1,18 @@
 #include "DomainFilter.h"
 #include "misc.h"
-#include <regex>
 #include <cstring>
+
+namespace {
+
+bool fail(std::string *error, std::string message)
+{
+	if (error) {
+		*error = std::move(message);
+	}
+	return false;
+}
+
+}
 
 std::string domain_suffix_key(std::string const &name)
 {
@@ -125,59 +136,98 @@ DomainFilter::Kind DomainFilter::find(std::string const &name) const
 		}
 	}
 	// regex match
-	for (Item const &item : regex_list_) {
-		if (std::regex_match(loname, std::regex(item.name))) {
+	for (RegexItem const &item : regex_list_) {
+		try {
+			if (std::regex_match(loname, item.expression)) {
+				return item.kind;
+			}
+		} catch (std::regex_error const &) {
+			// A deny/filter rule must never become fail-open because the regex engine
+			// hit a run-time resource/complexity error.
 			return item.kind;
 		}
 	}
 	return NORMAL;
 }
 
-void DomainFilter::add_entry(std::string const &name, Kind kind)
+bool DomainFilter::add_entry(std::string const &name, Kind kind, std::string *error)
 {
+	if (name.empty()) {
+		return fail(error, "filter value must not be empty");
+	}
+	if (entry_count_ >= 100000) {
+		return fail(error, "too many filter rules (maximum 100000)");
+	}
+	if (name.size() > 4096) {
+		return fail(error, "filter rule is too long (maximum 4096 bytes)");
+	}
+	auto Success = [&](){
+		entry_count_++;
+		return true;
+	};
+
 	std::string loname = misc::strtolower(name);
-	if (loname.size() > 2) {
-		if (loname[0] == '/' && loname[loname.size() - 1] == '/') {
-			// regex match
-			Item item;
-			item.kind = kind;
-			item.name = loname.substr(1, loname.size() - 2);
-			regex_list_.push_back(item);
-			return;
+
+	if (name.size() >= 2 && name.front() == '/' && name.back() == '/') {
+		std::string pattern = name.substr(1, name.size() - 2);
+		if (pattern.empty()) {
+			return fail(error, "regular expression must not be empty");
 		}
-		if (loname[0] == '*' && loname[loname.size() - 1] == '*') {
-			// middle match
-			Item item;
+		try {
+			RegexItem item;
 			item.kind = kind;
-			item.name = loname.substr(1, loname.size() - 2);
-			middle_map_.push_back(item);
-			return;
-		}
-		if (loname[loname.size() - 2] == '.' && loname[loname.size() - 1] == '*') {
-			// prefix match
-			std::string key = domain_prefix_key(loname);
-			Item item;
-			item.kind = kind;
-			item.name = loname.substr(0, loname.size() - 1);
-			auto it = prefix_map_.find(key);
-			if (it == prefix_map_.end()) {
-				it = prefix_map_.insert(it, std::make_pair(key, std::vector<Item>()));
-			}
-			it->second.push_back(item);
-			return;
+			item.expression = std::regex(pattern,
+				std::regex_constants::ECMAScript | std::regex_constants::icase);
+			regex_list_.push_back(std::move(item));
+			return Success();
+		} catch (std::regex_error const &e) {
+			return fail(error, std::string("invalid regular expression: ") + e.what());
 		}
 	}
+
+	if (loname.size() >= 2 && loname.front() == '*' && loname.back() == '*') {
+		std::string needle = loname.substr(1, loname.size() - 2);
+		if (needle.empty()) {
+			return fail(error, "middle-match filter must not be empty");
+		}
+		Item item;
+		item.kind = kind;
+		item.name = std::move(needle);
+		middle_map_.push_back(std::move(item));
+		return Success();
+	}
+
+	if (loname.size() >= 3 && loname.compare(loname.size() - 2, 2, ".*") == 0) {
+		std::string prefix = loname.substr(0, loname.size() - 1);
+		if (prefix == "." || !misc::is_valid_domain(prefix)) {
+			return fail(error, "invalid prefix-match domain");
+		}
+		std::string key = domain_prefix_key(loname);
+		if (key.empty()) {
+			return fail(error, "invalid prefix-match domain");
+		}
+		Item item;
+		item.kind = kind;
+		item.name = std::move(prefix);
+		auto it = prefix_map_.find(key);
+		if (it == prefix_map_.end()) {
+			it = prefix_map_.insert(it, std::make_pair(key, std::vector<Item>()));
+		}
+		it->second.push_back(std::move(item));
+		return Success();
+	}
+
 	{
 		// suffix match
 		Item item;
 		item.kind = kind;
-		if (loname[0] == '*' || loname[1] == '.') {
+		if (loname.size() >= 2 && loname[0] == '*' && loname[1] == '.') {
 			item.name = loname.substr(2);
 		} else {
 			item.name = loname;
 		}
 		if (!misc::is_valid_domain(item.name)) {
-			return;
+			return fail(error, "invalid filter domain or wildcard pattern");
 		}
 		std::string key = domain_suffix_key(loname);
 		if (!key.empty()) {
@@ -185,24 +235,24 @@ void DomainFilter::add_entry(std::string const &name, Kind kind)
 			if (it == suffix_map_.end()) {
 				it = suffix_map_.insert(it, std::make_pair(key, std::vector<Item>()));
 			}
-			it->second.push_back(item);
-			return;
+			it->second.push_back(std::move(item));
+			return Success();
 		}
 	}
+	return fail(error, "invalid filter domain");
 }
 
-void DomainFilter::add_nxdomain(std::string const &name)
+bool DomainFilter::add_nxdomain(std::string const &name, std::string *error)
 {
-	add_entry(name, Kind::NXDOMAIN);
+	return add_entry(name, Kind::NXDOMAIN, error);
 }
 
-void DomainFilter::add_nodata(const std::string &name)
+bool DomainFilter::add_nodata(const std::string &name, std::string *error)
 {
-	add_entry(name, Kind::NODATA);
+	return add_entry(name, Kind::NODATA, error);
 }
 
-void DomainFilter::add_nodata_aaaa(const std::string &name)
+bool DomainFilter::add_nodata_aaaa(const std::string &name, std::string *error)
 {
-	add_entry(name, Kind::NODATA_AAAA);
+	return add_entry(name, Kind::NODATA_AAAA, error);
 }
-

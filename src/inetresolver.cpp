@@ -19,50 +19,31 @@
 bool InetResolver::resolve(const char *name, Type type, Addr *out)
 {
 	if (!name || !out) return false;
-
-	if (type == InetResolver::IN4) {
-		out->type = type;
-		struct addrinfo hints;
-		memset(&hints, 0, sizeof(hints));
-		hints.ai_socktype = SOCK_STREAM;
-		hints.ai_family = AF_INET;
-		struct addrinfo *res = nullptr;
-		int err = getaddrinfo(name, NULL, &hints, &res);
-		if (err != 0) {
-			logprintf(LOG_DEFAULT, "error %d\n", err);
-			return false;
-		}
-		for (struct addrinfo *p = res; p; p = p->ai_next) {
-			struct sockaddr_in *addr = (struct sockaddr_in *)p->ai_addr;
-			std::vector<uint8_t> a(sizeof(in_addr));
-			memcpy(a.data(), &addr->sin_addr.s_addr, sizeof(struct in_addr));
-			out->addr.push_back(a);
-			break;
-		}
-		freeaddrinfo(res);
-	} else if (type == InetResolver::IN6) {
-		out->type = type;
-		struct addrinfo hints;
-		memset(&hints, 0, sizeof(hints));
-		hints.ai_socktype = SOCK_STREAM;
-		hints.ai_family = AF_INET6;
-		struct addrinfo *res = nullptr;
-		int err = getaddrinfo(name, NULL, &hints, &res);
-		if (err != 0) {
-			logprintf(LOG_DEFAULT, "error %d\n", err);
-			return false;
-		}
-		for (struct addrinfo *p = res; p; p = p->ai_next) {
-			struct sockaddr_in6 *addr = (struct sockaddr_in6 *)p->ai_addr;
-			std::vector<uint8_t> a(sizeof(in6_addr));
-			memcpy(a.data(), addr->sin6_addr.s6_addr, sizeof(struct in6_addr));
-			out->addr.push_back(a);
-			break;
-		}
-		freeaddrinfo(res);
+	out->type = UNSPEC;
+	out->addr.clear();
+	struct addrinfo hints = {};
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_family = type == IN4 ? AF_INET : type == IN6 ? AF_INET6 : AF_UNSPEC;
+	struct addrinfo *result = nullptr;
+	int error = getaddrinfo(name, nullptr, &hints, &result);
+	if (error != 0) {
+		logprintf(LOG_DEFAULT, "resolve %s: %s\n", name, gai_strerror(error));
+		return false;
 	}
-
-	return true;
+	for (struct addrinfo *item = result; item; item = item->ai_next) {
+		if (item->ai_family == AF_INET && item->ai_addrlen >= sizeof(sockaddr_in)) {
+			auto *address = (sockaddr_in *)item->ai_addr;
+			out->add_in4(&address->sin_addr);
+			break;
+		}
+		if (item->ai_family == AF_INET6 && item->ai_addrlen >= sizeof(sockaddr_in6)) {
+			auto *address = (sockaddr_in6 *)item->ai_addr;
+			out->add_in6(&address->sin6_addr);
+			break;
+		}
+	}
+	freeaddrinfo(result);
+	return !out->empty();
 }
 
 void InetResolver::Addr::add_in4(const _in_addr *a)

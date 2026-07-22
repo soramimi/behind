@@ -4,6 +4,7 @@
 #include "DomainFilter.h"
 #include "RandomNumberGenerator.h"
 #include "inetresolver.h"
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -68,6 +69,7 @@ inline bool operator == (const ProtocolFamilyType &l, const ProtocolFamilyType &
 class Hosts {
 private:
 public:
+	bool valid = true;
 	std::string path;
 	time_t mtime = 0;
 	std::unordered_map<std::string, InetResolver::Addr> map_;
@@ -89,6 +91,7 @@ struct Option {
 	struct Zone {
 		std::string zone;
 		std::string name;
+		InetAddrPort endpoint;
 	};
 	std::vector<Zone> forward_addr;
 	bool case_randomize = true; // always true
@@ -102,13 +105,19 @@ struct Option {
 	struct HostsFile {
 		std::string suffix;
 		std::string path;
+		std::optional<Hosts> initial_data;
 	};
 	std::vector<HostsFile> hostsfiles;
 	// resource limits and security tuning
-	size_t max_tasks = 1000;
+	size_t max_tasks = 500;
 	size_t max_cache_entry_size = 65535;
+	size_t max_cache_bytes = 64 * 1024 * 1024;
 	uint32_t max_ttl = 86400;
 	uint16_t edns0_buffer_size = 1232;
+	std::vector<std::string> allow_clients;
+	uint32_t rate_limit_qps = 1000;
+	uint32_t rate_limit_burst = 2000;
+	uint32_t upstream_timeout_ms = 3000;
 };
 
 enum class DNS_CLASS : uint16_t {
@@ -167,12 +176,14 @@ private:
 	enum class Operation {
 		NONE,
 		READING_FROM_CLIENT,
+		WRITING_TO_CLIENT_TCP,
 		REPLY_TO_CLIENT_UDP,
 		REPLY_TO_CLIENT_TCP,
 		FORWARD_TO_UPSTREAM_TCP,
 	};
 
 	struct Task;
+	struct PendingQuery;
 	struct ForwardingThreadData;
 
 	enum class SocketMode {
@@ -233,20 +244,23 @@ private:
 	static int parse_question_section(char const *begin, char const *end, char const *ptr, dns::Question *out);
 	std::vector<const Forwarder *> choose_forwarder(const std::string &name, size_t max) const;
 	void init_forwarder();
-	void clean();
+	void clean(InternalData *d);
 	void clean_transaction(uint32_t id);
 	void push_task(std::shared_ptr<Task> task, int timeout, uint32_t epoll_events);
+	void finish_task(std::shared_ptr<Task> task, bool close_client = true);
 	static bool parse_dns_message(char const *begin, char const *end, dns::Message *msg);
 
 	bool is_nodata(std::string const &name) const;
 	bool is_nxdomain(std::string const &name) const;
 	bool is_nodata_aaaa(std::string const &name) const;
-	bool is_valid_response(std::shared_ptr<Task> task, dns::Message const &received) const;
+	bool is_matching_response(std::shared_ptr<Task> task, dns::Message const &received) const;
+	bool is_cacheable_response(std::shared_ptr<Task> task, dns::Message const &received) const;
 
 	struct Packet;
-	static Packet make_dns_packet(dns::Message const &msg, bool tcp);
+	static Packet make_dns_packet(dns::Message const &msg, bool tcp, uint16_t udp_limit = 512);
 	bool send_dns_message(InternalData *d, const ProtocolFamilyType &proto, dns::Message const &msg, bool forward, bool from_cache);
-	void set_edns0(dns::Message *msg);
+	void set_edns0(dns::Message *msg, uint16_t payload_size, uint8_t extended_rcode = 0);
+	uint16_t client_edns_payload(dns::Message const &msg) const;
 
 	enum class ConnectionStatus {
 		ERROR,
@@ -257,11 +271,18 @@ private:
 	enum class TcpReadResult {
 		READY,
 		NEED_MORE,
+		MALFORMED,
+		ERROR,
+	};
+	enum class TcpWriteResult {
+		DONE,
+		NEED_MORE,
 		ERROR,
 	};
 
 	InternalData make_client_data(InternalData const &d, ProtocolFamilyType const &proto, int fd) const;
 	TcpReadResult read_tcp_message(std::shared_ptr<Task> task, dns::Message *out);
+	TcpWriteResult write_tcp_buffer(std::shared_ptr<Task> task);
 
 	ConnectionStatus process(InternalData *d, const ProtocolFamilyType &proto);
 	void process_udp(InternalData *d, sa_family_t family);
@@ -274,34 +295,49 @@ private:
 	void initialize_hosts();
 	uint32_t next_local_transaction_id();
 	int ctl_add(int fd, epoll_event *e, bool in, bool out);
+	int ctl_mod(int fd, epoll_event *e, bool in, bool out);
 	int ctl_del(int fd, epoll_event *e);
 	void delete_socket(int fd, struct epoll_event *e);
 	void delete_socket(std::shared_ptr<Task> task);
 	bool accept_dns_type(DNS_TYPE t);
 
-	ConnectionStatus forward_tcp(InternalData *d, const ProtocolFamilyType &client_proto, int client_fd, uint16_t client_request_id, dns::Header const &header, const dns::Question &question, uint32_t local_transaction_id, const Forwarder &forwarder);
-	void forward_udp(const InternalData &d, const ProtocolFamilyType &proto, const dns::Header &header, const dns::Question &q, uint32_t local_transaction_id, const Forwarder &forwarder);
+	ConnectionStatus forward_tcp(InternalData *d, const ProtocolFamilyType &client_proto,
+		int client_fd, uint16_t client_request_id, const dns::Question &question,
+		uint16_t client_udp_payload,
+		uint32_t local_transaction_id, const Forwarder &forwarder);
+	void forward_udp(const InternalData &d, const ProtocolFamilyType &proto,
+		const dns::Header &header, const dns::Question &q, uint16_t client_udp_payload,
+		uint32_t local_transaction_id, const Forwarder &forwarder,
+		std::shared_ptr<PendingQuery> const &pending);
 
 	std::vector<char> read(InternalData *d, const ProtocolFamilyType &proto);
 	dns::Cache *get_cache(DNS_TYPE type);
+	bool process_local_query(InternalData *d, const ProtocolFamilyType &client_proto,
+		const dns::Message &received, const dns::Question &q);
 	void process_query_udp(InternalData *d, const ProtocolFamilyType &proto, const dns::Message &received, const dns::Question &question);
 	ConnectionStatus process_query_tcp(InternalData *d, const ProtocolFamilyType &client_proto, int client_fd, const dns::Message &received, const dns::Question &q);
 	uint16_t next_txid();
 	void process_receive(InternalData *d, int upstream_fd);
-	std::shared_ptr<Task> take_task_by_fd(int fd);
+	std::shared_ptr<Task> find_task_by_fd(int fd) const;
 
-	void reply_to_client_udp(InternalData *d, std::shared_ptr<Task> task, const dns::Message &received);
-	bool reply_from_cache(InternalData *d, const ProtocolFamilyType &client_proto, const dns::Header &header, const dns::Question &q);
+	bool reply_to_client_udp(InternalData *d, std::shared_ptr<Task> task, const dns::Message &received);
+	bool reply_from_cache(InternalData *d, const ProtocolFamilyType &client_proto,
+		const dns::Header &header, const dns::Question &q, uint16_t client_udp_payload);
 	std::shared_ptr<Task> make_task(Operation op, uint32_t local_transaction_id);
 	void init_epoll_event(Task *task, int fd, uint32_t events);
 	void uptime();
 	void drop_aa_flag(dns::Message *msg);
 	Hosts load_hosts_file(const std::string &suffix, const std::string &path);
 	void update_hosts_files(bool force);
+	bool is_client_allowed(sa_family_t family, const void *address) const;
+	bool consume_rate_limit(sa_family_t family, const void *address);
 public:
+	static bool validate_options(Option const &opt, std::string *error = nullptr);
+	static bool validate_runtime_inputs(Option *opt,
+		std::string const &working_directory, std::string *error = nullptr);
 	Behind(Option const &opt);
 	~Behind();
-	void main();
+	bool main(std::function<bool(bool)> const &reload_requested = {});
 	void self_test();
 };
 

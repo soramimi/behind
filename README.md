@@ -63,11 +63,21 @@ Specify runtime behavior and resource limits:
 directory = /var/lib/behind    ; Working directory for the server
 listen = 127.0.0.1@5301        ; IPv4 listen address and port
 listen = ::1@5301              ; IPv6 listen address and port
-max-tasks = 1000               ; Maximum number of active forwarding tasks
+max-tasks = 500                ; Maximum number of active forwarding tasks
 max-cache-entry-size = 65535   ; Maximum serialized cache entry size
+max-cache-bytes = 67108864     ; Global cache memory limit
 max-ttl = 86400                ; Maximum cached TTL in seconds
-edns0-buffer-size = 1232       ; EDNS0 UDP payload size advertised in responses
+edns0-buffer-size = 1232       ; Maximum EDNS0 UDP payload size
+allow-client = 192.0.2.0/24    ; Allowed client CIDR (repeatable)
+rate-limit-qps = 1000          ; Per-client and global sustained query rate
+rate-limit-burst = 2000        ; Token-bucket burst size
+upstream-timeout-ms = 3000     ; Upstream response timeout
 ```
+
+If no `allow-client` entry is configured, only loopback clients (`127.0.0.0/8`
+and `::1/128`) are accepted. Add explicit CIDRs before exposing BEHIND to a
+network. `max-tasks` must also fit within the process file-descriptor limit;
+startup fails safely when it does not.
 
 #### [logging]
 Configure log file location:
@@ -157,9 +167,17 @@ These mappings take precedence over DNS queries and are useful for:
 ./_bin/behind -C /path/to/behind.conf
 ```
 
+Validate a configuration without binding sockets:
+
+```bash
+./_bin/behind --check-config -C /path/to/behind.conf
+```
+
 ### Command Line Options
 
 - `-C, --conf <config-file>`: Specify the configuration file path
+- `--check-config`: Validate syntax, referenced hosts files, and forwarder resolution, then exit
+- `--log-file <path>`: Override the configured log file path
 
 ### Installing as a systemd Service
 
@@ -204,7 +222,7 @@ BEHIND acts as a DNS proxy/forwarder with support for both UDP and TCP protocols
 5. If not cached, randomly selects one of the configured upstream DNS servers and forwards the query:
    - **UDP forwarding**: Uses randomized source ports and connected UDP sockets for stronger upstream response validation
    - **TCP forwarding**: Uses non-blocking connections with epoll for efficient connection management
-   - UDP responses that exceed 512 bytes are truncated at a record boundary and returned with the TC flag set
+   - UDP responses that exceed the client's negotiated payload limit are truncated at a record boundary and returned with the TC flag set
 6. Caches the response based on each record's TTL value (supports both UDP and TCP responses)
 7. Returns the response to the client with DNS name compression for efficiency
 
@@ -212,18 +230,18 @@ The case randomization feature is always enabled and randomly changes the case o
 
 All security-sensitive randomness (transaction IDs, UDP source ports, and 0x20 case bits) is produced by a ChaCha20-based CSPRNG. Its key and nonce are seeded from the operating system's `getrandom` at startup; if the OS entropy source is unavailable, the server aborts rather than running with a predictable key.
 
-Malformed DNS messages are rejected during parsing. BEHIND validates name RDATA boundaries, section counts, response QR/TC flags, question name, type, and class before forwarding responses into the cache.
+Malformed DNS messages are rejected during parsing. BEHIND validates response transaction IDs, QR/opcode fields, the exact case-randomized question name, type, class, and connected upstream endpoint before accepting a response. Upstream timeouts and exhausted task capacity fail safely with DNS errors instead of leaving clients waiting indefinitely.
 
 ### Protocol Handling
 
 - **UDP Protocol**: The primary protocol for DNS queries. BEHIND uses randomized source ports when forwarding UDP queries to upstream servers, and uses connected UDP sockets so responses are accepted only from the selected upstream endpoint.
 
 - **TCP Protocol**: Automatically used for:
-  - Large DNS responses that exceed the UDP packet size limit (512 bytes)
+  - Large DNS responses that exceed the client's UDP payload limit
   - Direct TCP queries from clients
   - TCP forwarding uses non-blocking connections managed by epoll, ensuring efficient handling of multiple simultaneous TCP connections without thread overhead
 
-- **Truncation Handling**: When a DNS response over UDP would exceed 512 bytes, BEHIND truncates at the last complete record that fits and sets the TC (truncation) flag, signaling the client to retry the query over TCP.
+- **EDNS and truncation**: Non-EDNS clients use the 512-byte DNS UDP limit. EDNS clients are limited to the smaller of their advertised payload size and `edns0-buffer-size`. Oversized responses are truncated at the last complete record and returned with the TC flag so the client can retry over TCP. Unsupported EDNS versions receive BADVERS; DNSSEC validation is not performed.
 
 ### Logging
 
