@@ -2,7 +2,9 @@
 main: nxdomain restart
 
 restart:
-	systemctl restart behind
+	/etc/init.d/unbound stop
+	/etc/init.d/behind restart
+	/etc/init.d/unbound start
 
 nxdomain:
 	sort nxdomain.in >nxdomain.tmp

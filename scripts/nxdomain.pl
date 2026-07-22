@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
-use strict;
-use warnings;
+#use strict;
+#use warnings;
 
 # 使い方:
 #   perl gen_rpz.pl domains.txt

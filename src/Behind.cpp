@@ -1500,6 +1500,8 @@ void Behind::clean_transaction(uint32_t id)
 			finish_task(task);
 		}
 	}
+	
+	logprintf(LOG_DEFAULT, "(debug) task tracking: dec %d\n", (int)m->fds_by_txid.size());
 }
 
 std::shared_ptr<Behind::Task> Behind::find_task_by_fd(int fd) const
@@ -1548,6 +1550,8 @@ void Behind::push_task(std::shared_ptr<Task> task, int timeout, uint32_t epoll_e
 
 	m->tasks_by_fd[task->upstream_fd] = task;
 	m->fds_by_txid.insert({task->local_transaction_id, task->upstream_fd});
+
+	logprintf(LOG_DEFAULT, "(debug) task tracking: inc %d\n", (int)m->fds_by_txid.size());
 }
 
 bool Behind::parse_dns_message(const char *begin, const char *end, dns::Message *msg)
