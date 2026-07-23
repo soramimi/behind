@@ -176,8 +176,7 @@ bool DomainFilter::add_entry(std::string const &name, Kind kind, std::string *er
 		try {
 			RegexItem item;
 			item.kind = kind;
-			item.expression = std::regex(pattern,
-				std::regex_constants::ECMAScript | std::regex_constants::icase);
+			item.expression = std::regex(pattern, std::regex_constants::ECMAScript | std::regex_constants::icase);
 			regex_list_.push_back(std::move(item));
 			return Success();
 		} catch (std::regex_error const &e) {

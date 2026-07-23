@@ -187,8 +187,7 @@ bool LineReader::open(const std::string &path)
 		if (stat_result != 0 || !S_ISREG(info.st_mode)) {
 			int error_number = stat_result != 0 ? errno : EINVAL;
 			::close(fd);
-			set_error(abspath, 0,
-				std::string("configuration path is not a regular file: ") + strerror(error_number));
+			set_error(abspath, 0, std::string("configuration path is not a regular file: ") + strerror(error_number));
 			return false;
 		}
 		File file;
@@ -210,8 +209,7 @@ bool LineReader::getline(std::string *out)
 		std::string_view content = misc::trimmed(*out);
 		for (unsigned char c : content) {
 			if ((c < 0x20 && c != '\t') || c == 0x7f) {
-				set_error(current()->path, current()->line,
-					"control character is not allowed in configuration text");
+				set_error(current()->path, current()->line, "control character is not allowed in configuration text");
 				return false;
 			}
 		}
@@ -284,8 +282,7 @@ bool LineReader::getline(std::string *out)
 			}
 			if (!open(path)) {
 				std::string detail = error_message_;
-				set_error(source_file, source_line,
-					"failed to include '" + include_path + "': " + detail);
+				set_error(source_file, source_line, "failed to include '" + include_path + "': " + detail);
 				break;
 			}
 			continue;

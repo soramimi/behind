@@ -73,8 +73,7 @@ std::string path_from_startup_directory(std::string const &path,
 
 }
 
-bool set_option(std::string const &section, std::string const &key, std::string const &value,
-	Option *opt, std::string *error)
+bool set_option(std::string const &section, std::string const &key, std::string const &value, Options *opts, std::string *error)
 {
 	std::vector<std::string_view> section_parts = misc::split(section);
 	if (!validate_section(section_parts, error)) return false;
@@ -84,13 +83,13 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 	if (sec == "options") {
 		if (key == "directory") {
 			if (value.empty()) return option_error(error, "directory must not be empty");
-			opt->working_dir = value;
+			opts->working_dir = value;
 			return true;
 		}
 		if (key == "max-tasks") {
 			uint64_t v = 0;
 			if (parse_unsigned(value, 1, std::numeric_limits<size_t>::max(), &v)) {
-				opt->max_tasks = static_cast<size_t>(v);
+				opts->max_tasks = static_cast<size_t>(v);
 				return true;
 			}
 			return option_error(error, "invalid max-tasks value: " + value);
@@ -98,7 +97,7 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 		if (key == "max-cache-entry-size") {
 			uint64_t v = 0;
 			if (parse_unsigned(value, 1, std::numeric_limits<size_t>::max(), &v)) {
-				opt->max_cache_entry_size = static_cast<size_t>(v);
+				opts->max_cache_entry_size = static_cast<size_t>(v);
 				return true;
 			}
 			return option_error(error, "invalid max-cache-entry-size value: " + value);
@@ -106,7 +105,7 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 		if (key == "max-cache-bytes") {
 			uint64_t v = 0;
 			if (parse_unsigned(value, 1, std::numeric_limits<size_t>::max(), &v)) {
-				opt->max_cache_bytes = static_cast<size_t>(v);
+				opts->max_cache_bytes = static_cast<size_t>(v);
 				return true;
 			}
 			return option_error(error, "invalid max-cache-bytes value: " + value);
@@ -114,7 +113,7 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 		if (key == "max-ttl") {
 			uint64_t v = 0;
 			if (parse_unsigned(value, 1, std::numeric_limits<uint32_t>::max(), &v)) {
-				opt->max_ttl = static_cast<uint32_t>(v);
+				opts->max_ttl = static_cast<uint32_t>(v);
 				return true;
 			}
 			return option_error(error, "invalid max-ttl value: " + value);
@@ -122,7 +121,7 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 		if (key == "edns0-buffer-size") {
 			uint64_t v = 0;
 			if (parse_unsigned(value, 512, 65535, &v)) {
-				opt->edns0_buffer_size = static_cast<uint16_t>(v);
+				opts->edns0_buffer_size = static_cast<uint16_t>(v);
 				return true;
 			}
 			return option_error(error, "invalid edns0-buffer-size value: " + value);
@@ -130,7 +129,7 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 		if (key == "rate-limit-qps") {
 			uint64_t v = 0;
 			if (parse_unsigned(value, 1, std::numeric_limits<unsigned>::max(), &v)) {
-				opt->rate_limit_qps = static_cast<unsigned>(v);
+				opts->rate_limit_qps = static_cast<unsigned>(v);
 				return true;
 			}
 			return option_error(error, "invalid rate-limit-qps value: " + value);
@@ -138,7 +137,7 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 		if (key == "rate-limit-burst") {
 			uint64_t v = 0;
 			if (parse_unsigned(value, 1, std::numeric_limits<unsigned>::max(), &v)) {
-				opt->rate_limit_burst = static_cast<unsigned>(v);
+				opts->rate_limit_burst = static_cast<unsigned>(v);
 				return true;
 			}
 			return option_error(error, "invalid rate-limit-burst value: " + value);
@@ -146,14 +145,14 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 		if (key == "upstream-timeout-ms") {
 			uint64_t v = 0;
 			if (parse_unsigned(value, 1, std::numeric_limits<unsigned>::max(), &v)) {
-				opt->upstream_timeout_ms = static_cast<unsigned>(v);
+				opts->upstream_timeout_ms = static_cast<unsigned>(v);
 				return true;
 			}
 			return option_error(error, "invalid upstream-timeout-ms value: " + value);
 		}
 		if (key == "allow-client") {
 			if (value.empty()) return option_error(error, "allow-client must not be empty");
-			opt->allow_clients.push_back(value);
+			opts->allow_clients.push_back(value);
 			return true;
 		}
 		if (key == "listen") {
@@ -166,10 +165,10 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 				addrport.port = DEFAUT_LISTEN_PORT;
 			}
 			if (addrport.addr.type == InetResolver::IN4) {
-				opt->listen4 = addrport;
+				opts->listen4 = addrport;
 				return true;
 			} else if (addrport.addr.type == InetResolver::IN6) {
-				opt->listen6 = addrport;
+				opts->listen6 = addrport;
 				return true;
 			} else {
 				return option_error(error, "invalid listen address: " + value);
@@ -178,7 +177,7 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 	} else if (sec == "logging") {
 		if (key == "file") {
 			if (value.empty()) return option_error(error, "log file must not be empty");
-			opt->log_file = value;
+			opts->log_file = value;
 			return true;
 		}
 	} else if (sec == "forward-zone") {
@@ -198,21 +197,21 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 			if (!misc::is_valid_domain(zone)) {
 				return option_error(error, "invalid forward zone: " + zone);
 			}
-			Option::Zone z;
+			Options::Zone z;
 			z.zone = zone;
 			z.name = value;
-			opt->forward_addr.push_back(z);
+			opts->forward_addr.push_back(z);
 			return true;
 		}
 	} else if (sec == "filter") {
 		if (key == "nxdomain") {
-			return opt->domain_filter.add_nxdomain(value, error);
+			return opts->domain_filter.add_nxdomain(value, error);
 		}
 		if (key == "nodata") {
-			return opt->domain_filter.add_nodata(value, error);
+			return opts->domain_filter.add_nodata(value, error);
 		}
 		if (key == "nodata-aaaa") {
-			return opt->domain_filter.add_nodata_aaaa(value, error);
+			return opts->domain_filter.add_nodata_aaaa(value, error);
 		}
 	} else if (sec == "hosts") {
 		std::string suffix;
@@ -240,76 +239,76 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 			if (!address || value.find('@') != std::string::npos) {
 				return option_error(error, "invalid host address: " + value);
 			}
-			Option::Host h;
+			Options::Host h;
 			h.name = name;
 			h.suffix = suffix;
 			h.address = value;
-			opt->hosts.push_back(std::move(h));
+			opts->hosts.push_back(std::move(h));
 			return true;
 		} else if (key == "file") {
 			if (value.empty()) return option_error(error, "hosts file path must not be empty");
-			Option::HostsFile hf;
+			Options::HostsFile hf;
 			hf.suffix = suffix;
 			hf.path = value;
-			opt->hostsfiles.push_back(std::move(hf));
+			opts->hostsfiles.push_back(std::move(hf));
 			return true;
 		}
 	}
 	return option_error(error, "unknown option in [" + sec + "]: " + key);
 }
 
-bool parse_option(int argc, char **argv, std::string const &startup_directory,
-	Option *opt, bool *check_config)
+bool parse_option(int argc, char **argv, std::string const &startup_directory, Options *opts, bool *check_config)
 {
-	*opt = { };
+	*opts = { };
 	*check_config = false;
 	std::optional<std::string> log_file_override;
 	int argi = 1;
 	while (argi < argc) {
-		char const *arg = argv[argi++];
-		if (arg[0] == '-') {
-			if (strcmp(arg, "-C") == 0 || strcmp(arg, "--conf") == 0) {
+		char const *c_arg = argv[argi++];
+		if (c_arg[0] == '-') {
+			std::string_view arg_v = c_arg;
+			if (arg_v == "-C" || arg_v == "--conf") {
 				if (argi < argc) {
 					std::string path = path_from_startup_directory(argv[argi++], startup_directory);
 					std::string confpath = misc::realpath(path);
 					if (confpath.empty()) {
-						fprintf(stderr, "%s: cannot resolve configuration path: %s\n",
-							path.c_str(), strerror(errno));
+						fprintf(stderr, "%s: cannot resolve configuration path: %s", path.c_str(), strerror(errno));
 						return false;
 					}
 					if (!ConfigParser::parse(confpath.c_str(), [](std::string const &section, std::string const &key, std::string const &value, void *cookie, std::string *error) {
-							Option *opt = static_cast<Option *>(cookie);
-							return set_option(section, key, value, opt, error); }, opt)) {
+							Options *opt = static_cast<Options *>(cookie);
+							return set_option(section, key, value, opt, error);
+						}, opts)) {
 						return false;
 					}
 				} else {
-					fprintf(stderr, "option %s requires an argument.\n", arg);
+					fprintf(stderr, "option %s requires an argument.", c_arg);
 					return false;
 				}
-			} else if (strcmp(arg, "--log-file") == 0) {
+			} else if (arg_v == "--log-file") {
 				if (argi < argc) {
 					std::string value = argv[argi++];
 					if (value.empty()) {
-						fprintf(stderr, "option %s requires a non-empty argument.\n", arg);
+						fprintf(stderr, "option %s requires a non-empty argument.", c_arg);
 						return false;
 					}
 					log_file_override = std::move(value);
 				} else {
-					fprintf(stderr, "option %s requires an argument.\n", arg);
+					fprintf(stderr, "option %s requires an argument.", c_arg);
 					return false;
 				}
-			} else if (strcmp(arg, "--check-config") == 0) {
+			} else if (arg_v == "--check-config") {
 				*check_config = true;
 			} else {
-				fprintf(stderr, "unknown option: %s\n", arg);
+				fprintf(stderr, "unknown option: %s", c_arg);
 				return false;
 			}
 		} else {
-			fprintf(stderr, "unexpected positional argument: %s\n", arg);
+			fprintf(stderr, "unexpected positional argument: %s", c_arg);
 			return false;
 		}
 	}
-	if (log_file_override) opt->log_file = std::move(*log_file_override);
+	if (log_file_override) opts->log_file = std::move(*log_file_override);
 	return true;
 }
 
@@ -329,19 +328,19 @@ std::string current_working_directory()
 #include <atomic>
 extern std::atomic<bool> sigint_caught;
 
-bool validate_configuration(Option *opt, std::string const &startup_directory)
+bool validate_configuration(Options *opts, std::string const &startup_directory)
 {
-	if (!opt) {
+	if (!opts) {
 		fprintf(stderr, "configuration validation failed: no configuration was provided\n");
 		return false;
 	}
 	std::string error;
-	if (!Behind::validate_options(*opt, &error)) {
+	if (!Behind::validate_options(*opts, &error)) {
 		if (error.empty()) error = "unspecified validation error";
 		fprintf(stderr, "configuration validation failed: %s\n", error.c_str());
 		return false;
 	}
-	std::string working_directory = path_from_startup_directory(opt->working_dir,
+	std::string working_directory = path_from_startup_directory(opts->working_dir,
 		startup_directory);
 	struct stat info = { };
 	if (stat(working_directory.c_str(), &info) != 0 || !S_ISDIR(info.st_mode) || access(working_directory.c_str(), X_OK) != 0) {
@@ -349,7 +348,7 @@ bool validate_configuration(Option *opt, std::string const &startup_directory)
 			working_directory.c_str());
 		return false;
 	}
-	for (Option::HostsFile const &hosts : opt->hostsfiles) {
+	for (Options::HostsFile const &hosts : opts->hostsfiles) {
 		std::string path = hosts.path;
 		if (!path.empty() && path.front() != '/') {
 			path = working_directory + (working_directory.back() == '/' ? "" : "/") + path;
@@ -360,23 +359,22 @@ bool validate_configuration(Option *opt, std::string const &startup_directory)
 			return false;
 		}
 	}
-	if (!Behind::validate_runtime_inputs(opt, working_directory, &error)) {
+	if (!Behind::validate_runtime_inputs(opts, working_directory, &error)) {
 		fprintf(stderr, "configuration validation failed: %s\n", error.c_str());
 		return false;
 	}
 	return true;
 }
 
-bool main2(Option const &opt, std::string const &startup_directory,
-	std::function<bool(bool)> const &reload_requested)
+bool main2(Options const &opts, std::string const &startup_directory, std::function<bool(bool)> const &reload_requested)
 {
-	std::string log_file = path_from_startup_directory(opt.log_file, startup_directory);
+	std::string log_file = path_from_startup_directory(opts.log_file, startup_directory);
 	Logger::open(log_file);
 	Logger::pause(false);
 	logprintf(LOG_BOTH, "log file: %s\n", log_file.c_str());
 
-	if (!opt.working_dir.empty()) {
-		std::string working_dir = path_from_startup_directory(opt.working_dir, startup_directory);
+	if (!opts.working_dir.empty()) {
+		std::string working_dir = path_from_startup_directory(opts.working_dir, startup_directory);
 		if (chdir(working_dir.c_str()) != 0) {
 			logprintf(LOG_BOTH, "failed to chdir to %s: %s\n", working_dir.c_str(), strerror(errno));
 			return false;
@@ -385,7 +383,7 @@ bool main2(Option const &opt, std::string const &startup_directory,
 	std::string cwd = current_working_directory();
 	logprintf(LOG_BOTH, "current working directory: %s\n", cwd.c_str());
 
-	Behind behind(opt);
+	Behind behind(opts);
 
 	behind.self_test();
 	return behind.main(reload_requested);
@@ -400,9 +398,9 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	Option opt;
+	Options opts;
 	bool check_config = false;
-	if (!parse_option(argc, argv, startup_directory, &opt, &check_config) || !validate_configuration(&opt, startup_directory)) {
+	if (!parse_option(argc, argv, startup_directory, &opts, &check_config) || !validate_configuration(&opts, startup_directory)) {
 		return 1;
 	}
 	if (check_config) {
@@ -418,9 +416,9 @@ int main(int argc, char **argv)
 	}
 
 	int exit_code = 0;
-	std::optional<Option> fallback_option;
-	std::optional<Option> reload_candidate;
-	std::future<std::optional<Option>> reload_validation;
+	std::optional<Options> fallback_option;
+	std::optional<Options> reload_candidate;
+	std::future<std::optional<Options>> reload_validation;
 	bool validate_again = false;
 	auto ValidationReady = [&]() {
 		return reload_validation.valid() && reload_validation.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
@@ -429,9 +427,9 @@ int main(int argc, char **argv)
 		logprintf(LOG_DEFAULT, "=== SIGHUP: validating candidate asynchronously ===\n");
 		try {
 			reload_validation = std::async(std::launch::async,
-				[argc, argv, startup_directory]() -> std::optional<Option> {
+				[argc, argv, startup_directory]() -> std::optional<Options> {
 					try {
-						Option candidate;
+						Options candidate;
 						bool ignored_check_config = false;
 						if (parse_option(argc, argv, startup_directory, &candidate,
 								&ignored_check_config)
@@ -471,7 +469,7 @@ int main(int argc, char **argv)
 		}
 		if (!ValidationReady()) return false;
 
-		std::optional<Option> candidate;
+		std::optional<Options> candidate;
 		try {
 			candidate = reload_validation.get();
 		} catch (std::exception const &e) {
@@ -496,10 +494,10 @@ int main(int argc, char **argv)
 	};
 	while (1) {
 		reload_candidate.reset();
-		bool ok = main2(opt, startup_directory, ValidateReload);
+		bool ok = main2(opts, startup_directory, ValidateReload);
 		if (!ok) {
 			if (fallback_option) {
-				opt = std::move(*fallback_option);
+				opts = std::move(*fallback_option);
 				fallback_option.reset();
 				logprintf(LOG_BOTH, "reloaded configuration failed at runtime; restored previous configuration\n");
 				continue;
@@ -509,8 +507,8 @@ int main(int argc, char **argv)
 		}
 
 		if (reload_candidate) {
-			fallback_option = opt;
-			opt = std::move(*reload_candidate);
+			fallback_option = opts;
+			opts = std::move(*reload_candidate);
 			reload_candidate.reset();
 			continue;
 		}

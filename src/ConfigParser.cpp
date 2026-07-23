@@ -77,8 +77,7 @@ bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 		if (content.empty()) continue;
 		for (unsigned char c : content) {
 			if ((c < 0x20 && c != '\t') || c == 0x7f) {
-				return report_error(source_file, source_line,
-					"control character is not allowed in configuration text");
+				return report_error(source_file, source_line, "control character is not allowed in configuration text");
 			}
 		}
 
@@ -88,8 +87,7 @@ bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 				return report_error(source_file, source_line, "unterminated section header");
 			}
 			if (!misc::trimmed(content.substr(closing + 1)).empty()) {
-				return report_error(source_file, source_line,
-					"unexpected text after section header");
+				return report_error(source_file, source_line, "unexpected text after section header");
 			}
 			std::string_view name = misc::trimmed(content.substr(1, closing - 1));
 			if (name.empty()) {
@@ -103,8 +101,7 @@ bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 					return report_error(source_file, source_line, assignment_error);
 				}
 			} catch (std::exception const &e) {
-				return report_error(source_file, source_line,
-					std::string("exception while validating section: ") + e.what());
+				return report_error(source_file, source_line, std::string("exception while validating section: ") + e.what());
 			}
 			continue;
 		}
@@ -122,8 +119,7 @@ bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 			char delimiter = value.front();
 			size_t const closing = value.find(delimiter, 1);
 			if (closing == std::string_view::npos || closing != value.size() - 1) {
-				return report_error(source_file, source_line,
-					"unexpected text after quoted value");
+				return report_error(source_file, source_line, "unexpected text after quoted value");
 			}
 			value.remove_prefix(1);
 			value.remove_suffix(1);
@@ -131,14 +127,12 @@ bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 
 		std::string assignment_error;
 		try {
-			if (!fn_assign(section, std::string(key), std::string(value), cookie,
-					&assignment_error)) {
+			if (!fn_assign(section, std::string(key), std::string(value), cookie, &assignment_error)) {
 				if (assignment_error.empty()) assignment_error = "invalid option or value";
 				return report_error(source_file, source_line, assignment_error);
 			}
 		} catch (std::exception const &e) {
-			return report_error(source_file, source_line,
-				std::string("exception while applying option: ") + e.what());
+			return report_error(source_file, source_line, std::string("exception while applying option: ") + e.what());
 		}
 	}
 	if (reader.failed()) {
@@ -149,17 +143,18 @@ bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 
 void ConfigParser::example()
 {
-	struct Option {
+	struct Options {
 	};
 
-	Option opt;
+	Options opts;
 	char const *file = "example.ini";
 	parse(file, [](std::string const &section, std::string const &key, std::string const &value, void *cookie, std::string *error) {
-		Option *opt = static_cast<Option *>(cookie);
+		Options *opts = static_cast<Options *>(cookie);
 		(void)section;
 		(void)key;
 		(void)value;
-		(void)opt;
+		(void)opts;
 		(void)error;
-		return true; }, &opt);
+		return true;
+	}, &opts);
 }

@@ -85,7 +85,7 @@ public:
 	}
 };
 
-struct Option {
+struct Options {
 	int listen_port = DEFAUT_LISTEN_PORT;
 	InetAddrPort listen4;
 	InetAddrPort listen6;
@@ -337,10 +337,9 @@ private:
 	bool consume_rate_limit(sa_family_t family, const void *address);
 
 public:
-	static bool validate_options(Option const &opt, std::string *error = nullptr);
-	static bool validate_runtime_inputs(Option *opt,
-		std::string const &working_directory, std::string *error = nullptr);
-	Behind(Option const &opt);
+	static bool validate_options(Options const &opts, std::string *error = nullptr);
+	static bool validate_runtime_inputs(Options *opts, std::string const &working_directory, std::string *error = nullptr);
+	Behind(Options const &opts);
 	~Behind();
 	bool main(std::function<bool(bool)> const &reload_requested = { });
 	void self_test();
