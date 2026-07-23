@@ -2,9 +2,9 @@
 #define DOMAINFILTER_H
 
 #include <regex>
-#include <vector>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 class DomainFilter {
 public:
@@ -14,6 +14,7 @@ public:
 		NODATA,
 		NODATA_AAAA,
 	};
+
 private:
 	struct Item {
 		std::string name;
@@ -29,6 +30,7 @@ private:
 	std::vector<RegexItem> regex_list_;
 	size_t entry_count_ = 0;
 	bool add_entry(std::string const &name, Kind kind, std::string *error);
+
 public:
 	Kind find(std::string const &name) const;
 	bool add_nxdomain(std::string const &name, std::string *error = nullptr);

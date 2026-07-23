@@ -98,7 +98,7 @@ bool ConfigParser::parse(char const *file, fn_assign_t fn_assign, void *cookie)
 			section = std::string(name);
 			std::string assignment_error;
 			try {
-				if (!fn_assign(section, {}, {}, cookie, &assignment_error)) {
+				if (!fn_assign(section, { }, { }, cookie, &assignment_error)) {
 					if (assignment_error.empty()) assignment_error = "invalid section";
 					return report_error(source_file, source_line, assignment_error);
 				}
@@ -154,14 +154,12 @@ void ConfigParser::example()
 
 	Option opt;
 	char const *file = "example.ini";
-	parse(file, [](std::string const &section, std::string const &key, std::string const &value,
-			void *cookie, std::string *error){
+	parse(file, [](std::string const &section, std::string const &key, std::string const &value, void *cookie, std::string *error) {
 		Option *opt = static_cast<Option *>(cookie);
 		(void)section;
 		(void)key;
 		(void)value;
 		(void)opt;
 		(void)error;
-		return true;
-	}, &opt);
+		return true; }, &opt);
 }

@@ -1,12 +1,12 @@
 
 #include "LineReader.h"
+#include "misc.h"
 #include <cerrno>
 #include <cstring>
+#include <fcntl.h>
 #include <string_view>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include "misc.h"
 
 LineReader::File *LineReader::current()
 {
@@ -115,7 +115,7 @@ LineReader::~LineReader()
 
 std::string LineReader::file() const
 {
-	if (files_.empty()) return {};
+	if (files_.empty()) return { };
 	return files_.back().path;
 }
 
@@ -182,14 +182,13 @@ bool LineReader::open(const std::string &path)
 	// hanging startup, SIGHUP validation, or shutdown indefinitely.
 	int fd = ::open(abspath.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
 	if (fd != -1) {
-		struct stat info = {};
+		struct stat info = { };
 		int const stat_result = fstat(fd, &info);
 		if (stat_result != 0 || !S_ISREG(info.st_mode)) {
 			int error_number = stat_result != 0 ? errno : EINVAL;
 			::close(fd);
 			set_error(abspath, 0,
-				std::string("configuration path is not a regular file: ") +
-				strerror(error_number));
+				std::string("configuration path is not a regular file: ") + strerror(error_number));
 			return false;
 		}
 		File file;
@@ -216,8 +215,7 @@ bool LineReader::getline(std::string *out)
 				return false;
 			}
 		}
-		if (content.size() > 7 && content.compare(0, 7, "include") == 0 &&
-				isspace(static_cast<unsigned char>(content[7]))) {
+		if (content.size() > 7 && content.compare(0, 7, "include") == 0 && isspace(static_cast<unsigned char>(content[7]))) {
 			std::string source_file = current()->path;
 			int source_line = current()->line;
 			content.remove_prefix(7);

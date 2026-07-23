@@ -3,27 +3,26 @@
 #include <cstdio>
 #include <cstring>
 
-
 #ifdef _WIN32
-#include <winsock2.h>
-#include <windows.h>
 #include <WS2tcpip.h>
+#include <windows.h>
+#include <winsock2.h>
 #else
+#include <arpa/inet.h>
 #include <net/if.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <arpa/inet.h>
 #endif
-
 
 bool InetResolver::resolve(const char *name, Type type, Addr *out)
 {
 	if (!name || !out) return false;
 	out->type = UNSPEC;
 	out->addr.clear();
-	struct addrinfo hints = {};
+	struct addrinfo hints = { };
 	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_family = type == IN4 ? AF_INET : type == IN6 ? AF_INET6 : AF_UNSPEC;
+	hints.ai_family = type == IN4 ? AF_INET : type == IN6 ? AF_INET6
+														  : AF_UNSPEC;
 	struct addrinfo *result = nullptr;
 	int error = getaddrinfo(name, nullptr, &hints, &result);
 	if (error != 0) {
@@ -78,5 +77,5 @@ std::string InetResolver::Addr::to_string(size_t i) const
 			}
 		}
 	}
-	return {};
+	return { };
 }

@@ -13,5 +13,3 @@ struct netif_t {
 std::string get_host_name();
 
 #endif
-
-

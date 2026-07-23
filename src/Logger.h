@@ -32,6 +32,7 @@ private:
 	void x_stop();
 	void x_pause(bool f);
 	void x_open(const std::string &log_file);
+
 public:
 	Logger();
 	~Logger();
@@ -41,7 +42,6 @@ public:
 	static void start();
 	static void stop();
 	static void open(std::string const &log_file);
-
 };
 
 extern Logger x_logger;

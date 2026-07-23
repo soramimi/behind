@@ -1,9 +1,9 @@
 #include "misc.h"
-#include <stdlib.h>
-#include <limits.h>
 #include <chrono>
-#include <cstdio>
 #include <cstdarg>
+#include <cstdio>
+#include <limits.h>
+#include <stdlib.h>
 
 std::string misc::asprintf(char const *fmt, ...)
 {
@@ -64,9 +64,11 @@ std::string_view misc::trimmed(std::string_view const &sv)
 	char const *end = begin + sv.size();
 	char const *left = begin;
 	char const *right = end;
-	while (left < right && isspace((unsigned char)*left)) left++;
-	while (left < right && isspace((unsigned char)right[-1])) right--;
-	return {left, right - left};
+	while (left < right && isspace((unsigned char)*left))
+		left++;
+	while (left < right && isspace((unsigned char)right[-1]))
+		right--;
+	return { left, right - left };
 }
 
 std::vector<std::string_view> misc::split(char const *begin, char const *end)
@@ -114,7 +116,7 @@ std::string misc::realpath(const char *path)
 	if (::realpath(path, tmp)) {
 		return tmp;
 	}
-	return {};
+	return { };
 }
 
 std::string misc::realpath(std::string const &path)
@@ -168,4 +170,3 @@ bool misc::is_valid_domain(std::string_view const &s)
 	if (label_len == 0 || label_len > 63) return false;
 	return true;
 }
-

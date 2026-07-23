@@ -1,9 +1,9 @@
 #ifndef INETRESOLVER_H
 #define INETRESOLVER_H
 
-#include <vector>
-#include <string>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 class InetResolver {
 public:
@@ -25,7 +25,7 @@ public:
 		{
 			return size() == 0;
 		}
-		operator bool () const
+		operator bool() const
 		{
 			return !empty();
 		}
@@ -43,6 +43,5 @@ public:
 	};
 	bool resolve(char const *name, Type type, Addr *out);
 };
-
 
 #endif // INETRESOLVER_H

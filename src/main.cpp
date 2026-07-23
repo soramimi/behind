@@ -5,8 +5,8 @@
 #include "misc.h"
 #include "network.h"
 #include "rwfile.h"
-#include <charconv>
 #include <cerrno>
+#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <future>
@@ -25,13 +25,12 @@ bool option_error(std::string *error, std::string message)
 }
 
 bool parse_unsigned(std::string const &text, uint64_t minimum, uint64_t maximum,
-		uint64_t *out)
+	uint64_t *out)
 {
 	if (text.empty()) return false;
 	uint64_t value = 0;
 	auto result = std::from_chars(text.data(), text.data() + text.size(), value, 10);
-	if (result.ec != std::errc() || result.ptr != text.data() + text.size() ||
-			value < minimum || value > maximum) {
+	if (result.ec != std::errc() || result.ptr != text.data() + text.size() || value < minimum || value > maximum) {
 		return false;
 	}
 	*out = value;
@@ -63,7 +62,7 @@ bool validate_section(std::vector<std::string_view> const &parts, std::string *e
 }
 
 std::string path_from_startup_directory(std::string const &path,
-		std::string const &startup_directory)
+	std::string const &startup_directory)
 {
 	if (path.empty() || path.front() == '/') return path;
 	if (startup_directory.empty() || startup_directory == "/") {
@@ -75,7 +74,7 @@ std::string path_from_startup_directory(std::string const &path,
 }
 
 bool set_option(std::string const &section, std::string const &key, std::string const &value,
-		Option *opt, std::string *error)
+	Option *opt, std::string *error)
 {
 	std::vector<std::string_view> section_parts = misc::split(section);
 	if (!validate_section(section_parts, error)) return false;
@@ -260,7 +259,7 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 }
 
 bool parse_option(int argc, char **argv, std::string const &startup_directory,
-		Option *opt, bool *check_config)
+	Option *opt, bool *check_config)
 {
 	*opt = { };
 	*check_config = false;
@@ -278,12 +277,9 @@ bool parse_option(int argc, char **argv, std::string const &startup_directory,
 							path.c_str(), strerror(errno));
 						return false;
 					}
-					if (!ConfigParser::parse(confpath.c_str(), [](std::string const &section,
-							std::string const &key, std::string const &value, void *cookie,
-							std::string *error) {
+					if (!ConfigParser::parse(confpath.c_str(), [](std::string const &section, std::string const &key, std::string const &value, void *cookie, std::string *error) {
 							Option *opt = static_cast<Option *>(cookie);
-							return set_option(section, key, value, opt, error);
-							}, opt)) {
+							return set_option(section, key, value, opt, error); }, opt)) {
 						return false;
 					}
 				} else {
@@ -347,9 +343,8 @@ bool validate_configuration(Option *opt, std::string const &startup_directory)
 	}
 	std::string working_directory = path_from_startup_directory(opt->working_dir,
 		startup_directory);
-	struct stat info = {};
-	if (stat(working_directory.c_str(), &info) != 0 || !S_ISDIR(info.st_mode) ||
-			access(working_directory.c_str(), X_OK) != 0) {
+	struct stat info = { };
+	if (stat(working_directory.c_str(), &info) != 0 || !S_ISDIR(info.st_mode) || access(working_directory.c_str(), X_OK) != 0) {
 		fprintf(stderr, "configuration validation failed: working directory is not accessible: %s\n",
 			working_directory.c_str());
 		return false;
@@ -373,7 +368,7 @@ bool validate_configuration(Option *opt, std::string const &startup_directory)
 }
 
 bool main2(Option const &opt, std::string const &startup_directory,
-		std::function<bool(bool)> const &reload_requested)
+	std::function<bool(bool)> const &reload_requested)
 {
 	std::string log_file = path_from_startup_directory(opt.log_file, startup_directory);
 	Logger::open(log_file);
@@ -407,8 +402,7 @@ int main(int argc, char **argv)
 
 	Option opt;
 	bool check_config = false;
-	if (!parse_option(argc, argv, startup_directory, &opt, &check_config) ||
-			!validate_configuration(&opt, startup_directory)) {
+	if (!parse_option(argc, argv, startup_directory, &opt, &check_config) || !validate_configuration(&opt, startup_directory)) {
 		return 1;
 	}
 	if (check_config) {
@@ -428,37 +422,36 @@ int main(int argc, char **argv)
 	std::optional<Option> reload_candidate;
 	std::future<std::optional<Option>> reload_validation;
 	bool validate_again = false;
-	auto ValidationReady = [&](){
-		return reload_validation.valid() &&
-			reload_validation.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+	auto ValidationReady = [&]() {
+		return reload_validation.valid() && reload_validation.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
 	};
-	auto StartValidation = [&](){
+	auto StartValidation = [&]() {
 		logprintf(LOG_DEFAULT, "=== SIGHUP: validating candidate asynchronously ===\n");
 		try {
 			reload_validation = std::async(std::launch::async,
-					[argc, argv, startup_directory]() -> std::optional<Option> {
-				try {
-					Option candidate;
-					bool ignored_check_config = false;
-					if (parse_option(argc, argv, startup_directory, &candidate,
-							&ignored_check_config) &&
-							validate_configuration(&candidate, startup_directory)) {
-						return candidate;
+				[argc, argv, startup_directory]() -> std::optional<Option> {
+					try {
+						Option candidate;
+						bool ignored_check_config = false;
+						if (parse_option(argc, argv, startup_directory, &candidate,
+								&ignored_check_config)
+							&& validate_configuration(&candidate, startup_directory)) {
+							return candidate;
+						}
+					} catch (std::exception const &e) {
+						fprintf(stderr, "configuration reload validation failed: %s\n", e.what());
+					} catch (...) {
+						fprintf(stderr, "configuration reload validation failed: unknown exception\n");
 					}
-				} catch (std::exception const &e) {
-					fprintf(stderr, "configuration reload validation failed: %s\n", e.what());
-				} catch (...) {
-					fprintf(stderr, "configuration reload validation failed: unknown exception\n");
-				}
-				return std::nullopt;
-			});
+					return std::nullopt;
+				});
 		} catch (std::exception const &e) {
 			logprintf(LOG_BOTH,
 				"cannot start configuration validation; keeping current runtime: %s\n",
 				e.what());
 		}
 	};
-	auto ValidateReload = [&](bool requested){
+	auto ValidateReload = [&](bool requested) {
 		if (requested) {
 			if (reload_validation.valid() && !ValidationReady()) {
 				validate_again = true;
@@ -467,7 +460,10 @@ int main(int argc, char **argv)
 				return false;
 			}
 			if (reload_validation.valid()) {
-				try { (void)reload_validation.get(); } catch (...) { }
+				try {
+					(void)reload_validation.get();
+				} catch (...) {
+				}
 			}
 			validate_again = false;
 			StartValidation();
@@ -527,14 +523,15 @@ int main(int argc, char **argv)
 
 	if (reload_validation.valid()) {
 		logprintf(LOG_DEFAULT, "waiting for configuration validation to finish during shutdown\n");
-		if (reload_validation.wait_for(std::chrono::seconds(5)) !=
-				std::future_status::ready) {
-			static constexpr char message[] =
-				"configuration validation did not stop within 5 seconds; forcing shutdown\n";
+		if (reload_validation.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+			static constexpr char message[] = "configuration validation did not stop within 5 seconds; forcing shutdown\n";
 			(void)::write(STDERR_FILENO, message, sizeof(message) - 1);
 			_exit(exit_code);
 		}
-		try { (void)reload_validation.get(); } catch (...) { }
+		try {
+			(void)reload_validation.get();
+		} catch (...) {
+		}
 	}
 	Logger::stop();
 

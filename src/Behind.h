@@ -19,7 +19,7 @@
 struct InetAddrPort {
 	InetResolver::Addr addr;
 	uint16_t port = 0;
-	operator bool () const
+	operator bool() const
 	{
 		return addr.type != InetResolver::UNSPEC;
 	}
@@ -30,11 +30,14 @@ class ProtocolFamilyType {
 private:
 	sa_family_t af_family_ = AF_UNSPEC;
 	int sock_type_ = SOCK_DGRAM;
+
 public:
 	ProtocolFamilyType() = default;
 	ProtocolFamilyType(sa_family_t af_family, int sock_type)
-		: af_family_(af_family), sock_type_(sock_type)
-	{}
+		: af_family_(af_family)
+		, sock_type_(sock_type)
+	{
+	}
 	sa_family_t family() const
 	{
 		return af_family_;
@@ -59,9 +62,9 @@ public:
 	{
 		return sock_type_ == SOCK_STREAM;
 	}
-	friend bool operator == (const ProtocolFamilyType &l, const ProtocolFamilyType &r);
+	friend bool operator==(const ProtocolFamilyType &l, const ProtocolFamilyType &r);
 };
-inline bool operator == (const ProtocolFamilyType &l, const ProtocolFamilyType &r)
+inline bool operator==(const ProtocolFamilyType &l, const ProtocolFamilyType &r)
 {
 	return l.af_family_ == r.af_family_ && l.sock_type_ == r.sock_type_;
 }
@@ -141,9 +144,9 @@ char const *dns_type_to_string(DNS_TYPE type);
 struct Forwarder {
 	std::string zone;
 	sa_family_t af_type = AF_UNSPEC;
-	uint8_t addr[16] = {0};
+	uint8_t addr[16] = { 0 };
 	int port = STANDARD_DNS_PORT;
-	operator bool () const
+	operator bool() const
 	{
 		return af_type != AF_UNSPEC;
 	}
@@ -168,8 +171,8 @@ struct Message;
 class Behind {
 public:
 	struct InternalData;
-private:
 
+private:
 	struct Private;
 	Private *m;
 
@@ -214,6 +217,7 @@ private:
 	private:
 		size_t offset_ = 0;
 		std::map<std::string, size_t> map_;
+
 	public:
 		void set_offset(size_t offset)
 		{
@@ -331,13 +335,14 @@ private:
 	void update_hosts_files(bool force);
 	bool is_client_allowed(sa_family_t family, const void *address) const;
 	bool consume_rate_limit(sa_family_t family, const void *address);
+
 public:
 	static bool validate_options(Option const &opt, std::string *error = nullptr);
 	static bool validate_runtime_inputs(Option *opt,
 		std::string const &working_directory, std::string *error = nullptr);
 	Behind(Option const &opt);
 	~Behind();
-	bool main(std::function<bool(bool)> const &reload_requested = {});
+	bool main(std::function<bool(bool)> const &reload_requested = { });
 	void self_test();
 };
 

@@ -1,12 +1,12 @@
 
-#include <vector>
 #include "network.h"
+#include <vector>
 
-#include <stdint.h>
-#include <unistd.h>
 #include <ifaddrs.h>
-#include <sys/socket.h>
 #include <netinet/in.h>
+#include <stdint.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 std::string get_host_name()
 {
@@ -16,4 +16,3 @@ std::string get_host_name()
 	gethostname(tmp, i);
 	return tmp;
 }
-

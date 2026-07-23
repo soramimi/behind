@@ -9,7 +9,7 @@
 #include <sys/stat.h>
 
 #ifdef WIN32
-#pragma warning(disable:4996)
+#pragma warning(disable : 4996)
 #endif
 
 bool readfile(char const *path, std::vector<char> *out, int maxsize)
@@ -73,5 +73,3 @@ bool writefile(char const *path, std::vector<char> const *vec)
 	}
 	return ok;
 }
-
-

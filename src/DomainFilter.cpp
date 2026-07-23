@@ -76,7 +76,7 @@ std::string domain_prefix_key(std::string const &name)
 	if (p) {
 		return name.substr(0, p + 1 - name.c_str());
 	}
-	return {};
+	return { };
 }
 
 DomainFilter::Kind DomainFilter::find(std::string const &name) const
@@ -84,7 +84,7 @@ DomainFilter::Kind DomainFilter::find(std::string const &name) const
 	std::string loname = misc::strtolower(name);
 	// suffix match
 	{
-		auto Find = [&](std::string const &name){
+		auto Find = [&](std::string const &name) {
 			std::string key = domain_suffix_key(name);
 			if (!key.empty()) {
 				auto it = suffix_map_.find(key);
@@ -129,7 +129,7 @@ DomainFilter::Kind DomainFilter::find(std::string const &name) const
 	}
 	// middle match
 	{
-		for (auto const &item: middle_map_) {
+		for (auto const &item : middle_map_) {
 			if (strstr(loname.c_str(), item.name.c_str())) {
 				return item.kind;
 			}
@@ -161,7 +161,7 @@ bool DomainFilter::add_entry(std::string const &name, Kind kind, std::string *er
 	if (name.size() > 4096) {
 		return fail(error, "filter rule is too long (maximum 4096 bytes)");
 	}
-	auto Success = [&](){
+	auto Success = [&]() {
 		entry_count_++;
 		return true;
 	};

@@ -1,24 +1,24 @@
 
 #include "Logger.h"
-#include <cstdio>
 #include <cctype>
-#include <cstdlib>
+#include <condition_variable>
 #include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <vector>
-#include <string>
-#include <unistd.h>
 #include <fcntl.h>
+#include <mutex>
+#include <string>
 #include <sys/stat.h>
+#include <thread>
+#include <unistd.h>
+#include <vector>
 
 Logger x_logger;
 
 struct Logger::LogItem {
-	Logger::time_point_t tp = {};
+	Logger::time_point_t tp = { };
 	int level = 0;
 	std::string message;
 	std::string file;
@@ -82,15 +82,7 @@ void Logger::write(LogItem const &item)
 			msg += item.file;
 			msg += buf;
 		}
-		int len = asprintf(&text, "[%d-%02d-%02d,%02d:%02d:%02d.%03d] %s\n"
-				, tm->tm_year + 1900
-				, tm->tm_mon + 1
-				, tm->tm_mday
-				, tm->tm_hour
-				, tm->tm_min
-				, tm->tm_sec
-				, int(msec % 1000)
-				, msg.c_str());
+		int len = asprintf(&text, "[%d-%02d-%02d,%02d:%02d:%02d.%03d] %s\n", tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, int(msec % 1000), msg.c_str());
 		if (text) {
 			if (item.level & LOG_DEFAULT) {
 				write(text, len);
@@ -106,7 +98,7 @@ void Logger::write(LogItem const &item)
 void Logger::rotate()
 {
 	if (m->fd_log == -1) return;
-	
+
 	const int N = 9;
 	int i = N;
 	std::string dst = m->log_file + '.' + std::to_string(i);
@@ -156,7 +148,7 @@ void Logger::x_start()
 	m->paused = false;
 	m->interrupted = false;
 
-	m->thread = std::thread([this](){
+	m->thread = std::thread([this]() {
 		while (1) {
 			std::vector<LogItem> items;
 			{
@@ -232,7 +224,8 @@ void Logger::x_logprint(const char *file, int line, int level, std::string_view 
 	item.line = line;
 	size_t len = str.size();
 	if (level != LOG_RAW) {
-		while (len > 0 && isspace((unsigned char)str[len - 1])) len--;
+		while (len > 0 && isspace((unsigned char)str[len - 1]))
+			len--;
 		str = str.substr(0, len);
 	}
 	item.message = std::string(str);
@@ -261,5 +254,3 @@ void Logger::pause(bool f)
 {
 	x_logger.x_pause(f);
 }
-
-

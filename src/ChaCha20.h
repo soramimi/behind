@@ -13,10 +13,10 @@ private:
 	int index_ = 0;
 	void seed_zero();
 	void seed_random();
+
 public:
 	ChaCha20();
 	uint32_t next_u32();
 };
-
 
 #endif // CHACHA20_H

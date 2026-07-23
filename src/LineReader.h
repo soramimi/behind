@@ -27,6 +27,7 @@ private:
 	void close_one();
 	void set_error(std::string file, int line, std::string message);
 	bool internal_getline(std::string *out);
+
 public:
 	LineReader();
 	~LineReader();

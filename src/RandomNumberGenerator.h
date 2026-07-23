@@ -8,6 +8,7 @@ class RandomNumberGenerator {
 private:
 	struct Private;
 	Private *m;
+
 public:
 	RandomNumberGenerator();
 	~RandomNumberGenerator();
