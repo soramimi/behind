@@ -151,6 +151,16 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 			}
 			return option_error(error, "invalid upstream-timeout-ms value: " + value);
 		}
+		if (key == "udp-multiple-forwarding") {
+			constexpr int min = 1;
+			constexpr int max = 4;
+			uint64_t v = 0;
+			if (parse_unsigned(value, min, max, &v)) {
+				opts->udp_multiple_forwarding = static_cast<int>(v);
+				return true;
+			}
+			return option_error(error, "invalid udp-multiple-forwarding value: " + value);
+		}
 		if (key == "allow-client") {
 			if (value.empty()) return option_error(error, "allow-client must not be empty");
 			opts->allow_clients.push_back(value);
@@ -367,12 +377,10 @@ bool validate_configuration(Options *opts, std::string const &startup_directory)
 		fprintf(stderr, "configuration validation failed: %s\n", error.c_str());
 		return false;
 	}
-	std::string working_directory = path_from_startup_directory(opts->working_dir,
-		startup_directory);
+	std::string working_directory = path_from_startup_directory(opts->working_dir, startup_directory);
 	struct stat info = { };
 	if (stat(working_directory.c_str(), &info) != 0 || !S_ISDIR(info.st_mode) || access(working_directory.c_str(), X_OK) != 0) {
-		fprintf(stderr, "configuration validation failed: working directory is not accessible: %s\n",
-			working_directory.c_str());
+		fprintf(stderr, "configuration validation failed: working directory is not accessible: %s\n", working_directory.c_str());
 		return false;
 	}
 	for (Options::HostsFile const &hosts : opts->hostsfiles) {
@@ -381,8 +389,7 @@ bool validate_configuration(Options *opts, std::string const &startup_directory)
 			path = working_directory + (working_directory.back() == '/' ? "" : "/") + path;
 		}
 		if (stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode)) {
-			fprintf(stderr, "configuration validation failed: hosts file is not accessible: %s\n",
-				path.c_str());
+			fprintf(stderr, "configuration validation failed: hosts file is not accessible: %s\n", path.c_str());
 			return false;
 		}
 	}

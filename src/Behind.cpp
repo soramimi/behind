@@ -714,7 +714,7 @@ struct Behind::Private {
 	std::unordered_map<int, std::shared_ptr<Behind::Task>> tasks_by_fd;
 	std::unordered_multimap<uint32_t, int> fds_by_txid;
 	std::unordered_map<uint32_t, std::shared_ptr<Behind::UdpQuery>> udp_queries_by_local_txid;
-	std::unordered_map<uint64_t, std::shared_ptr<Behind::UdpQuery>> udp_queries_by_socket_txid;
+	std::unordered_multimap<uint64_t, std::shared_ptr<Behind::UdpQuery>> udp_queries_by_socket_txid;
 	std::unordered_map<std::string, std::shared_ptr<Behind::PendingQuery>> pending_udp;
 	std::vector<std::shared_ptr<Behind::UdpChannel>> udp_channels;
 	std::unordered_map<int, std::shared_ptr<Behind::UdpChannel>> udp_channels_by_fd;
@@ -1389,6 +1389,28 @@ void Behind::uptime()
 	}
 }
 
+void Behind::finish_udp_query(std::shared_ptr<UdpQuery> const &query)
+{
+	if (!query) return;
+	if (std::shared_ptr<UdpChannel> channel = find_udp_channel_by_fd(query->channel_fd)) {
+		if (channel->active_queries > 0) {
+			channel->active_queries--;
+		}
+	}
+	while (1) {
+		auto it = m->udp_queries_by_local_txid.find(query->local_transaction_id);
+		if (it == m->udp_queries_by_local_txid.end()) break;
+		m->udp_queries_by_local_txid.erase(it);
+	}
+	m->udp_queries_by_socket_txid.erase(udp_socket_txid_key(query->channel_fd, query->upstream_id));
+	if (query->pending) {
+		auto found = m->pending_udp.find(query->pending->key);
+		if (found != m->pending_udp.end() && found->second == query->pending) {
+			m->pending_udp.erase(found);
+		}
+	}
+}
+
 // Remove a single (txid -> fd) entry from the multimap (a task can share its
 // txid with a sibling, so erase by the exact fd, not the whole key).
 static void erase_txid_fd(std::unordered_multimap<uint32_t, int> *mm, uint32_t txid, int fd)
@@ -1432,63 +1454,6 @@ void Behind::clean(InternalData *d)
 	std::unordered_set<uint32_t> completed_transactions;
 	for (auto const &task : expired) {
 		if (!task || task->upstream_fd == -1 || find_task_by_fd(task->upstream_fd) != task) continue;
-		if (task->op == Operation::REPLY_TO_CLIENT_UDP) {
-			if (!completed_transactions.insert(task->local_transaction_id).second) continue;
-			bool all_expired = true;
-			auto range = m->fds_by_txid.equal_range(task->local_transaction_id);
-			for (auto it = range.first; it != range.second; ++it) {
-				auto found = m->tasks_by_fd.find(it->second);
-				if (found != m->tasks_by_fd.end() && now - found->second->timestamp < (uint64_t)found->second->timeout) {
-					all_expired = false;
-					break;
-				}
-			}
-			if (!all_expired) {
-				finish_task(task);
-				continue;
-			}
-			dns::Message failure;
-			failure.header.flags = 0x8182;
-			dns::Question question;
-			question.name = task->request_name;
-			question.type = task->type;
-			question.clas = task->clas;
-			failure.questions = { question };
-			if (dns::Cache *cache = get_cache(task->type)) {
-				cache->insert_failure(task->forward_name, task->type, task->clas, failure);
-			}
-			std::vector<PendingQuery::Waiter> waiters;
-			if (task->pending)
-				waiters = task->pending->waiters;
-			else {
-				PendingQuery::Waiter waiter;
-				waiter.proto = task->client_proto;
-				waiter.requester_id = task->requester_id;
-				waiter.udp_payload = task->client_udp_payload;
-				waiter.request_name = task->request_name;
-				if (waiter.proto.is_inet4()) {
-					waiter.sa4 = task->client_sa4;
-				} else {
-					waiter.sa6 = task->client_sa6;
-				}
-				waiters.push_back(std::move(waiter));
-			}
-			for (PendingQuery::Waiter const &waiter : waiters) {
-				dns::Message sending = failure;
-				sending.header.id = waiter.requester_id;
-				sending.questions.front().name = waiter.request_name;
-				set_edns0(&sending, waiter.udp_payload);
-				InternalData client = *d;
-				if (waiter.proto.is_inet4()) {
-					client.in4_udp.sa4 = waiter.sa4;
-				} else {
-					client.in6_udp.sa6 = waiter.sa6;
-				}
-				send_dns_message(&client, waiter.proto, sending, false, false);
-			}
-			clean_transaction(task->local_transaction_id);
-			continue;
-		}
 		if (task->op == Operation::FORWARD_TO_UPSTREAM_TCP || task->op == Operation::REPLY_TO_CLIENT_TCP) {
 			dns::Message failure;
 			failure.header.id = task->requester_id;
@@ -1580,27 +1545,6 @@ void Behind::clean_transaction(uint32_t id)
 		if (it != m->tasks_by_fd.end()) {
 			std::shared_ptr<Task> task = it->second;
 			finish_task(task);
-		}
-	}
-}
-
-void Behind::finish_udp_query(std::shared_ptr<UdpQuery> const &query)
-{
-	if (!query) return;
-	if (std::shared_ptr<UdpChannel> channel = find_udp_channel_by_fd(query->channel_fd)) {
-		if (channel->active_queries > 0) {
-			channel->active_queries--;
-		}
-	}
-	auto by_local = m->udp_queries_by_local_txid.find(query->local_transaction_id);
-	if (by_local != m->udp_queries_by_local_txid.end() && by_local->second == query) {
-		m->udp_queries_by_local_txid.erase(by_local);
-	}
-	m->udp_queries_by_socket_txid.erase(udp_socket_txid_key(query->channel_fd, query->upstream_id));
-	if (query->pending) {
-		auto found = m->pending_udp.find(query->pending->key);
-		if (found != m->pending_udp.end() && found->second == query->pending) {
-			m->pending_udp.erase(found);
 		}
 	}
 }
@@ -2669,7 +2613,7 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 		query->channel_fd = channel->fd;
 		channel->active_queries++;
 		m->udp_queries_by_local_txid[local_transaction_id] = query;
-		m->udp_queries_by_socket_txid[udp_socket_txid_key(channel->fd, upstream_id)] = query;
+		m->udp_queries_by_socket_txid.insert(std::pair<uint64_t, std::shared_ptr<Behind::UdpQuery>>(udp_socket_txid_key(channel->fd, upstream_id), query));
 	}
 }
 
@@ -2924,15 +2868,11 @@ bool Behind::process_local_query(InternalData *d, ProtocolFamilyType const &clie
 	return false;
 }
 
-void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client_proto,
-	dns::Message const &received, dns::Question const &q)
+void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client_proto, dns::Message const &received, dns::Question const &q)
 {
 	if (process_local_query(d, client_proto, received, q)) return;
 	
-	// Under load, duplicating every cache miss to multiple upstream servers
-	// cuts effective task capacity in half. Prefer one upstream here and let the
-	// next query retry via the normal random selection path if needed.
-	std::vector<Forwarder const *> forwarders = choose_forwarder(q.name, 1);
+	std::vector<Forwarder const *> forwarders = choose_forwarder(q.name, m->options.udp_multiple_forwarding);
 	auto SendFailure = [&]() {
 		dns::Message sending;
 		sending.header.id = received.header.id;
@@ -3192,6 +3132,7 @@ bool Behind::reply_to_client_udp(InternalData *d, std::shared_ptr<UdpQuery> cons
 		} else {
 			client.in6_udp.sa6 = waiter.sa6;
 		}
+		// fprintf(stderr, "---A %d\n", query->local_transaction_id);
 		sent = send_dns_message(&client, waiter.proto, sending, false, false) || sent;
 	}
 	if (sent) {
@@ -3228,6 +3169,10 @@ void Behind::process_upstream_udp_channel(InternalData *d, std::shared_ptr<UdpCh
 		if (found == m->udp_queries_by_socket_txid.end()) continue;
 		std::shared_ptr<UdpQuery> query = found->second;
 		if (!query || query->channel_fd != channel->fd || query->upstream_id != received.header.id) continue;
+		{
+			auto it = m->udp_queries_by_local_txid.find(query->local_transaction_id);
+			if (it == m->udp_queries_by_local_txid.end()) continue;
+		}
 		if (!is_matching_udp_response(query, received)) continue;
 		
 		drop_aa_flag(&received);
@@ -3254,7 +3199,7 @@ void Behind::process_upstream_udp_channel(InternalData *d, std::shared_ptr<UdpCh
 					query->upstream_id = retry_id;
 					query->used_edns = false;
 					query->timestamp = misc::get_tick_count();
-					m->udp_queries_by_socket_txid[udp_socket_txid_key(channel->fd, retry_id)] = query;
+					m->udp_queries_by_socket_txid.insert(std::pair<uint64_t, std::shared_ptr<Behind::UdpQuery>>(udp_socket_txid_key(channel->fd, retry_id), query));
 					continue;
 				}
 			}
@@ -3509,64 +3454,6 @@ void Behind::process_receive(InternalData *d, int upstream_fd)
 		return;
 	}
 	
-	if (task->op == Operation::REPLY_TO_CLIENT_UDP) {
-		std::array<char, 65535> buffer;
-		iovec iov { buffer.data(), buffer.size() };
-		msghdr message { };
-		message.msg_iov = &iov;
-		message.msg_iovlen = 1;
-		ssize_t size;
-		do {
-			size = recvmsg(upstream_fd, &message, MSG_TRUNC);
-		} while (size < 0 && errno == EINTR);
-		if (size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
-		if (size <= 0 || (message.msg_flags & MSG_TRUNC) || (size_t)size > buffer.size()) return; // retain the task until timeout
-		dns::Message received;
-		if (!parse_dns_message(buffer.data(), buffer.data() + size, &received) || !is_matching_response(task, received)) {
-			return; // an invalid datagram must not cancel a valid sibling
-		}
-		drop_aa_flag(&received);
-		uint16_t rcode = received.header.flags & 0x000f;
-		if ((rcode == 1 || rcode == 4) && task->used_edns) {
-			dns::Message retry;
-			retry.header.id = next_txid();
-			retry.header.flags = 0x0100;
-			dns::Question question;
-			question.name = task->forward_name;
-			question.type = task->type;
-			question.clas = task->clas;
-			retry.questions = { question };
-			InternalData upstream;
-			if (task->upstream_proto.is_inet4()) {
-				upstream.in4_udp.fd = upstream_fd;
-				init_sa4(&upstream.in4_udp.sa4, (in_addr const *)task->forwarder.addr, task->forwarder.port);
-			} else {
-				upstream.in6_udp.fd = upstream_fd;
-				init_sa6(&upstream.in6_udp.sa6, (in6_addr const *)task->forwarder.addr, task->forwarder.port);
-			}
-			if (send_dns_message(&upstream, task->upstream_proto, retry, true, false)) {
-				task->upstream_id = retry.header.id;
-				task->used_edns = false;
-				return;
-			}
-		}
-		if (rcode != 0 && rcode != 3) {
-			auto range = m->fds_by_txid.equal_range(task->local_transaction_id);
-			size_t siblings = (size_t)std::distance(range.first, range.second);
-			if (siblings > 1) {
-				finish_task(task);
-				return;
-			}
-			if (dns::Cache *cache = get_cache(task->type)) {
-				cache->insert_failure(task->forward_name, task->type, task->clas, received);
-			}
-		}
-		if (reply_to_client_udp(d, task, received)) {
-			clean_transaction(task->local_transaction_id);
-		}
-		return;
-	}
-	
 	finish_task(task);
 }
 
@@ -3575,21 +3462,28 @@ void Behind::drop_aa_flag(dns::Message *msg)
 	msg->header.flags &= ~0x0400;
 }
 
-Behind::ConnectionStatus Behind::process(InternalData *d, ProtocolFamilyType const &client_proto)
+void Behind::process_udp(InternalData *d, sa_family_t family)
 {
+	ProtocolFamilyType client_proto = { family, SOCK_DGRAM };
+	
+	auto Return = [](Behind::ConnectionStatus s)-> void {
+		(void)s;
+		return void();
+	};
+	
 	if (client_proto.is_inet4() || client_proto.is_inet6()) {
 		std::vector<char> buf;
 		buf = read(d, client_proto);
-		if (buf.empty()) return ConnectionStatus::ERROR;
+		if (buf.empty()) return Return(ConnectionStatus::ERROR);
 		if (client_proto.is_dgram()) {
 			void const *address = client_proto.is_inet4()
-			? (void const *)&d->in4_udp.sa4.sin_addr
-			: (void const *)&d->in6_udp.sa6.sin6_addr;
+									  ? (void const *)&d->in4_udp.sa4.sin_addr
+									  : (void const *)&d->in6_udp.sa6.sin6_addr;
 			if (!is_client_allowed(client_proto.family(), address) || !consume_rate_limit(client_proto.family(), address)) {
-				return ConnectionStatus::ERROR; // silently drop unauthorized/rate-limited UDP
+				return Return(ConnectionStatus::ERROR); // silently drop unauthorized/rate-limited UDP
 			}
 		}
-		if (buf.size() < 12) return ConnectionStatus::CONTINUE;
+		if (buf.size() < 12) return Return(ConnectionStatus::CONTINUE);
 		
 		dns::Message received;
 		if (!parse_dns_message(buf.data(), buf.data() + buf.size(), &received)) {
@@ -3600,9 +3494,9 @@ Behind::ConnectionStatus Behind::process(InternalData *d, ProtocolFamilyType con
 				error.header.flags = 0x8081 | (request_flags & 0x0100);
 				send_dns_message(d, client_proto, error, false, false);
 			}
-			return ConnectionStatus::ERROR;
+			return Return(ConnectionStatus::ERROR);
 		}
-		if (received.header.flags & 0x8000) return ConnectionStatus::ERROR;
+		if (received.header.flags & 0x8000) return Return(ConnectionStatus::ERROR);
 		
 		uint16_t error_rcode = 0;
 		if ((received.header.flags & 0x7800) != 0) {
@@ -3621,8 +3515,7 @@ Behind::ConnectionStatus Behind::process(InternalData *d, ProtocolFamilyType con
 				opt_count++;
 				if (!additional.name.empty()) error_rcode = 1;
 				if (((additional.ttl >> 16) & 0xff) != 0) {
-					badvers_payload = std::min<uint16_t>(m->options.edns0_buffer_size,
-														 std::max<uint16_t>(512, (uint16_t)additional.clas));
+					badvers_payload = std::min<uint16_t>(m->options.edns0_buffer_size, std::max<uint16_t>(512, (uint16_t)additional.clas));
 				}
 			}
 		}
@@ -3636,7 +3529,7 @@ Behind::ConnectionStatus Behind::process(InternalData *d, ProtocolFamilyType con
 			error.questions = received.questions;
 			set_edns0(&error, badvers_payload, 1);
 			send_dns_message(d, client_proto, error, false, false);
-			return ConnectionStatus::DONE;
+			return Return(ConnectionStatus::DONE);
 		}
 		if (error_rcode) {
 			dns::Message error;
@@ -3645,23 +3538,20 @@ Behind::ConnectionStatus Behind::process(InternalData *d, ProtocolFamilyType con
 			if (received.questions.size() == 1) error.questions = received.questions;
 			set_edns0(&error, client_edns_payload(received));
 			send_dns_message(d, client_proto, error, false, false);
-			return ConnectionStatus::DONE;
+			return Return(ConnectionStatus::DONE);
 		}
 		
 		dns::Question const &q = received.questions.front();
 		if (client_proto.is_dgram()) {
 			process_query_udp(d, client_proto, received, q);
-			return ConnectionStatus::DONE;
+			return Return(ConnectionStatus::DONE);
+		} else if (client_proto.is_stream()) {
+			int client_fd = client_proto.is_inet4() ? d->in4_tcp.fd : d->in6_tcp.fd;
+			auto r = process_query_tcp(d, client_proto, client_fd, received, q);
+			return Return(r);
 		}
-		int client_fd = client_proto.is_inet4() ? d->in4_tcp.fd : d->in6_tcp.fd;
-		return process_query_tcp(d, client_proto, client_fd, received, q);
 	}
-	return ConnectionStatus::ERROR;
-}
-
-void Behind::process_udp(InternalData *d, sa_family_t family)
-{
-	process(d, { family, SOCK_DGRAM });
+	return Return(ConnectionStatus::ERROR);
 }
 
 void Behind::process_tcp(InternalData *d, sa_family_t family)
@@ -4229,6 +4119,12 @@ bool Behind::main(std::function<bool(bool)> const &reload_requested)
 					} else if (fd == d.in6_tcp.listener_fd) {
 						process_tcp(&d, AF_INET6);
 					} else {
+						// static bool f = false;
+						// if (!f) {
+						// 	f = true;
+						// } else {
+						// 	fprintf(stderr, "---B\n");
+						// }
 						process_receive(&d, fd);
 					}
 				}

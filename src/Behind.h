@@ -121,6 +121,8 @@ struct Options {
 	uint32_t rate_limit_qps = 1000;
 	uint32_t rate_limit_burst = 2000;
 	uint32_t upstream_timeout_ms = 3000;
+	//
+	int udp_multiple_forwarding = 2;
 };
 
 enum class DNS_CLASS : uint16_t {
@@ -180,7 +182,6 @@ private:
 		NONE,
 		READING_FROM_CLIENT,
 		WRITING_TO_CLIENT_TCP,
-		REPLY_TO_CLIENT_UDP,
 		REPLY_TO_CLIENT_TCP,
 		FORWARD_TO_UPSTREAM_TCP,
 	};
@@ -286,7 +287,6 @@ private:
 	TcpReadResult read_tcp_message(std::shared_ptr<Task> task, dns::Message *out);
 	TcpWriteResult write_tcp_buffer(std::shared_ptr<Task> task);
 	
-	ConnectionStatus process(InternalData *d, const ProtocolFamilyType &proto);
 	void process_udp(InternalData *d, sa_family_t family);
 	void process_tcp(InternalData *d, sa_family_t family);
 	
