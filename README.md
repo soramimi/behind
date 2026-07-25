@@ -209,17 +209,9 @@ Validate a configuration without binding sockets:
 
 - `-C, --conf <config-file>`: Specify the configuration file path
 - `--check-config`: Validate syntax, referenced hosts files, and forwarder resolution, then exit
-- `--self-test`: Run the built-in DNS codec/cache tests and exit
 - `--log-file <path>`: Override the configured log file path
 - `-h, --help`: Show command-line help
 - `-v, --version`: Show the version
-
-Run the self-test from the repository root so the packet fixtures under
-`testcase/` can be found:
-
-```bash
-./_bin/behind --self-test
-```
 
 ### Benchmarking
 

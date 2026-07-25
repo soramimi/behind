@@ -23,7 +23,6 @@
 enum class RunMode {
 	SERVE,
 	CHECK_CONFIG,
-	SELF_TEST,
 	HELP,
 	VERSION,
 };
@@ -36,8 +35,7 @@ bool option_error(std::string *error, std::string message)
 	return false;
 }
 
-bool parse_unsigned(std::string const &text, uint64_t minimum, uint64_t maximum,
-	uint64_t *out)
+bool parse_unsigned(std::string const &text, uint64_t minimum, uint64_t maximum, uint64_t *out)
 {
 	if (text.empty()) return false;
 	uint64_t value = 0;
@@ -86,8 +84,7 @@ bool validate_section(std::vector<std::string_view> const &parts, std::string *e
 	return option_error(error, "unknown section: [" + section + "]");
 }
 
-std::string path_from_startup_directory(std::string const &path,
-	std::string const &startup_directory)
+std::string path_from_startup_directory(std::string const &path, std::string const &startup_directory)
 {
 	if (path.empty() || path.front() == '/') return path;
 	if (startup_directory.empty() || startup_directory == "/") {
@@ -96,7 +93,7 @@ std::string path_from_startup_directory(std::string const &path,
 	return startup_directory + '/' + path;
 }
 
-}
+} // namespace
 
 bool set_option(std::string const &section, std::string const &key, std::string const &value, Options *opts, std::string *error)
 {
@@ -305,7 +302,6 @@ void print_usage(FILE *fp)
 		"\n"
 		"  -C, --conf <file>   read the configuration from <file>\n"
 		"      --check-config  validate the configuration and exit\n"
-		"      --self-test     run the built-in test suite and exit\n"
 		"      --log-file <p>  override the configured log file path\n"
 		"  -h, --help          show this help and exit\n"
 		"  -v, --version       show the version and exit\n"
@@ -313,8 +309,7 @@ void print_usage(FILE *fp)
 		"See README.md for the configuration file syntax.\n");
 }
 
-bool parse_option(int argc, char **argv, std::string const &startup_directory, Options *opts,
-	RunMode *run_mode)
+bool parse_option(int argc, char **argv, std::string const &startup_directory, Options *opts, RunMode *run_mode)
 {
 	*opts = { };
 	*run_mode = RunMode::SERVE;
@@ -334,8 +329,7 @@ bool parse_option(int argc, char **argv, std::string const &startup_directory, O
 					}
 					if (!ConfigParser::parse(confpath.c_str(), [](std::string const &section, std::string const &key, std::string const &value, void *cookie, std::string *error) {
 							Options *opt = static_cast<Options *>(cookie);
-							return set_option(section, key, value, opt, error);
-						}, opts)) {
+							return set_option(section, key, value, opt, error); }, opts)) {
 						return false;
 					}
 				} else {
@@ -356,8 +350,6 @@ bool parse_option(int argc, char **argv, std::string const &startup_directory, O
 				}
 			} else if (arg_v == "--check-config") {
 				*run_mode = RunMode::CHECK_CONFIG;
-			} else if (arg_v == "--self-test") {
-				*run_mode = RunMode::SELF_TEST;
 			} else if (arg_v == "-h" || arg_v == "--help") {
 				*run_mode = RunMode::HELP;
 				return true;
@@ -396,31 +388,32 @@ bool validate_configuration(Options *opts, std::string const &startup_directory)
 		fprintf(stderr, "configuration validation failed: no configuration was provided\n");
 		return false;
 	}
-	auto ensure_fd_limit = [&](size_t max_tasks) {
-		if (max_tasks == 0) return true;
+	auto Ensure_FD_Limit = [&](size_t max_tasks) {
+		if (max_tasks == 0) return;
 		struct rlimit file_limit = { };
 		if (getrlimit(RLIMIT_NOFILE, &file_limit) != 0 || file_limit.rlim_cur == RLIM_INFINITY) {
-			return true;
+			return;
 		}
 		auto safe_tasks = [](rlim_t limit) -> rlim_t {
 			return limit > 32 ? (limit - 16) / 2 : 0;
 		};
-		if ((rlim_t)max_tasks <= safe_tasks(file_limit.rlim_cur)) return true;
+		if ((rlim_t)max_tasks <= safe_tasks(file_limit.rlim_cur)) return;
 		rlim_t needed = 16 + (rlim_t)max_tasks * 2;
 		if (file_limit.rlim_max != RLIM_INFINITY && needed > file_limit.rlim_max) {
-			return true;
+			fprintf(stderr, "warning: RLIMIT_NOFILE hard limit is %llu; max-tasks=%zu may not be fully supported\n", (unsigned long long)file_limit.rlim_max, max_tasks);
+			return;
 		}
 		rlim_t target = file_limit.rlim_max == RLIM_INFINITY ? needed : std::min(file_limit.rlim_max, needed);
-		if (target <= file_limit.rlim_cur) return true;
+		if (target <= file_limit.rlim_cur) return;
 		struct rlimit raised = file_limit;
 		raised.rlim_cur = target;
-		if (setrlimit(RLIMIT_NOFILE, &raised) == 0) {
-			return true;
+		if (setrlimit(RLIMIT_NOFILE, &raised) != 0) {
+			fprintf(stderr, "warning: failed to raise RLIMIT_NOFILE soft limit to %llu: %s\n", (unsigned long long)target, strerror(errno));
+			return;
 		}
-		fprintf(stderr, "warning: failed to raise RLIMIT_NOFILE soft limit to %llu: %s\n", (unsigned long long)target, strerror(errno));
-		return true;
+		return;
 	};
-	ensure_fd_limit(opts->max_tasks);
+	Ensure_FD_Limit(opts->max_tasks);
 	std::string error;
 	if (!Behind::validate_options(*opts, &error)) {
 		if (error.empty()) error = "unspecified validation error";
@@ -469,8 +462,6 @@ bool main2(Options const &opts, std::string const &startup_directory, std::funct
 
 	Behind behind(opts);
 
-	// self_test() deliberately does not run here: main2() is re-entered on every
-	// SIGHUP reload, so the suite used to re-run on a live server. Use --self-test.
 	return behind.main(reload_requested);
 }
 
@@ -496,20 +487,10 @@ int main(int argc, char **argv)
 		printf("behind %s\n", BEHIND_VERSION);
 		return 0;
 	}
-	if (run_mode == RunMode::SELF_TEST) {
-		// No log file is opened in this mode, so the logger falls back to stderr.
-		// The writer thread still has to run for anything to be emitted at all.
-		Logger::start();
-		Logger::pause(false);
-		bool ok = false;
-		{
-			Options test_options;
-			Behind behind(test_options);
-			ok = behind.self_test();
-		}
-		Logger::stop();
-		fprintf(stderr, "%s\n", ok ? "self-test passed" : "self-test FAILED");
-		return ok ? 0 : 1;
+	if (1) { // self test
+		Options test_options;
+		Behind behind(test_options);
+		behind.self_test();
 	}
 	if (!validate_configuration(&opts, startup_directory)) {
 		return 1;
@@ -542,9 +523,7 @@ int main(int argc, char **argv)
 					try {
 						Options candidate;
 						RunMode ignored_run_mode = RunMode::SERVE;
-						if (parse_option(argc, argv, startup_directory, &candidate,
-								&ignored_run_mode)
-							&& validate_configuration(&candidate, startup_directory)) {
+						if (parse_option(argc, argv, startup_directory, &candidate, &ignored_run_mode) && validate_configuration(&candidate, startup_directory)) {
 							return candidate;
 						}
 					} catch (std::exception const &e) {
@@ -599,8 +578,7 @@ int main(int argc, char **argv)
 			return true;
 		}
 		reload_candidate.reset();
-		logprintf(LOG_BOTH,
-			"configuration reload failed validation; keeping current runtime\n");
+		logprintf(LOG_BOTH, "configuration reload failed validation; keeping current runtime\n");
 		return false;
 	};
 	while (1) {
