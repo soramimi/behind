@@ -4,3 +4,4 @@ _bin/
 build/
 src/nxdomain
 *.d
+resperf.gnuplot

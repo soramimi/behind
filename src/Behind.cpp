@@ -34,6 +34,8 @@
 #define SOCKET_ERROR (-1)
 #define closesocket(S) close(S)
 
+#define BEHIND_UPSTREAM_UDP_CHANNELS_PER_FORWARDER 4
+
 static inline uint16_t ntohs_p(void const *p)
 {
 	uint16_t v;
@@ -578,6 +580,32 @@ struct Behind::ForwardingThreadData {
 	dns::Message msg;
 };
 
+struct Behind::UdpChannel {
+	ProtocolFamilyType proto;
+	Forwarder forwarder;
+	int fd = -1;
+	size_t active_queries = 0;
+	std::shared_ptr<epoll_event> ev = std::make_shared<epoll_event>();
+};
+
+struct Behind::UdpQuery {
+	uint64_t timestamp = 0;
+	int timeout = 1000;
+	uint32_t local_transaction_id = 0;
+	uint16_t upstream_id = 0;
+	DNS_TYPE type = DNS_TYPE::A;
+	DNS_CLASS clas = DNS_CLASS::IN;
+	ProtocolFamilyType client_proto;
+	ProtocolFamilyType upstream_proto;
+	uint16_t client_udp_payload = 0;
+	std::shared_ptr<Behind::PendingQuery> pending;
+	std::string request_name;
+	std::string forward_name;
+	Forwarder forwarder;
+	bool used_edns = true;
+	int channel_fd = -1;
+};
+
 namespace {
 
 struct ClientNetwork {
@@ -591,6 +619,16 @@ struct RateBucket {
 	uint64_t updated = 0;
 	uint64_t last_seen = 0;
 };
+
+uint64_t udp_socket_txid_key(int fd, uint16_t txid)
+{
+	return ((uint64_t)(uint32_t)fd << 32) | (uint64_t)txid;
+}
+
+bool same_forwarder_endpoint(Forwarder const &l, Forwarder const &r)
+{
+	return l.af_type == r.af_type && l.port == r.port && memcmp(l.addr, r.addr, sizeof(l.addr)) == 0;
+}
 
 bool parse_client_network(std::string text, ClientNetwork *out)
 {
@@ -647,7 +685,7 @@ std::string client_key(sa_family_t family, void const *address)
 } // namespace
 
 struct Behind::Private {
-	Options option;
+	Options options;
 	
 	RandomNumberGenerator rng;
 	
@@ -664,7 +702,7 @@ struct Behind::Private {
 	int epoll_fd = -1;
 	std::vector<int> select_in_fds;
 	std::vector<int> select_out_fds;
-	std::vector<epoll_event> epoll_events { 100 };
+	std::vector<epoll_event> epoll_events = std::vector<epoll_event>(256);
 	
 	dns::Cache dns_cache;
 	// Active forwarding tasks, indexed for O(1) dispatch.
@@ -675,7 +713,11 @@ struct Behind::Private {
 	//   one answers, clean_transaction() uses this to cancel the sibling.
 	std::unordered_map<int, std::shared_ptr<Behind::Task>> tasks_by_fd;
 	std::unordered_multimap<uint32_t, int> fds_by_txid;
+	std::unordered_map<uint32_t, std::shared_ptr<Behind::UdpQuery>> udp_queries_by_local_txid;
+	std::unordered_map<uint64_t, std::shared_ptr<Behind::UdpQuery>> udp_queries_by_socket_txid;
 	std::unordered_map<std::string, std::shared_ptr<Behind::PendingQuery>> pending_udp;
+	std::vector<std::shared_ptr<Behind::UdpChannel>> udp_channels;
+	std::unordered_map<int, std::shared_ptr<Behind::UdpChannel>> udp_channels_by_fd;
 	std::vector<Forwarder> forwarders;
 	bool forwarders_valid = true;
 	bool hosts_files_valid = true;
@@ -763,7 +805,8 @@ bool Behind::validate_options(Options const &opts, std::string *error)
 Behind::Behind(const Options &opts)
 	: m(new Private())
 {
-	m->option = opts;
+	m->options = opts;
+	m->epoll_events.resize(std::max<size_t>(256, opts.max_tasks + 8));
 	std::vector<std::string> allowed = opts.allow_clients;
 	if (allowed.empty()) {
 		allowed = { "127.0.0.0/8", "::1/128" };
@@ -796,7 +839,7 @@ inline bool Behind::eqi(const std::string &l, const std::string &r)
 
 inline uint16_t Behind::listen_port() const
 {
-	return m->option.listen_port;
+	return m->options.listen_port;
 }
 
 inline void Behind::write(std::vector<char> *out, char c)
@@ -920,7 +963,7 @@ int Behind::decode_name(const char *begin, const char *end, const char *ptr, std
 			continue;
 		}
 		if (bits != 0) break; // reserved label encodings
-		
+
 		cursor++;
 		if (!jumped) consumed++;
 		if (n == 0) {
@@ -1148,17 +1191,6 @@ uint16_t Behind::next_txid()
 	return m->rng.next_txid();
 }
 
-size_t parse_space(char const *p)
-{
-	size_t i = 0;
-	while (p[i]) {
-		int c = (unsigned char)p[i];
-		if (!isspace(c)) return i;
-		i++;
-	}
-	return i;
-}
-
 InetAddrPort InetAddrPort::parse(std::string name)
 {
 	InetAddrPort ret;
@@ -1210,10 +1242,10 @@ InetAddrPort InetAddrPort::parse(std::string name)
 
 void Behind::init_forwarder()
 {
-	for (Options::Zone const &z : m->option.forward_addr) {
+	for (Options::Zone const &z : m->options.forward_addr) {
 		InetResolver::Addr addr;
 		int port = STANDARD_DNS_PORT;
-		
+
 		// validate_runtime_inputs() records the exact endpoint that was checked,
 		// avoiding a second DNS lookup between validation and activation. Keep the
 		// parsing fallback for callers that construct Option programmatically.
@@ -1258,14 +1290,15 @@ int Behind::ctl_add(int fd, struct epoll_event *e, bool in, bool out)
 	if (fd == -1) return -1;
 	int ret = 0;
 	
-	auto Add = [](std::vector<int> *fds, int fd) {
-		if (std::find(fds->begin(), fds->end(), fd) == fds->end()) {
-			fds->push_back(fd);
-		}
-	};
-	if (in) Add(&m->select_in_fds, fd);
-	if (out) Add(&m->select_out_fds, fd);
-	logprintf(LOG_DEFAULT, "(debug) fd tracking: [+] fd=%d, in=%d, out=%d", fd, (int)m->select_in_fds.size(), (int)m->select_out_fds.size());
+	if (m->socket_mode == SocketMode::SELECT) {
+		auto Add = [](std::vector<int> *fds, int fd) {
+			if (std::find(fds->begin(), fds->end(), fd) == fds->end()) {
+				fds->push_back(fd);
+			}
+		};
+		if (in) Add(&m->select_in_fds, fd);
+		if (out) Add(&m->select_out_fds, fd);
+	}
 	
 	if (e && m->epoll_fd != -1) {
 		ret = epoll_ctl(m->epoll_fd, EPOLL_CTL_ADD, e->data.fd, e);
@@ -1276,13 +1309,15 @@ int Behind::ctl_add(int fd, struct epoll_event *e, bool in, bool out)
 int Behind::ctl_mod(int fd, struct epoll_event *e, bool in, bool out)
 {
 	if (fd == -1 || !e) return -1;
-	auto Set = [fd](std::vector<int> *fds, bool enabled) {
-		auto found = std::find(fds->begin(), fds->end(), fd);
-		if (enabled && found == fds->end()) fds->push_back(fd);
-		if (!enabled && found != fds->end()) fds->erase(found);
-	};
-	Set(&m->select_in_fds, in);
-	Set(&m->select_out_fds, out);
+	if (m->socket_mode == SocketMode::SELECT) {
+		auto Set = [fd](std::vector<int> *fds, bool enabled) {
+			auto found = std::find(fds->begin(), fds->end(), fd);
+			if (enabled && found == fds->end()) fds->push_back(fd);
+			if (!enabled && found != fds->end()) fds->erase(found);
+		};
+		Set(&m->select_in_fds, in);
+		Set(&m->select_out_fds, out);
+	}
 	e->events = (in ? (uint32_t)EPOLLIN : 0U) | (out ? (uint32_t)EPOLLOUT : 0U) | EPOLLERR | EPOLLHUP;
 	e->data.fd = fd;
 	if (m->epoll_fd != -1) {
@@ -1296,13 +1331,14 @@ int Behind::ctl_del(int fd, struct epoll_event *e)
 	if (fd == -1) return -1;
 	int ret = 0;
 	
-	auto Remove = [](std::vector<int> *fds, int fd) {
-		auto it = std::remove(fds->begin(), fds->end(), fd);
-		fds->erase(it, fds->end());
-	};
-	Remove(&m->select_in_fds, fd);
-	Remove(&m->select_out_fds, fd);
-	logprintf(LOG_DEFAULT, "(debug) fd tracking: [-] fd=%d, in=%d, out=%d", fd, (int)m->select_in_fds.size(), (int)m->select_out_fds.size());
+	if (m->socket_mode == SocketMode::SELECT) {
+		auto Remove = [](std::vector<int> *fds, int fd) {
+			auto it = std::remove(fds->begin(), fds->end(), fd);
+			fds->erase(it, fds->end());
+		};
+		Remove(&m->select_in_fds, fd);
+		Remove(&m->select_out_fds, fd);
+	}
 	
 	if (e && m->epoll_fd != -1) {
 		ret = epoll_ctl(m->epoll_fd, EPOLL_CTL_DEL, e->data.fd, e);
@@ -1371,7 +1407,7 @@ void Behind::clean(InternalData *d)
 	uint64_t now = misc::get_tick_count();
 	for (auto it = m->paused_listeners.begin(); it != m->paused_listeners.end();) {
 		if (now < it->second) {
-			++it;
+			it++;
 			continue;
 		}
 		InternalData::In *input = nullptr;
@@ -1383,7 +1419,7 @@ void Behind::clean(InternalData *d)
 			it = m->paused_listeners.erase(it);
 		} else {
 			it->second = now + 1000;
-			++it;
+			it++;
 		}
 	}
 	std::vector<std::shared_ptr<Task>> expired;
@@ -1478,10 +1514,50 @@ void Behind::clean(InternalData *d)
 		}
 		finish_task(task);
 	}
+	std::vector<std::shared_ptr<UdpQuery>> expired_udp_queries;
+	for (auto const &item : m->udp_queries_by_local_txid) {
+		std::shared_ptr<UdpQuery> const &query = item.second;
+		if (query && now - query->timestamp >= (uint64_t)query->timeout) {
+			expired_udp_queries.push_back(query);
+		}
+	}
+	for (std::shared_ptr<UdpQuery> const &query : expired_udp_queries) {
+		auto found = m->udp_queries_by_local_txid.find(query->local_transaction_id);
+		if (found == m->udp_queries_by_local_txid.end() || found->second != query) continue;
+		dns::Message failure;
+		failure.header.flags = 0x8182;
+		dns::Question question;
+		question.name = query->request_name;
+		question.type = query->type;
+		question.clas = query->clas;
+		failure.questions = { question };
+		if (dns::Cache *cache = get_cache(query->type)) {
+			cache->insert_failure(query->forward_name, query->type, query->clas, failure);
+		}
+		std::vector<PendingQuery::Waiter> waiters = query->pending ? query->pending->waiters : std::vector<PendingQuery::Waiter>();
+		for (PendingQuery::Waiter const &waiter : waiters) {
+			dns::Message sending = failure;
+			sending.header.id = waiter.requester_id;
+			sending.questions.front().name = waiter.request_name;
+			set_edns0(&sending, waiter.udp_payload);
+			InternalData client = *d;
+			if (waiter.proto.is_inet4()) {
+				client.in4_udp.sa4 = waiter.sa4;
+			} else {
+				client.in6_udp.sa6 = waiter.sa6;
+			}
+			send_dns_message(&client, waiter.proto, sending, false, false);
+		}
+		finish_udp_query(query);
+	}
 }
 
 void Behind::clean_transaction(uint32_t id)
 {
+	if (auto udp = m->udp_queries_by_local_txid.find(id); udp != m->udp_queries_by_local_txid.end()) {
+		finish_udp_query(udp->second);
+		return;
+	}
 	auto range = m->fds_by_txid.equal_range(id);
 	std::vector<int> fds;
 	std::shared_ptr<PendingQuery> pending;
@@ -1506,8 +1582,27 @@ void Behind::clean_transaction(uint32_t id)
 			finish_task(task);
 		}
 	}
-	
-	logprintf(LOG_DEFAULT, "(debug) task tracking: [-] n=%d", (int)m->fds_by_txid.size());
+}
+
+void Behind::finish_udp_query(std::shared_ptr<UdpQuery> const &query)
+{
+	if (!query) return;
+	if (std::shared_ptr<UdpChannel> channel = find_udp_channel_by_fd(query->channel_fd)) {
+		if (channel->active_queries > 0) {
+			channel->active_queries--;
+		}
+	}
+	auto by_local = m->udp_queries_by_local_txid.find(query->local_transaction_id);
+	if (by_local != m->udp_queries_by_local_txid.end() && by_local->second == query) {
+		m->udp_queries_by_local_txid.erase(by_local);
+	}
+	m->udp_queries_by_socket_txid.erase(udp_socket_txid_key(query->channel_fd, query->upstream_id));
+	if (query->pending) {
+		auto found = m->pending_udp.find(query->pending->key);
+		if (found != m->pending_udp.end() && found->second == query->pending) {
+			m->pending_udp.erase(found);
+		}
+	}
 }
 
 std::shared_ptr<Behind::Task> Behind::find_task_by_fd(int fd) const
@@ -1555,8 +1650,6 @@ void Behind::push_task(std::shared_ptr<Task> task, int timeout, uint32_t epoll_e
 	
 	m->tasks_by_fd[task->upstream_fd] = task;
 	m->fds_by_txid.insert({ task->local_transaction_id, task->upstream_fd });
-	
-	logprintf(LOG_DEFAULT, "(debug) task tracking: [+] n=%d", (int)m->fds_by_txid.size());
 }
 
 bool Behind::parse_dns_message(const char *begin, const char *end, dns::Message *msg)
@@ -1608,7 +1701,7 @@ bool Behind::parse_dns_message(const char *begin, const char *end, dns::Message 
 			if ((size_t)(end - ptr) < rdlen) return false;
 			char const *rdata_begin = ptr;
 			char const *rdata_end = ptr + rdlen;
-			
+
 			auto DecodeRdataName = [&](std::string *out) {
 				int consumed = decode_name(begin, end, ptr, out);
 				if (consumed <= 0 || (size_t)(rdata_end - ptr) < (size_t)consumed) return false;
@@ -1619,7 +1712,7 @@ bool Behind::parse_dns_message(const char *begin, const char *end, dns::Message 
 				a.bin.assign((uint8_t const *)rdata_begin, (uint8_t const *)rdata_end);
 				ptr = rdata_end;
 			};
-			
+
 			if (a.type == DNS_TYPE::A) {
 				if (rdlen != 4) return false;
 				CopyRaw();
@@ -1810,17 +1903,17 @@ struct Sender {
 
 bool Behind::is_nxdomain(std::string const &name) const
 {
-	return m->option.domain_filter.find(name) == DomainFilter::NXDOMAIN;
+	return m->options.domain_filter.find(name) == DomainFilter::NXDOMAIN;
 }
 
 bool Behind::is_nodata(std::string const &name) const
 {
-	return m->option.domain_filter.find(name) == DomainFilter::NODATA;
+	return m->options.domain_filter.find(name) == DomainFilter::NODATA;
 }
 
 bool Behind::is_nodata_aaaa(std::string const &name) const
 {
-	return m->option.domain_filter.find(name) == DomainFilter::NODATA_AAAA;
+	return m->options.domain_filter.find(name) == DomainFilter::NODATA_AAAA;
 }
 
 bool Behind::is_client_allowed(sa_family_t family, void const *address) const
@@ -1839,7 +1932,7 @@ bool Behind::consume_rate_limit(sa_family_t family, void const *address)
 	auto Refill = [&](RateBucket *bucket) {
 		if (now > bucket->updated) {
 			double elapsed = (double)(now - bucket->updated) / 1000.0;
-			bucket->tokens = std::min<double>(m->option.rate_limit_burst, bucket->tokens + elapsed * m->option.rate_limit_qps);
+			bucket->tokens = std::min<double>(m->options.rate_limit_burst, bucket->tokens + elapsed * m->options.rate_limit_qps);
 			bucket->updated = now;
 		}
 		bucket->last_seen = now;
@@ -1847,7 +1940,7 @@ bool Behind::consume_rate_limit(sa_family_t family, void const *address)
 	Refill(&m->global_rate);
 	if (m->global_rate.tokens < 1.0) return false;
 	
-	const size_t maximum_clients = std::max<size_t>(1024, m->option.max_tasks * 4);
+	const size_t maximum_clients = std::max<size_t>(1024, m->options.max_tasks * 4);
 	if (m->client_rates.size() >= maximum_clients && !m->client_rates.count(key)) {
 		if (now - m->last_rate_cleanup >= 1000) {
 			m->last_rate_cleanup = now;
@@ -1855,7 +1948,7 @@ bool Behind::consume_rate_limit(sa_family_t family, void const *address)
 				if (now - it->second.last_seen > 60000) {
 					it = m->client_rates.erase(it);
 				} else {
-					++it;
+					it++;
 				}
 			}
 		}
@@ -1865,7 +1958,7 @@ bool Behind::consume_rate_limit(sa_family_t family, void const *address)
 	auto [it, inserted] = m->client_rates.try_emplace(key);
 	RateBucket &client = it->second;
 	if (inserted) {
-		client.tokens = m->option.rate_limit_burst;
+		client.tokens = m->options.rate_limit_burst;
 		client.updated = now;
 	}
 	Refill(&client);
@@ -1905,6 +1998,49 @@ bool Behind::is_matching_response(std::shared_ptr<Task> task, dns::Message const
 bool Behind::is_cacheable_response(std::shared_ptr<Task> task, dns::Message const &received) const
 {
 	if (!is_matching_response(task, received) || (received.header.flags & 0x0200)) {
+		return false;
+	}
+	uint16_t rcode = received.header.flags & 0x000f;
+	if (rcode != 0 && rcode != 3) return false;
+	auto RecordsAreCacheable = [](std::vector<dns::Record> const &records) {
+		for (dns::Record const &record : records) {
+			if (!record.cacheable || record.type == DNS_TYPE::OPT) return false;
+		}
+		return true;
+	};
+	return RecordsAreCacheable(received.answers) && RecordsAreCacheable(received.authorities);
+}
+
+bool Behind::is_matching_udp_response(std::shared_ptr<UdpQuery> const &query, dns::Message const &received) const
+{
+	if (!query) {
+		return false;
+	}
+	if (received.header.id != query->upstream_id) {
+		return false;
+	}
+	if ((received.header.flags & 0x8000) == 0) {
+		return false;
+	}
+	if ((received.header.flags & 0x7800) != 0) {
+		return false;
+	}
+	if (received.questions.size() != 1) {
+		return false;
+	}
+	dns::Question const &q = received.questions.front();
+	if (q.name != query->forward_name) {
+		return false;
+	}
+	if (q.type != query->type || q.clas != query->clas) {
+		return false;
+	}
+	return true;
+}
+
+bool Behind::is_cacheable_udp_response(std::shared_ptr<UdpQuery> const &query, dns::Message const &received) const
+{
+	if (!is_matching_udp_response(query, received) || (received.header.flags & 0x0200)) {
 		return false;
 	}
 	uint16_t rcode = received.header.flags & 0x000f;
@@ -2030,56 +2166,38 @@ Behind::Packet Behind::make_dns_packet(dns::Message const &msg, bool tcp, uint16
 			// Truncate to the last complete record boundary (or question section)
 			size_t truncate_to = question_end;
 			for (size_t end : answer_ends) {
-				if (end <= limit) {
-					truncate_to = end;
-				} else {
-					break;
-				}
+				if (end > limit) break;
+				truncate_to = end;
 			}
 			for (size_t end : authority_ends) {
-				if (end <= limit) {
-					truncate_to = end;
-				} else {
-					break;
-				}
+				if (end > limit) break;
+				truncate_to = end;
 			}
 			for (size_t end : additional_ends) {
-				if (end <= limit) {
-					truncate_to = end;
-				} else {
-					break;
-				}
+				if (end > limit) break;
+				truncate_to = end;
 			}
 			ret.buffer.resize(truncate_to);
-			
+
 			uint16_t flags = ntohs_p(ret.buffer.data() + 2) | 0x0200;
 			write_us(ret.buffer.data() + 2, flags); // TC
 			// recount sections that actually fit
 			size_t fit = 0;
 			for (size_t end : answer_ends) {
-				if (end <= truncate_to) {
-					fit++;
-				} else {
-					break;
-				}
+				if (end > truncate_to) break;
+				fit++;
 			}
 			write_us(ret.buffer.data() + 6, (uint16_t)fit);
 			fit = 0;
 			for (size_t end : authority_ends) {
-				if (end <= truncate_to) {
-					fit++;
-				} else {
-					break;
-				}
+				if (end > truncate_to) break;
+				fit++;
 			}
 			write_us(ret.buffer.data() + 8, (uint16_t)fit);
 			fit = 0;
 			for (size_t end : additional_ends) {
-				if (end <= truncate_to) {
-					fit++;
-				} else {
-					break;
-				}
+				if (end > truncate_to) break;
+				fit++;
 			}
 			write_us(ret.buffer.data() + 10, (uint16_t)fit);
 		}
@@ -2109,7 +2227,7 @@ bool Behind::send_dns_message(InternalData *d, ProtocolFamilyType const &proto, 
 		if (sock == -1 || forward) return false;
 		std::shared_ptr<Task> task = find_task_by_fd(sock);
 		if (!task) {
-			if (m->tasks_by_fd.size() >= m->option.max_tasks) return false;
+			if (active_task_count() >= m->options.max_tasks) return false;
 			task = make_task(Operation::WRITING_TO_CLIENT_TCP, next_local_transaction_id());
 			task->upstream_fd = sock;
 			task->client_proto = proto;
@@ -2136,22 +2254,24 @@ bool Behind::send_dns_message(InternalData *d, ProtocolFamilyType const &proto, 
 		comment = " (from cache)";
 	}
 	
-	char const *qtype = dns_type_to_string(packet.q.type);
-	(void)qtype;
-	if (forward) {
-		logprintf(LOG_DEFAULT, "F: %s\n", packet.q.name.c_str());
-	} else if ((msg.header.flags & 0x000f) == 3) { // NXDOMAIN
-		logprintf(LOG_DEFAULT, "R: <<%s %s NXDOMAIN>> to %s\n", packet.q.name.c_str(), qtype, client.c_str());
-	} else if (msg.answers.size() > 0) {
-		for (size_t i = 0; i < msg.answers.size(); i++) {
-			dns::Record const &r = msg.answers[i];
-			std::string name = misc::strtolower(packet.q.name);
-			std::string addr_str = r.to_string();
-			logprintf(LOG_DEFAULT, "R: <<%s %s %s>> to %s%s\n", name.c_str(), qtype, addr_str.c_str(), client.c_str(), comment);
-			logprintf(LOG_DEFAULT, "(resolve) <<%s %s %s>> to %s%s\n", name.c_str(), qtype, addr_str.c_str(), client.c_str(), comment);
+	if (1) { // logging
+		char const *qtype = dns_type_to_string(packet.q.type);
+		(void)qtype;
+		if (forward) {
+			logprintf(LOG_DEFAULT, "F: %s\n", packet.q.name.c_str());
+		} else if ((msg.header.flags & 0x000f) == 3) { // NXDOMAIN
+			logprintf(LOG_DEFAULT, "R: <<%s %s NXDOMAIN>> to %s\n", packet.q.name.c_str(), qtype, client.c_str());
+		} else if (msg.answers.size() > 0) {
+			for (size_t i = 0; i < msg.answers.size(); i++) {
+				dns::Record const &r = msg.answers[i];
+				std::string name = misc::strtolower(packet.q.name);
+				std::string addr_str = r.to_string();
+				logprintf(LOG_DEFAULT, "R: <<%s %s %s>> to %s%s\n", name.c_str(), qtype, addr_str.c_str(), client.c_str(), comment);
+				logprintf(LOG_DEFAULT, "(resolve) <<%s %s %s>> to %s%s\n", name.c_str(), qtype, addr_str.c_str(), client.c_str(), comment);
+			}
+		} else {
+			logprintf(LOG_DEFAULT, "R: <<%s %s NOANSWER>> to %s%s\n", packet.q.name.c_str(), qtype, client.c_str(), comment);
 		}
-	} else {
-		logprintf(LOG_DEFAULT, "R: <<%s %s NOANSWER>> to %s%s\n", packet.q.name.c_str(), qtype, client.c_str(), comment);
 	}
 	
 	if (0) { // save packet binary for debug
@@ -2383,6 +2503,111 @@ std::shared_ptr<Behind::Task> Behind::make_task(Operation op, uint32_t local_tra
 	return t;
 }
 
+size_t Behind::active_task_count() const
+{
+	return m->tasks_by_fd.size() + m->udp_queries_by_local_txid.size();
+}
+
+std::shared_ptr<Behind::UdpChannel> Behind::find_udp_channel(Forwarder const &forwarder) const
+{
+	for (std::shared_ptr<UdpChannel> const &channel : m->udp_channels) {
+		if (channel && same_forwarder_endpoint(channel->forwarder, forwarder)) {
+			return channel;
+		}
+	}
+	return { };
+}
+
+std::shared_ptr<Behind::UdpChannel> Behind::choose_udp_channel(Forwarder const &forwarder) const
+{
+	std::shared_ptr<UdpChannel> best;
+	for (std::shared_ptr<UdpChannel> const &channel : m->udp_channels) {
+		if (!channel || !same_forwarder_endpoint(channel->forwarder, forwarder)) continue;
+		if (!best || channel->active_queries < best->active_queries) {
+			best = channel;
+		}
+	}
+	return best;
+}
+
+std::shared_ptr<Behind::UdpChannel> Behind::find_udp_channel_by_fd(int fd) const
+{
+	auto it = m->udp_channels_by_fd.find(fd);
+	if (it == m->udp_channels_by_fd.end()) {
+		return { };
+	}
+	return it->second;
+}
+
+std::shared_ptr<Behind::UdpChannel> Behind::get_or_create_udp_channel(Forwarder const &forwarder)
+{
+	size_t existing_count = 0;
+	for (std::shared_ptr<UdpChannel> const &channel : m->udp_channels) {
+		if (channel && same_forwarder_endpoint(channel->forwarder, forwarder)) {
+			existing_count++;
+		}
+	}
+	if (existing_count >= BEHIND_UPSTREAM_UDP_CHANNELS_PER_FORWARDER) {
+		return choose_udp_channel(forwarder);
+	}
+	int fd = socket(forwarder.af_type, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+	if (fd == INVALID_SOCKET) {
+		logprintf(LOG_DEFAULT, "socket: %s\n", strerror(errno));
+		return { };
+	}
+	if (forwarder.is_inet6()) {
+		int yes = 1;
+		setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&yes, sizeof(yes));
+	}
+	sockaddr_storage storage { };
+	sockaddr *sa = nullptr;
+	socklen_t salen = 0;
+	if (forwarder.is_inet4()) {
+		auto *sa4 = (sockaddr_in *)&storage;
+		init_sa4(sa4, (in_addr const *)forwarder.addr, forwarder.port);
+		sa = (sockaddr *)sa4;
+		salen = sizeof(*sa4);
+	} else if (forwarder.is_inet6()) {
+		auto *sa6 = (sockaddr_in6 *)&storage;
+		init_sa6(sa6, (in6_addr const *)forwarder.addr, forwarder.port);
+		sa = (sockaddr *)sa6;
+		salen = sizeof(*sa6);
+	}
+	if (!sa || connect(fd, sa, salen) != 0) {
+		logprintf(LOG_DEFAULT, "connect udp: %s\n", strerror(errno));
+		closesocket(fd);
+		return { };
+	}
+	std::shared_ptr<UdpChannel> channel = std::make_shared<UdpChannel>();
+	channel->proto = { forwarder.af_type, SOCK_DGRAM };
+	channel->forwarder = forwarder;
+	channel->fd = fd;
+	*channel->ev = { };
+	channel->ev->events = EPOLLIN | EPOLLERR | EPOLLHUP;
+	channel->ev->data.fd = fd;
+	if (ctl_add(fd, channel->ev.get(), true, false) != 0) {
+		logprintf(LOG_DEFAULT, "epoll_ctl: %s\n", strerror(errno));
+		closesocket(fd);
+		return { };
+	}
+	m->udp_channels.push_back(channel);
+	m->udp_channels_by_fd[fd] = channel;
+	return channel;
+}
+
+bool Behind::allocate_udp_upstream_id(int fd, uint16_t *out)
+{
+	if (!out) return false;
+	for (size_t attempt = 0; attempt < 65536; ++attempt) {
+		uint16_t candidate = next_txid();
+		if (!m->udp_queries_by_socket_txid.count(udp_socket_txid_key(fd, candidate))) {
+			*out = candidate;
+			return true;
+		}
+	}
+	return false;
+}
+
 void Behind::init_epoll_event(Behind::Task *task, int fd, uint32_t events)
 {
 	*task->ev = { };
@@ -2395,109 +2620,56 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 	uint32_t local_transaction_id, Forwarder const &forwarder,
 	std::shared_ptr<PendingQuery> const &pending)
 {
-	if (m->tasks_by_fd.size() >= m->option.max_tasks) {
-		logprintf(LOG_DEFAULT, "too many tasks (%zu): dropping UDP query\n", m->tasks_by_fd.size());
+	if (active_task_count() >= m->options.max_tasks) {
+		logprintf(LOG_DEFAULT, "too many tasks (%zu): dropping UDP query\n", active_task_count());
 		return;
 	}
 	
 	std::string query_name = question.name;
-	if (m->option.case_randomize) {
+	if (m->options.case_randomize) {
 		query_name = randomize_case(query_name, &m->rng);
 	}
 	
 	dns::Message sending;
-	sending.header.id = next_txid();
 	sending.header.flags = 0x0100;
 	sending.questions = { question };
 	sending.questions.front().name = query_name;
-	
-	int sock = -1;
-	{
-		sock = socket(forwarder.af_type, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-		if (sock == INVALID_SOCKET) {
-			logprintf(LOG_DEFAULT, "socket: %s\n", strerror(errno));
-			return;
-		}
-		
-		if (forwarder.is_inet6()) {
-			int yes = 1;
-			setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&yes, sizeof(yes));
-		}
-		
-		// bind to a random high port for source port randomization
-		bool bound = false;
-		constexpr int MAX_BIND_ATTEMPTS = 32;
-		for (int attempt = 0; attempt < MAX_BIND_ATTEMPTS && !bound; attempt++) {
-			uint16_t port = m->rng.random_port();
-			if (forwarder.is_inet4()) {
-				struct sockaddr_in bind_sa = { };
-				bind_sa.sin_family = AF_INET;
-				bind_sa.sin_port = htons(port);
-				bind_sa.sin_addr.s_addr = INADDR_ANY;
-				if (::bind(sock, (struct sockaddr *)&bind_sa, sizeof(bind_sa)) == 0) {
-					bound = true;
-				}
-			} else if (forwarder.is_inet6()) {
-				struct sockaddr_in6 bind_sa = { };
-				bind_sa.sin6_family = AF_INET6;
-				bind_sa.sin6_port = htons(port);
-				bind_sa.sin6_addr = IN6ADDR_ANY_INIT;
-				if (::bind(sock, (struct sockaddr *)&bind_sa, sizeof(bind_sa)) == 0) {
-					bound = true;
-				}
-			}
-		}
-		if (!bound) {
-			logprintf(LOG_DEFAULT, "bind: %s\n", strerror(errno));
-			closesocket(sock);
-			return;
-		}
-	}
-	
-	InternalData d2;
-	sockaddr *sa = nullptr;
-	socklen_t salen = 0;
-	if (forwarder.is_inet4()) {
-		init_sa4(&d2.in4_udp.sa4, (in_addr const *)forwarder.addr, forwarder.port);
-		d2.in4_udp.fd = sock;
-		sa = (sockaddr *)&d2.in4_udp.sa4;
-		salen = sizeof(d2.in4_udp.sa4);
-	} else if (forwarder.is_inet6()) {
-		init_sa6(&d2.in6_udp.sa6, (in6_addr const *)forwarder.addr, forwarder.port);
-		d2.in6_udp.fd = sock;
-		sa = (sockaddr *)&d2.in6_udp.sa6;
-		salen = sizeof(d2.in6_udp.sa6);
-	}
-	
-	if (!sa || connect(sock, sa, salen) != 0) {
-		logprintf(LOG_DEFAULT, "connect udp: %s\n", strerror(errno));
-		closesocket(sock);
+	std::shared_ptr<UdpChannel> channel = get_or_create_udp_channel(forwarder);
+	if (!channel) return;
+	uint16_t upstream_id = 0;
+	if (!allocate_udp_upstream_id(channel->fd, &upstream_id)) {
+		logprintf(LOG_DEFAULT, "too many active UDP upstream txids on fd=%d\n", channel->fd);
 		return;
 	}
-	
-	set_edns0(&sending, m->option.edns0_buffer_size);
+	sending.header.id = upstream_id;
+
+	InternalData d2;
+	if (forwarder.is_inet4()) {
+		d2.in4_udp.fd = channel->fd;
+	} else if (forwarder.is_inet6()) {
+		d2.in6_udp.fd = channel->fd;
+	}
+
+	set_edns0(&sending, m->options.edns0_buffer_size);
 	if (send_dns_message(&d2, { forwarder.af_type, SOCK_DGRAM }, sending, true, false)) {
-		std::shared_ptr<Task> t = make_task(Operation::REPLY_TO_CLIENT_UDP, local_transaction_id);
-		t->upstream_fd = sock;
-		t->requester_id = header.id;
-		t->upstream_id = sending.header.id;
-		t->client_udp_payload = client_udp_payload;
-		t->pending = pending;
-		t->type = question.type;
-		t->clas = question.clas;
-		t->client_proto = client_proto;
-		t->upstream_proto = { forwarder.af_type, SOCK_DGRAM };
-		t->forwarder = forwarder;
-		if (client_proto.is_inet4()) {
-			t->client_sa4 = d.in4_udp.sa4;
-		} else if (client_proto.is_inet6()) {
-			t->client_sa6 = d.in6_udp.sa6;
-		}
-		t->request_name = question.name;
-		t->forward_name = query_name;
-		push_task(t, m->option.upstream_timeout_ms, EPOLLIN | EPOLLERR | EPOLLHUP);
-	} else {
-		closesocket(sock);
+		std::shared_ptr<UdpQuery> query = std::make_shared<UdpQuery>();
+		query->timestamp = misc::get_tick_count();
+		query->timeout = m->options.upstream_timeout_ms;
+		query->local_transaction_id = local_transaction_id;
+		query->upstream_id = upstream_id;
+		query->type = question.type;
+		query->clas = question.clas;
+		query->client_proto = client_proto;
+		query->upstream_proto = { forwarder.af_type, SOCK_DGRAM };
+		query->client_udp_payload = client_udp_payload;
+		query->pending = pending;
+		query->request_name = question.name;
+		query->forward_name = query_name;
+		query->forwarder = forwarder;
+		query->channel_fd = channel->fd;
+		channel->active_queries++;
+		m->udp_queries_by_local_txid[local_transaction_id] = query;
+		m->udp_queries_by_socket_txid[udp_socket_txid_key(channel->fd, upstream_id)] = query;
 	}
 }
 
@@ -2525,7 +2697,7 @@ Behind::ConnectionStatus Behind::forward_tcp(InternalData *d,
 	task->client_udp_payload = client_udp_payload;
 	task->upstream_id = next_txid();
 	task->request_name = question.name;
-	task->forward_name = m->option.case_randomize ? randomize_case(question.name, &m->rng) : question.name;
+	task->forward_name = m->options.case_randomize ? randomize_case(question.name, &m->rng) : question.name;
 	task->type = question.type;
 	task->clas = question.clas;
 	task->client_proto = client_proto;
@@ -2535,7 +2707,7 @@ Behind::ConnectionStatus Behind::forward_tcp(InternalData *d,
 	task->fwdata->msg.header.flags = 0x0100;
 	task->fwdata->msg.questions = { question };
 	task->fwdata->msg.questions.front().name = task->forward_name;
-	set_edns0(&task->fwdata->msg, m->option.edns0_buffer_size);
+	set_edns0(&task->fwdata->msg, m->options.edns0_buffer_size);
 	Packet upstream_packet = make_dns_packet(task->fwdata->msg, true);
 	if (!upstream_packet) return ConnectionStatus::ERROR;
 	task->buffer = std::move(upstream_packet.buffer);
@@ -2570,7 +2742,7 @@ Behind::ConnectionStatus Behind::forward_tcp(InternalData *d,
 			task->connect_in_progress = true;
 			task->upstream_proto = upstream_proto;
 			task->upstream_fd = sock;
-			push_task(task, m->option.upstream_timeout_ms, EPOLLOUT | EPOLLERR | EPOLLHUP);
+			push_task(task, m->options.upstream_timeout_ms, EPOLLOUT | EPOLLERR | EPOLLHUP);
 			ret = ConnectionStatus::CONTINUE;
 		} else {
 			logprintf(LOG_DEFAULT, "connect: %s\n", strerror(errno));
@@ -2593,7 +2765,7 @@ void Behind::set_edns0(dns::Message *msg, uint16_t payload_size, uint8_t extende
 	}
 	
 	if (payload_size == 0) return;
-	payload_size = std::max<uint16_t>(512, std::min<uint16_t>(payload_size, m->option.edns0_buffer_size));
+	payload_size = std::max<uint16_t>(512, std::min<uint16_t>(payload_size, m->options.edns0_buffer_size));
 	const uint8_t version = 0;
 	const bool dnssec_ok = false;
 	const uint16_t z = 0;
@@ -2616,7 +2788,7 @@ uint16_t Behind::client_edns_payload(dns::Message const &msg) const
 		payload = std::max<uint16_t>(512, (uint16_t)record.clas);
 	}
 	if (payload == 0) return 0;
-	return std::min<uint16_t>(payload, m->option.edns0_buffer_size);
+	return std::min<uint16_t>(payload, m->options.edns0_buffer_size);
 }
 
 bool Behind::reply_from_cache(InternalData *d, ProtocolFamilyType const &client_proto, dns::Header const &header, dns::Question const &q, uint16_t client_udp_payload)
@@ -2677,7 +2849,6 @@ bool Behind::process_local_query(InternalData *d, ProtocolFamilyType const &clie
 			SendNODATA();
 			return true;
 		}
-		logprintf(LOG_DEFAULT, "Q: %s %s\n", q.name.c_str(), dns_type_to_string(q.type));
 		// check known hosts
 		if (q.type == DNS_TYPE::PTR) {
 			auto addr = parse_ptr_query_addr(q.name);
@@ -2733,26 +2904,22 @@ bool Behind::process_local_query(InternalData *d, ProtocolFamilyType const &clie
 			}
 			return true;
 		}
-		
-		if (is_nxdomain(q.name)) {
+
+		DomainFilter::Kind const filter_kind = m->options.domain_filter.find(q.name);
+		if (filter_kind == DomainFilter::NXDOMAIN) {
 			SendNXDOMAIN();
 			return true;
 		}
-		
-		if (is_nodata(q.name)) {
+		if (filter_kind == DomainFilter::NODATA) {
+			SendNODATA();
+			return true;
+		}
+		if (q.type == DNS_TYPE::AAAA && filter_kind == DomainFilter::NODATA_AAAA) {
 			SendNODATA();
 			return true;
 		}
 		
-		if (q.type == DNS_TYPE::AAAA && is_nodata_aaaa(q.name)) {
-			SendNODATA();
-			return true;
-		}
-		
-		if (reply_from_cache(d, client_proto, received.header, q, udp_payload)) {
-			return true;
-		}
-		return false;
+		return reply_from_cache(d, client_proto, received.header, q, udp_payload);
 	}
 	return false;
 }
@@ -2762,7 +2929,10 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 {
 	if (process_local_query(d, client_proto, received, q)) return;
 	
-	std::vector<Forwarder const *> forwarders = choose_forwarder(q.name, 2);
+	// Under load, duplicating every cache miss to multiple upstream servers
+	// cuts effective task capacity in half. Prefer one upstream here and let the
+	// next query retry via the normal random selection path if needed.
+	std::vector<Forwarder const *> forwarders = choose_forwarder(q.name, 1);
 	auto SendFailure = [&]() {
 		dns::Message sending;
 		sending.header.id = received.header.id;
@@ -2809,7 +2979,7 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 	for (Forwarder const *f : forwarders) {
 		forward_udp(*d, client_proto, received.header, q, client_edns_payload(received), local_transaction_id, *f, pending);
 	}
-	if (m->fds_by_txid.count(local_transaction_id) == 0) {
+	if (m->udp_queries_by_local_txid.count(local_transaction_id) == 0) {
 		m->pending_udp.erase(key);
 		SendFailure();
 	}
@@ -2925,9 +3095,7 @@ Behind::ConnectionStatus Behind::process_query_tcp(InternalData *d, ProtocolFami
 		sending.header.flags = 0x8182;
 		sending.questions = { q };
 		set_edns0(&sending, client_edns_payload(received));
-		return send_dns_message(&d2, client_proto, sending, false, false)
-				   ? ConnectionStatus::CONTINUE
-				   : ConnectionStatus::ERROR;
+		return send_dns_message(&d2, client_proto, sending, false, false) ? ConnectionStatus::CONTINUE : ConnectionStatus::ERROR;
 	}
 	
 	const uint32_t local_transaction_id = next_local_transaction_id();
@@ -2948,17 +3116,18 @@ bool Behind::reply_to_client_udp(InternalData *d, std::shared_ptr<Task> task, dn
 		waiter.requester_id = task->requester_id;
 		waiter.udp_payload = task->client_udp_payload;
 		waiter.request_name = task->request_name;
-		if (waiter.proto.is_inet4())
+		if (waiter.proto.is_inet4()) {
 			waiter.sa4 = task->client_sa4;
-		else
+		} else {
 			waiter.sa6 = task->client_sa6;
+		}
 		waiters.push_back(std::move(waiter));
 	}
 	
 	bool sent = false;
 	for (PendingQuery::Waiter const &waiter : waiters) {
 		auto AmendOwner = [&](std::string const &name) {
-			return stricmp(task->forward_name.c_str(), name.c_str()) == 0
+			return stricmp(task->forward_name.c_str(), name.c_str()) == 0 
 					   ? waiter.request_name
 					   : misc::strtolower(name);
 		};
@@ -2993,8 +3162,120 @@ bool Behind::reply_to_client_udp(InternalData *d, std::shared_ptr<Task> task, dn
 	return sent;
 }
 
+bool Behind::reply_to_client_udp(InternalData *d, std::shared_ptr<UdpQuery> const &query, dns::Message const &received)
+{
+	if (!query || received.questions.size() != 1 || received.questions.front().name != query->forward_name || received.questions.front().type != query->type || received.questions.front().clas != query->clas) return false;
+	std::vector<PendingQuery::Waiter> waiters = query->pending ? query->pending->waiters : std::vector<PendingQuery::Waiter>();
+	bool sent = false;
+	for (PendingQuery::Waiter const &waiter : waiters) {
+		auto AmendOwner = [&](std::string const &name) {
+			return stricmp(query->forward_name.c_str(), name.c_str()) == 0
+					   ? waiter.request_name
+					   : misc::strtolower(name);
+		};
+		dns::Message sending = received;
+		dns::normalize_negative_ttl(&sending);
+		sending.header.id = waiter.requester_id;
+		for (dns::Question &question : sending.questions) {
+			question.name = waiter.request_name;
+		}
+		for (dns::Record &record : sending.answers) {
+			record.name = AmendOwner(record.name);
+		}
+		for (dns::Record &record : sending.authorities) {
+			record.name = AmendOwner(record.name);
+		}
+		set_edns0(&sending, waiter.udp_payload);
+		InternalData client = *d;
+		if (waiter.proto.is_inet4()) {
+			client.in4_udp.sa4 = waiter.sa4;
+		} else {
+			client.in6_udp.sa6 = waiter.sa6;
+		}
+		sent = send_dns_message(&client, waiter.proto, sending, false, false) || sent;
+	}
+	if (sent) {
+		if (is_cacheable_udp_response(query, received)) {
+			dns::Message cached = received;
+			cached.additionals.clear();
+			if (dns::Cache *cache = get_cache(query->type)) {
+				cache->insert(query->forward_name, query->type, query->clas, cached);
+			}
+		}
+	}
+	return sent;
+}
+
+void Behind::process_upstream_udp_channel(InternalData *d, std::shared_ptr<UdpChannel> const &channel)
+{
+	if (!channel) return;
+	while (true) {
+		std::array<char, 65535> buffer;
+		iovec iov { buffer.data(), buffer.size() };
+		msghdr message { };
+		message.msg_iov = &iov;
+		message.msg_iovlen = 1;
+		ssize_t size;
+		do {
+			size = recvmsg(channel->fd, &message, MSG_TRUNC);
+		} while (size < 0 && errno == EINTR);
+		
+		if (size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+		if (size <= 0 || (message.msg_flags & MSG_TRUNC) || (size_t)size > buffer.size()) continue;
+		dns::Message received;
+		if (!parse_dns_message(buffer.data(), buffer.data() + size, &received)) continue;
+		auto found = m->udp_queries_by_socket_txid.find(udp_socket_txid_key(channel->fd, received.header.id));
+		if (found == m->udp_queries_by_socket_txid.end()) continue;
+		std::shared_ptr<UdpQuery> query = found->second;
+		if (!query || query->channel_fd != channel->fd || query->upstream_id != received.header.id) continue;
+		if (!is_matching_udp_response(query, received)) continue;
+		
+		drop_aa_flag(&received);
+		uint16_t rcode = received.header.flags & 0x000f;
+		if ((rcode == 1 || rcode == 4) && query->used_edns) {
+			dns::Message retry;
+			retry.header.flags = 0x0100;
+			dns::Question question;
+			question.name = query->forward_name;
+			question.type = query->type;
+			question.clas = query->clas;
+			retry.questions = { question };
+			uint16_t retry_id = 0;
+			if (allocate_udp_upstream_id(channel->fd, &retry_id)) {
+				retry.header.id = retry_id;
+				InternalData upstream;
+				if (query->upstream_proto.is_inet4()) {
+					upstream.in4_udp.fd = channel->fd;
+				} else {
+					upstream.in6_udp.fd = channel->fd;
+				}
+				if (send_dns_message(&upstream, query->upstream_proto, retry, true, false)) {
+					m->udp_queries_by_socket_txid.erase(found);
+					query->upstream_id = retry_id;
+					query->used_edns = false;
+					query->timestamp = misc::get_tick_count();
+					m->udp_queries_by_socket_txid[udp_socket_txid_key(channel->fd, retry_id)] = query;
+					continue;
+				}
+			}
+		}
+		if (rcode != 0 && rcode != 3) {
+			if (dns::Cache *cache = get_cache(query->type)) {
+				cache->insert_failure(query->forward_name, query->type, query->clas, received);
+			}
+		}
+		if (reply_to_client_udp(d, query, received)) {
+			finish_udp_query(query);
+		}
+	}
+}
+
 void Behind::process_receive(InternalData *d, int upstream_fd)
 {
+	if (std::shared_ptr<UdpChannel> channel = find_udp_channel_by_fd(upstream_fd)) {
+		process_upstream_udp_channel(d, channel);
+		return;
+	}
 	std::shared_ptr<Task> task = find_task_by_fd(upstream_fd);
 	if (!task) return; // stale epoll event; the fd may already have been reused
 	assert(task->upstream_fd == upstream_fd);
@@ -3073,7 +3354,7 @@ void Behind::process_receive(InternalData *d, int upstream_fd)
 				opt_count++;
 				if (!additional.name.empty()) error_rcode = 1;
 				if (((additional.ttl >> 16) & 0xff) != 0) {
-					badvers_payload = std::min<uint16_t>(m->option.edns0_buffer_size,
+					badvers_payload = std::min<uint16_t>(m->options.edns0_buffer_size,
 														 std::max<uint16_t>(512, (uint16_t)additional.clas));
 				}
 			}
@@ -3340,7 +3621,7 @@ Behind::ConnectionStatus Behind::process(InternalData *d, ProtocolFamilyType con
 				opt_count++;
 				if (!additional.name.empty()) error_rcode = 1;
 				if (((additional.ttl >> 16) & 0xff) != 0) {
-					badvers_payload = std::min<uint16_t>(m->option.edns0_buffer_size,
+					badvers_payload = std::min<uint16_t>(m->options.edns0_buffer_size,
 														 std::max<uint16_t>(512, (uint16_t)additional.clas));
 				}
 			}
@@ -3390,14 +3671,12 @@ void Behind::process_tcp(InternalData *d, sa_family_t family)
 	if (family == AF_INET) {
 		input = &d->in4_tcp;
 		socklen_t len = sizeof(d->in4_tcp.sa4);
-		sock = accept4(d->in4_tcp.listener_fd, (sockaddr *)&d->in4_tcp.sa4, &len,
-					   SOCK_NONBLOCK | SOCK_CLOEXEC);
+		sock = accept4(d->in4_tcp.listener_fd, (sockaddr *)&d->in4_tcp.sa4, &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
 		d->in4_tcp.fd = sock;
 	} else if (family == AF_INET6) {
 		input = &d->in6_tcp;
 		socklen_t len = sizeof(d->in6_tcp.sa6);
-		sock = accept4(d->in6_tcp.listener_fd, (sockaddr *)&d->in6_tcp.sa6, &len,
-					   SOCK_NONBLOCK | SOCK_CLOEXEC);
+		sock = accept4(d->in6_tcp.listener_fd, (sockaddr *)&d->in6_tcp.sa6, &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
 		d->in6_tcp.fd = sock;
 	}
 	if (sock == -1) {
@@ -3405,8 +3684,7 @@ void Behind::process_tcp(InternalData *d, sa_family_t family)
 		if (input && (error == EMFILE || error == ENFILE)) {
 			int listener = input->listener_fd;
 			if (!m->paused_listeners.count(listener)) {
-				logprintf(LOG_BOTH, "accept paused after file-descriptor exhaustion: %s\n",
-						  strerror(error));
+				logprintf(LOG_BOTH, "accept paused after file-descriptor exhaustion: %s\n", strerror(error));
 				ctl_mod(listener, &input->ev, false, false);
 				m->paused_listeners[listener] = misc::get_tick_count() + 1000;
 			}
@@ -3423,8 +3701,8 @@ void Behind::process_tcp(InternalData *d, sa_family_t family)
 			closesocket(sock);
 			return;
 		}
-		if (m->tasks_by_fd.size() >= m->option.max_tasks) {
-			logprintf(LOG_DEFAULT, "too many tasks (%zu): rejecting TCP connection\n", m->tasks_by_fd.size());
+		if (active_task_count() >= m->options.max_tasks) {
+			logprintf(LOG_DEFAULT, "too many tasks (%zu): rejecting TCP connection\n", active_task_count());
 			closesocket(sock);
 			return;
 		}
@@ -3463,13 +3741,13 @@ bool Behind::init_socket(void *private_in, ProtocolFamilyType proto)
 		Behind::InternalData::In *in = static_cast<Behind::InternalData::In *>(private_in);
 		int r = SOCKET_ERROR;
 		if (proto.is_inet4()) {
-			if (m->option.listen4.addr) {
-				init_sa4(&in->sa4, (in_addr *)m->option.listen4.addr.to_in4(0), m->option.listen4.port);
+			if (m->options.listen4.addr) {
+				init_sa4(&in->sa4, (in_addr *)m->options.listen4.addr.to_in4(0), m->options.listen4.port);
 				r = ::bind(sock, (struct sockaddr *)&in->sa4, sizeof(in->sa4));
 			}
 		} else {
-			if (m->option.listen6.addr) {
-				init_sa6((sockaddr_in6 *)&in->sa6, (in6_addr *)m->option.listen6.addr.to_in6(0), m->option.listen6.port);
+			if (m->options.listen6.addr) {
+				init_sa6((sockaddr_in6 *)&in->sa6, (in6_addr *)m->options.listen6.addr.to_in6(0), m->options.listen6.port);
 				r = ::bind(sock, (struct sockaddr *)&in->sa6, sizeof(in->sa6));
 			}
 		}
@@ -3522,8 +3800,7 @@ static std::string make_host_name(std::string name, std::string suffix)
 	return name;
 }
 
-static Hosts parse_hosts_file_data(std::string const &suffix, std::string const &path,
-	std::string *error)
+static Hosts parse_hosts_file_data(std::string const &suffix, std::string const &path, std::string *error)
 {
 	Hosts hosts;
 	hosts.path = path;
@@ -3646,7 +3923,7 @@ void Behind::update_hosts_files(bool force)
 		m->last_hosts_check = now;
 	}
 	
-	std::vector<Options::HostsFile> const &hostsfiles = m->option.hostsfiles;
+	std::vector<Options::HostsFile> const &hostsfiles = m->options.hostsfiles;
 	
 	for (Options::HostsFile const &hf : hostsfiles) {
 		
@@ -3696,7 +3973,7 @@ void Behind::update_hosts_files(bool force)
 
 void Behind::initialize_hosts()
 {
-	std::vector<Options::Host> const &hosts = m->option.hosts;
+	std::vector<Options::Host> const &hosts = m->options.hosts;
 	
 	m->hosts.clear();
 	
@@ -3721,7 +3998,7 @@ void Behind::initialize_hosts()
 	}
 	
 	bool needs_runtime_load = false;
-	for (Options::HostsFile const &hosts_file : m->option.hostsfiles) {
+	for (Options::HostsFile const &hosts_file : m->options.hostsfiles) {
 		if (hosts_file.initial_data && hosts_file.initial_data->valid) {
 			m->hosts.push_back(*hosts_file.initial_data);
 		} else {
@@ -3778,8 +4055,8 @@ bool Behind::main(std::function<bool(bool)> const &reload_requested)
 	
 	InternalData d;
 	bool socket_ok = true;
-	bool has_listen4 = m->option.listen4.addr;
-	bool has_listen6 = m->option.listen6.addr;
+	bool has_listen4 = m->options.listen4.addr;
+	bool has_listen6 = m->options.listen6.addr;
 	if (!has_listen4 && !has_listen6) {
 		logprintf(LOG_BOTH, "no listen address configured\n");
 		return false;
@@ -3994,12 +4271,19 @@ bool Behind::main(std::function<bool(bool)> const &reload_requested)
 	Track(d.in6_udp.fd);
 	Track(d.in4_tcp.listener_fd);
 	Track(d.in6_tcp.listener_fd);
+	for (std::shared_ptr<UdpChannel> const &channel : m->udp_channels) {
+		if (channel) Track(channel->fd);
+	}
 	for (int fd : sockets_to_close) {
 		closesocket(fd);
 	}
 	m->select_in_fds.clear();
 	m->select_out_fds.clear();
 	m->paused_listeners.clear();
+	m->udp_channels.clear();
+	m->udp_channels_by_fd.clear();
+	m->udp_queries_by_local_txid.clear();
+	m->udp_queries_by_socket_txid.clear();
 	return run_ok;
 }
 
@@ -4040,31 +4324,17 @@ void Behind::self_test()
 		int r;
 		std::string in, out;
 		
-		in = "\x03"
-			 "www"
-			 "\x06"
-			 "google"
-			 "\x03"
-			 "com"
-			 "\x00";
+		in = "\x03" "www" "\x06" "google" "\x03" "com" "\x00";
 		r = decode_name(in.data(), in.data() + 16, in.data(), &out);
 		EXPECT_EQ(r, 16);
 		EXPECT_EQ(out, "www.google.com");
 		
-		in = "\x03"
-			 "www"
-			 "\x06"
-			 "google"
-			 "\x03"
-			 "com"
-			 "\x00\x00\x00";
+		in = "\x03" "www" "\x06" "google" "\x03" "com" "\x00\x00\x00";
 		r = decode_name(in.data(), in.data() + 18, in.data(), &out);
 		EXPECT_EQ(r, 16);
 		EXPECT_EQ(out, "www.google.com");
 		
-		in = "\x03"
-			 "www"
-			 "\x00\x00\x00";
+		in = "\x03" "www" "\x00\x00\x00"; 
 		r = decode_name(in.data(), in.data() + 7, in.data(), &out);
 		EXPECT_EQ(r, 5);
 		EXPECT_EQ(out, "www");
@@ -4074,13 +4344,7 @@ void Behind::self_test()
 		EXPECT_EQ(r, 0);
 		EXPECT_EQ(out, "");
 		
-		in = "\x03"
-			 "www"
-			 "\x06"
-			 "google"
-			 "\x03"
-			 "com"
-			 "\xc0\x00"; // infinite loop
+		in = "\x03" "www" "\x06" "google" "\x03" "com" "\xc0\x00"; // infinite loop
 		r = decode_name(in.data(), in.data() + 17, in.data(), &out);
 		EXPECT_EQ(r, 0);
 		EXPECT_EQ(out, "");
@@ -4199,8 +4463,7 @@ void Behind::self_test()
 		
 		std::vector<char> encoded;
 		NameMap names;
-		EXPECT_EQ(write_name(&encoded, &names, std::string("a\x00" "b", 3)),
-				  false);
+		EXPECT_EQ(write_name(&encoded, &names, std::string("a\x00" "b", 3)), false);
 		EXPECT_EQ(write_name(&encoded, &names, "a..b"), false);
 		
 		// A compression pointer has only 14 offset bits.  An existing suffix

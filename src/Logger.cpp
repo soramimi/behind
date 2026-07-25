@@ -222,12 +222,10 @@ void Logger::x_logprint(const char *file, int line, int level, std::string_view 
 	item.level = level;
 	item.file = file;
 	item.line = line;
-	size_t len = str.size();
 	if (level != LOG_RAW) {
-		while (len > 0 && isspace((unsigned char)str[len - 1])) {
-			len--;
+		while (!str.empty() && isspace((unsigned char)str.back())) {
+			str.remove_suffix(1);
 		}
-		str = str.substr(0, len);
 	}
 	item.message = std::string(str);
 	push(item);
@@ -236,19 +234,16 @@ void Logger::x_logprint(const char *file, int line, int level, std::string_view 
 
 void Logger::x_logprintf(char const *file, int line, int level, char const *fmt, ...)
 {
-	std::string text;
-
 	va_list ap;
 	va_start(ap, fmt);
 	char *msg = nullptr;
 	int len = vasprintf(&msg, fmt, ap);
 	if (msg) {
-		text.assign(msg, len);
+		std::string_view v(msg, len);
+		x_logprint(file, line, level, v);
 		free(msg);
 	}
 	va_end(ap);
-
-	x_logprint(file, line, level, text);
 }
 
 void Logger::pause(bool f)

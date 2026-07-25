@@ -13,6 +13,7 @@
 #include <limits>
 #include <optional>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -334,6 +335,32 @@ bool validate_configuration(Options *opts, std::string const &startup_directory)
 		fprintf(stderr, "configuration validation failed: no configuration was provided\n");
 		return false;
 	}
+	auto ensure_fd_limit = [&](size_t max_tasks) {
+		if (max_tasks == 0) return true;
+		struct rlimit file_limit = { };
+		if (getrlimit(RLIMIT_NOFILE, &file_limit) != 0 || file_limit.rlim_cur == RLIM_INFINITY) {
+			return true;
+		}
+		auto safe_tasks = [](rlim_t limit) -> rlim_t {
+			return limit > 32 ? (limit - 16) / 2 : 0;
+		};
+		if ((rlim_t)max_tasks <= safe_tasks(file_limit.rlim_cur)) return true;
+		rlim_t needed = 16 + (rlim_t)max_tasks * 2;
+		if (file_limit.rlim_max != RLIM_INFINITY && needed > file_limit.rlim_max) {
+			return true;
+		}
+		rlim_t target = file_limit.rlim_max == RLIM_INFINITY ? needed : std::min(file_limit.rlim_max, needed);
+		if (target <= file_limit.rlim_cur) return true;
+		struct rlimit raised = file_limit;
+		raised.rlim_cur = target;
+		if (setrlimit(RLIMIT_NOFILE, &raised) == 0) {
+			return true;
+		}
+		fprintf(stderr, "warning: failed to raise RLIMIT_NOFILE soft limit to %llu: %s\n",
+			(unsigned long long)target, strerror(errno));
+		return true;
+	};
+	ensure_fd_limit(opts->max_tasks);
 	std::string error;
 	if (!Behind::validate_options(*opts, &error)) {
 		if (error.empty()) error = "unspecified validation error";
@@ -416,7 +443,7 @@ int main(int argc, char **argv)
 	}
 
 	int exit_code = 0;
-	std::optional<Options> fallback_option;
+	std::optional<Options> fallback_options;
 	std::optional<Options> reload_candidate;
 	std::future<std::optional<Options>> reload_validation;
 	bool validate_again = false;
@@ -496,9 +523,9 @@ int main(int argc, char **argv)
 		reload_candidate.reset();
 		bool ok = main2(opts, startup_directory, ValidateReload);
 		if (!ok) {
-			if (fallback_option) {
-				opts = std::move(*fallback_option);
-				fallback_option.reset();
+			if (fallback_options) {
+				opts = std::move(*fallback_options);
+				fallback_options.reset();
 				logprintf(LOG_BOTH, "reloaded configuration failed at runtime; restored previous configuration\n");
 				continue;
 			}
@@ -507,12 +534,12 @@ int main(int argc, char **argv)
 		}
 
 		if (reload_candidate) {
-			fallback_option = opts;
+			fallback_options = opts;
 			opts = std::move(*reload_candidate);
 			reload_candidate.reset();
 			continue;
 		}
-		fallback_option.reset(); // the active configuration ran successfully
+		fallback_options.reset(); // the active configuration ran successfully
 		if (sigint_caught.load(std::memory_order_relaxed)) {
 			logprintf(LOG_DEFAULT, "=== SIGINT ===\n");
 		}
