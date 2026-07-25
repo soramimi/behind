@@ -417,8 +417,7 @@ bool validate_configuration(Options *opts, std::string const &startup_directory)
 		if (setrlimit(RLIMIT_NOFILE, &raised) == 0) {
 			return true;
 		}
-		fprintf(stderr, "warning: failed to raise RLIMIT_NOFILE soft limit to %llu: %s\n",
-			(unsigned long long)target, strerror(errno));
+		fprintf(stderr, "warning: failed to raise RLIMIT_NOFILE soft limit to %llu: %s\n", (unsigned long long)target, strerror(errno));
 		return true;
 	};
 	ensure_fd_limit(opts->max_tasks);

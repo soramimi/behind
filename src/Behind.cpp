@@ -778,8 +778,8 @@ bool Behind::validate_options(Options const &opts, std::string *error)
 	if ((opts.listen4.addr && opts.listen4.port == 0) || (opts.listen6.addr && opts.listen6.port == 0)) {
 		return Fail("listen port must be between 1 and 65535");
 	}
-	if (opts.max_tasks == 0 || opts.max_tasks > 10000) {
-		return Fail("max-tasks must be between 1 and 10000");
+	if (opts.max_tasks == 0 || opts.max_tasks > 50000) {
+		return Fail("max-tasks must be between 1 and 50000");
 	}
 	struct rlimit file_limit = { };
 	if (getrlimit(RLIMIT_NOFILE, &file_limit) == 0 && file_limit.rlim_cur != RLIM_INFINITY) {
@@ -2890,7 +2890,6 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 {
 	if (process_local_query(d, client_proto, received, q)) return;
 	
-	std::vector<Forwarder const *> forwarders = choose_forwarder(q.name, m->options.udp_multiple_forwarding);
 	auto SendFailure = [&]() {
 		dns::Message sending;
 		sending.header.id = received.header.id;
@@ -2899,6 +2898,11 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 		set_edns0(&sending, client_edns_payload(received));
 		send_dns_message(d, client_proto, sending, false, false);
 	};
+	
+	// If the server is already busy, don't fan out to multiple forwarders
+	int fanout = (active_task_count() < m->options.max_tasks / 2) ? m->options.udp_multiple_forwarding : 1;
+	std::vector<Forwarder const *> forwarders = choose_forwarder(q.name, fanout);
+	
 	if (forwarders.empty()) {
 		logprintf(LOG_DEFAULT, "No forwarder configured.\n");
 		SendFailure();
