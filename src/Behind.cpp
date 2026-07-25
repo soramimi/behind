@@ -340,7 +340,15 @@ struct CacheKeyHash {
 
 class Cache {
 private:
-	static constexpr size_t MAX_ENTRIES = 4096;
+	// Entry-count floor and ceiling. The effective cap is derived from
+	// max_bytes_ (see set_max_bytes) because a fixed 4096-entry limit was
+	// reached at only a few MB, so max-cache-bytes could never bind and the
+	// documented 64 MB default was unreachable. Cache hit rate is the largest
+	// single lever on real-world throughput: every miss costs an upstream round
+	// trip and occupies a max-tasks slot.
+	static constexpr size_t MIN_ENTRIES = 4096;
+	static constexpr size_t MAX_ENTRIES_LIMIT = 1000000;
+	static constexpr size_t ASSUMED_ENTRY_BYTES = 512;
 	struct Item {
 		CacheKey key;
 		uint64_t expire = 0;
@@ -351,6 +359,7 @@ private:
 	std::unordered_map<CacheKey, std::list<Item>::iterator, CacheKeyHash> index_;
 	size_t bytes_ = 0;
 	size_t max_bytes_ = 64 * 1024 * 1024;
+	size_t max_entries_ = MAX_ENTRIES_LIMIT;
 	size_t max_entry_size_ = 65535;
 	uint32_t max_ttl_ = 86400;
 	
@@ -434,7 +443,7 @@ private:
 		if (charge == SIZE_MAX || charge > max_entry_size_ || charge > max_bytes_) return;
 		auto found = index_.find(key);
 		if (found != index_.end()) erase(found->second);
-		while (!items_.empty() && (items_.size() >= MAX_ENTRIES || charge > max_bytes_ - bytes_)) {
+		while (!items_.empty() && (items_.size() >= max_entries_ || charge > max_bytes_ - bytes_)) {
 			erase(std::prev(items_.end()));
 		}
 		items_.push_front({ std::move(key), expire, charge, std::move(value) });
@@ -444,8 +453,16 @@ private:
 	
 public:
 	void set_max_entry_size(size_t value) { max_entry_size_ = value; }
-	void set_max_bytes(size_t value) { max_bytes_ = value; }
+	void set_max_bytes(size_t value)
+	{
+		max_bytes_ = value;
+		// bytes_/max_bytes_ is the real safety bound; the entry count only keeps
+		// the list and index from growing pathologically long for tiny entries.
+		max_entries_ = std::clamp(value / ASSUMED_ENTRY_BYTES, MIN_ENTRIES, MAX_ENTRIES_LIMIT);
+	}
 	void set_max_ttl(uint32_t value) { max_ttl_ = value; }
+	size_t entry_count() const { return items_.size(); }
+	size_t byte_count() const { return bytes_; }
 	
 	std::optional<Message> find(std::string const &name, DNS_TYPE type, DNS_CLASS clas)
 	{
@@ -692,6 +709,7 @@ struct Behind::Private {
 	uint64_t start_time = 0;
 	uint64_t last_uptime_min = 0;
 	uint64_t last_hosts_check = 0;
+	uint64_t last_maintenance = 0;
 	
 	std::vector<Hosts> hosts;
 	uint32_t local_transaction_id = 0;
@@ -708,12 +726,17 @@ struct Behind::Private {
 	// Active forwarding tasks, indexed for O(1) dispatch.
 	// tasks_by_fd: upstream_fd -> task. Each task owns a unique socket, so the
 	//   fd is a unique key; this is the hot lookup in process_receive().
-	// fds_by_txid: local_transaction_id -> upstream_fd(s). A single UDP query
-	//   can fan out to two forwarder tasks that share one transaction id; when
-	//   one answers, clean_transaction() uses this to cancel the sibling.
+	// udp_queries_by_local_txid: local_transaction_id -> in-flight UDP query.
+	//   A single client query fans out to udp-multiple-forwarding upstreams that
+	//   share one local transaction id, so this MUST be a multimap: it is the
+	//   authoritative registry of in-flight upstream queries and therefore also
+	//   what active_task_count() counts and what clean() scans for deadlines.
+	//   Erase by (txid, query) identity so a finishing query cannot unregister
+	//   its sibling; see erase_udp_query_by_txid().
+	// udp_queries_by_socket_txid: (channel_fd, upstream_id) -> in-flight query.
+	//   allocate_udp_upstream_id() keeps the key unique among live queries.
 	std::unordered_map<int, std::shared_ptr<Behind::Task>> tasks_by_fd;
-	std::unordered_multimap<uint32_t, int> fds_by_txid;
-	std::unordered_map<uint32_t, std::shared_ptr<Behind::UdpQuery>> udp_queries_by_local_txid;
+	std::unordered_multimap<uint32_t, std::shared_ptr<Behind::UdpQuery>> udp_queries_by_local_txid;
 	std::unordered_multimap<uint64_t, std::shared_ptr<Behind::UdpQuery>> udp_queries_by_socket_txid;
 	std::unordered_map<std::string, std::shared_ptr<Behind::PendingQuery>> pending_udp;
 	std::vector<std::shared_ptr<Behind::UdpChannel>> udp_channels;
@@ -1141,14 +1164,23 @@ std::vector<Forwarder const *> Behind::choose_forwarder(std::string const &name,
 {
 	std::vector<Forwarder const *> default_forwarders;
 	std::vector<Forwarder const *> matched_forwarders;
-	
+	// Longest match wins. Collecting every matching zone instead would make
+	// overlapping zones behave randomly: with both "example.com." and
+	// "sub.example.com." configured, a query for host.sub.example.com matched
+	// both, so UDP fanned out to both upstreams (first answer wins) and TCP
+	// picked one at random - roughly half of the queries went to the upstream
+	// for the less specific zone. The zone invariant (non-empty, absolute) is
+	// enforced at configuration time by validate_options().
+	size_t best_zone_length = 0;
+
 	for (Forwarder const &f : m->forwarders) {
 		if (f) {
-			assert(!f.zone.empty() && f.zone.back() == '.');
 			size_t n = f.zone.size();
 			if (n == 1) {
 				default_forwarders.push_back(&f);
 			} else if (n > 1) {
+				if (n < best_zone_length) continue;
+				size_t zone_length = n;
 				n--;
 				size_t i = name.size();
 				if (i >= n) {
@@ -1163,6 +1195,10 @@ std::vector<Forwarder const *> Behind::choose_forwarder(std::string const &name,
 							return true;
 						};
 						if (Compare()) {
+							if (zone_length > best_zone_length) {
+								best_zone_length = zone_length;
+								matched_forwarders.clear();
+							}
 							matched_forwarders.push_back(&f);
 						}
 					}
@@ -1170,9 +1206,9 @@ std::vector<Forwarder const *> Behind::choose_forwarder(std::string const &name,
 			}
 		}
 	}
-	
+
 	std::vector<Forwarder const *> *forwarders = matched_forwarders.empty() ? &default_forwarders : &matched_forwarders;
-	
+
 	{ // shuffle and resize
 		size_t n = forwarders->size();
 		size_t count = std::min((size_t)max, n);
@@ -1279,7 +1315,13 @@ void Behind::init_forwarder()
 			}
 		}
 		
-		assert(!z.zone.empty() && z.zone.back() == '.');
+		// validate_options() rejects a non-absolute zone before we get here, but
+		// fail safe rather than abort() if that ever regresses: an unusable
+		// forwarder entry must not take the whole server down.
+		if (z.zone.empty() || z.zone.back() != '.') {
+			logprintf(LOG_BOTH, "ignoring forwarder with a non-absolute zone: %s\n", z.zone.c_str());
+			continue;
+		}
 		forwarder.zone = z.zone;
 		m->forwarders.push_back(forwarder);
 	}
@@ -1389,6 +1431,20 @@ void Behind::uptime()
 	}
 }
 
+bool Behind::is_udp_query_active(std::shared_ptr<UdpQuery> const &query) const
+{
+	if (!query) return false;
+	auto range = m->udp_queries_by_local_txid.equal_range(query->local_transaction_id);
+	for (auto it = range.first; it != range.second; ++it) {
+		if (it->second == query) return true;
+	}
+	return false;
+}
+
+// Retire a single in-flight upstream query: release its channel slot and both
+// index entries. Once the last sibling of a transaction is gone the coalescing
+// entry goes too, otherwise pending_udp would keep a PendingQuery that no
+// upstream query can ever complete and later clients would join it and hang.
 void Behind::finish_udp_query(std::shared_ptr<UdpQuery> const &query)
 {
 	if (!query) return;
@@ -1397,13 +1453,25 @@ void Behind::finish_udp_query(std::shared_ptr<UdpQuery> const &query)
 			channel->active_queries--;
 		}
 	}
-	while (1) {
-		auto it = m->udp_queries_by_local_txid.find(query->local_transaction_id);
-		if (it == m->udp_queries_by_local_txid.end()) break;
-		m->udp_queries_by_local_txid.erase(it);
+	// Erase by (key, query) identity in both indexes. Siblings of a fanned-out
+	// query share the local transaction id, so erasing by key alone would
+	// unregister them too and orphan them in udp_queries_by_socket_txid, where
+	// no deadline scan would ever reach them again.
+	auto by_txid = m->udp_queries_by_local_txid.equal_range(query->local_transaction_id);
+	for (auto it = by_txid.first; it != by_txid.second; ++it) {
+		if (it->second == query) {
+			m->udp_queries_by_local_txid.erase(it);
+			break;
+		}
 	}
-	m->udp_queries_by_socket_txid.erase(udp_socket_txid_key(query->channel_fd, query->upstream_id));
-	if (query->pending) {
+	auto by_socket = m->udp_queries_by_socket_txid.equal_range(udp_socket_txid_key(query->channel_fd, query->upstream_id));
+	for (auto it = by_socket.first; it != by_socket.second; ++it) {
+		if (it->second == query) {
+			m->udp_queries_by_socket_txid.erase(it);
+			break;
+		}
+	}
+	if (query->pending && m->udp_queries_by_local_txid.count(query->local_transaction_id) == 0) {
 		auto found = m->pending_udp.find(query->pending->key);
 		if (found != m->pending_udp.end() && found->second == query->pending) {
 			m->pending_udp.erase(found);
@@ -1411,17 +1479,34 @@ void Behind::finish_udp_query(std::shared_ptr<UdpQuery> const &query)
 	}
 }
 
-// Remove a single (txid -> fd) entry from the multimap (a task can share its
-// txid with a sibling, so erase by the exact fd, not the whole key).
-static void erase_txid_fd(std::unordered_multimap<uint32_t, int> *mm, uint32_t txid, int fd)
+// Complete a whole client transaction: retire every sibling that was fanned out
+// for it, because one has answered (first valid response wins) or all of them
+// have timed out. Retiring the last sibling drops the coalescing entry.
+void Behind::finish_udp_transaction(uint32_t local_transaction_id)
 {
-	auto range = mm->equal_range(txid);
+	std::vector<std::shared_ptr<UdpQuery>> siblings;
+	auto range = m->udp_queries_by_local_txid.equal_range(local_transaction_id);
 	for (auto it = range.first; it != range.second; ++it) {
-		if (it->second == fd) {
-			mm->erase(it);
-			return;
-		}
+		siblings.push_back(it->second);
 	}
+	for (std::shared_ptr<UdpQuery> const &query : siblings) {
+		finish_udp_query(query);
+	}
+}
+
+// Deadline scanning and the uptime tick are O(in-flight tasks + channels), but
+// the event loop used to call them after *every* epoll_wait, i.e. once per
+// datagram at low concurrency. Timeout granularity is bounded by the loop's
+// interval_ms anyway, so running them at most every MAINTENANCE_INTERVAL_MS
+// keeps the same behaviour and removes a full hash-table walk per query.
+void Behind::periodic(InternalData *d)
+{
+	constexpr uint64_t MAINTENANCE_INTERVAL_MS = 100;
+	uint64_t now = misc::get_tick_count();
+	if (now - m->last_maintenance < MAINTENANCE_INTERVAL_MS) return;
+	m->last_maintenance = now;
+	uptime();
+	clean(d);
 }
 
 void Behind::clean(InternalData *d)
@@ -1446,12 +1531,11 @@ void Behind::clean(InternalData *d)
 	}
 	std::vector<std::shared_ptr<Task>> expired;
 	for (auto const &item : m->tasks_by_fd) {
-		std::shared_ptr<Task> task = item.second;
+		std::shared_ptr<Task> const &task = item.second;
 		if (now - task->timestamp >= (uint64_t)task->timeout) {
 			expired.push_back(task);
 		}
 	}
-	std::unordered_set<uint32_t> completed_transactions;
 	for (auto const &task : expired) {
 		if (!task || task->upstream_fd == -1 || find_task_by_fd(task->upstream_fd) != task) continue;
 		if (task->op == Operation::FORWARD_TO_UPSTREAM_TCP || task->op == Operation::REPLY_TO_CLIENT_TCP) {
@@ -1487,8 +1571,9 @@ void Behind::clean(InternalData *d)
 		}
 	}
 	for (std::shared_ptr<UdpQuery> const &query : expired_udp_queries) {
-		auto found = m->udp_queries_by_local_txid.find(query->local_transaction_id);
-		if (found == m->udp_queries_by_local_txid.end() || found->second != query) continue;
+		// A sibling of this query may already have retired the whole transaction
+		// earlier in this same loop; skip whatever is no longer registered.
+		if (!is_udp_query_active(query)) continue;
 		dns::Message failure;
 		failure.header.flags = 0x8182;
 		dns::Question question;
@@ -1513,39 +1598,8 @@ void Behind::clean(InternalData *d)
 			}
 			send_dns_message(&client, waiter.proto, sending, false, false);
 		}
-		finish_udp_query(query);
-	}
-}
-
-void Behind::clean_transaction(uint32_t id)
-{
-	if (auto udp = m->udp_queries_by_local_txid.find(id); udp != m->udp_queries_by_local_txid.end()) {
-		finish_udp_query(udp->second);
-		return;
-	}
-	auto range = m->fds_by_txid.equal_range(id);
-	std::vector<int> fds;
-	std::shared_ptr<PendingQuery> pending;
-	for (auto it = range.first; it != range.second; ++it) {
-		fds.push_back(it->second);
-		auto found = m->tasks_by_fd.find(it->second);
-		if (found != m->tasks_by_fd.end() && found->second->pending) {
-			pending = found->second->pending;
-		}
-	}
-	if (pending) {
-		auto found = m->pending_udp.find(pending->key);
-		if (found != m->pending_udp.end() && found->second == pending) {
-			m->pending_udp.erase(found);
-		}
-	}
-	m->fds_by_txid.erase(id);
-	for (int fd : fds) {
-		auto it = m->tasks_by_fd.find(fd);
-		if (it != m->tasks_by_fd.end()) {
-			std::shared_ptr<Task> task = it->second;
-			finish_task(task);
-		}
+		// Retire every sibling of the timed-out transaction, not just this one.
+		finish_udp_transaction(query->local_transaction_id);
 	}
 }
 
@@ -1567,7 +1621,6 @@ void Behind::finish_task(std::shared_ptr<Task> task, bool close_client)
 		if (it != m->tasks_by_fd.end() && it->second == task) {
 			m->tasks_by_fd.erase(it);
 		}
-		erase_txid_fd(&m->fds_by_txid, task->local_transaction_id, fd);
 		delete_socket(fd, task->ev.get());
 		task->upstream_fd = -1;
 	}
@@ -1593,7 +1646,6 @@ void Behind::push_task(std::shared_ptr<Task> task, int timeout, uint32_t epoll_e
 	task->timeout = timeout;
 	
 	m->tasks_by_fd[task->upstream_fd] = task;
-	m->fds_by_txid.insert({ task->local_transaction_id, task->upstream_fd });
 }
 
 bool Behind::parse_dns_message(const char *begin, const char *end, dns::Message *msg)
@@ -1844,21 +1896,6 @@ struct Sender {
 		return -1;
 	}
 };
-
-bool Behind::is_nxdomain(std::string const &name) const
-{
-	return m->options.domain_filter.find(name) == DomainFilter::NXDOMAIN;
-}
-
-bool Behind::is_nodata(std::string const &name) const
-{
-	return m->options.domain_filter.find(name) == DomainFilter::NODATA;
-}
-
-bool Behind::is_nodata_aaaa(std::string const &name) const
-{
-	return m->options.domain_filter.find(name) == DomainFilter::NODATA_AAAA;
-}
 
 bool Behind::is_client_allowed(sa_family_t family, void const *address) const
 {
@@ -2193,63 +2230,26 @@ bool Behind::send_dns_message(InternalData *d, ProtocolFamilyType const &proto, 
 		ok = sent == (ssize_t)packet.buffer.size();
 	}
 	
-	char const *comment = "";
-	if (from_cache) {
-		comment = " (from cache)";
-	}
-	
-	if (1) { // logging
+	// Per-query logging is the single largest CPU cost on the response path: each
+	// line means a vasprintf, two std::string copies, a queue push and a write()
+	// in the writer thread. Let an operator turn it off ([logging] query-log).
+	if (m->options.log_queries) {
+		char const *comment = from_cache ? " (from cache)" : "";
 		char const *qtype = dns_type_to_string(packet.q.type);
-		(void)qtype;
 		if (forward) {
 			logprintf(LOG_DEFAULT, "F: %s\n", packet.q.name.c_str());
 		} else if ((msg.header.flags & 0x000f) == 3) { // NXDOMAIN
 			logprintf(LOG_DEFAULT, "R: <<%s %s NXDOMAIN>> to %s\n", packet.q.name.c_str(), qtype, client.c_str());
 		} else if (msg.answers.size() > 0) {
-			for (size_t i = 0; i < msg.answers.size(); i++) {
-				dns::Record const &r = msg.answers[i];
-				std::string name = misc::strtolower(packet.q.name);
-				std::string addr_str = r.to_string();
-				logprintf(LOG_DEFAULT, "R: <<%s %s %s>> to %s%s\n", name.c_str(), qtype, addr_str.c_str(), client.c_str(), comment);
-				logprintf(LOG_DEFAULT, "(resolve) <<%s %s %s>> to %s%s\n", name.c_str(), qtype, addr_str.c_str(), client.c_str(), comment);
+			std::string name = misc::strtolower(packet.q.name);
+			for (dns::Record const &r : msg.answers) {
+				logprintf(LOG_DEFAULT, "R: <<%s %s %s>> to %s%s\n", name.c_str(), qtype, r.to_string().c_str(), client.c_str(), comment);
 			}
 		} else {
 			logprintf(LOG_DEFAULT, "R: <<%s %s NOANSWER>> to %s%s\n", packet.q.name.c_str(), qtype, client.c_str(), comment);
 		}
 	}
-	
-	if (0) { // save packet binary for debug
-		if (msg.header.flags & 0x8000) {
-			if (stricmp(packet.q.name.c_str(), "www.google.com") == 0) {
-				char const *path = "testcase/google_packet.bin";
-				writefile(path, &packet.buffer);
-			} else if (stricmp(packet.q.name.c_str(), "doubleclick.net") == 0) {
-				char const *path = "testcase/doubleclick_packet.bin";
-				writefile(path, &packet.buffer);
-			} else if (stricmp(packet.q.name.c_str(), "www.soramimi.jp") == 0) {
-				char const *path = "testcase/soramimi_packet.bin";
-				writefile(path, &packet.buffer);
-			} else if (stricmp(packet.q.name.c_str(), "www.amazon.co.jp") == 0) {
-				char const *path = "testcase/amazon_packet.bin";
-				writefile(path, &packet.buffer);
-			}
-		} else {
-			if (stricmp(packet.q.name.c_str(), "www.google.com") == 0) {
-				char const *path = "testcase/google_query.bin";
-				writefile(path, &packet.buffer);
-			} else if (stricmp(packet.q.name.c_str(), "doubleclick.net") == 0) {
-				char const *path = "testcase/doubleclick_query.bin";
-				writefile(path, &packet.buffer);
-			} else if (stricmp(packet.q.name.c_str(), "www.soramimi.jp") == 0) {
-				char const *path = "testcase/soramimi_query.bin";
-				writefile(path, &packet.buffer);
-			} else if (stricmp(packet.q.name.c_str(), "www.amazon.co.jp") == 0) {
-				char const *path = "testcase/amazon_query.bin";
-				writefile(path, &packet.buffer);
-			}
-		}
-	}
-	
+
 	return ok;
 }
 
@@ -2449,6 +2449,10 @@ std::shared_ptr<Behind::Task> Behind::make_task(Operation op, uint32_t local_tra
 
 size_t Behind::active_task_count() const
 {
+	// udp_queries_by_local_txid is a multimap with one entry per in-flight
+	// upstream query, so a query fanned out to N forwarders correctly counts as
+	// N. Counting transactions instead would let udp-multiple-forwarding
+	// over-subscribe max-tasks (and therefore the fd budget) by up to N times.
 	return m->tasks_by_fd.size() + m->udp_queries_by_local_txid.size();
 }
 
@@ -2612,7 +2616,9 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 		query->forwarder = forwarder;
 		query->channel_fd = channel->fd;
 		channel->active_queries++;
-		m->udp_queries_by_local_txid[local_transaction_id] = query;
+		// insert(), not operator[]: siblings of a fanned-out query share the local
+		// transaction id and each one must stay individually registered.
+		m->udp_queries_by_local_txid.insert(std::pair<uint32_t, std::shared_ptr<Behind::UdpQuery>>(local_transaction_id, query));
 		m->udp_queries_by_socket_txid.insert(std::pair<uint64_t, std::shared_ptr<Behind::UdpQuery>>(udp_socket_txid_key(channel->fd, upstream_id), query));
 	}
 }
@@ -2759,14 +2765,20 @@ bool Behind::process_local_query(InternalData *d, ProtocolFamilyType const &clie
 	dns::Message const &received, dns::Question const &q)
 {
 	uint16_t const udp_payload = client_edns_payload(received);
+	// QR + RA, with RD copied from the query (RFC 1035 4.1.1: RD "is copied into
+	// the response"). Synthesized answers used to hardcode their flags: filter
+	// hits sent 0x8003/0x8000, which leaves RA clear so a blocked name looked
+	// like it came from a non-recursive server, and hosts/PTR answers sent
+	// 0x8180, which claims RD=1 even for a +norecurse query.
+	uint16_t const reply_flags = 0x8080 | (received.header.flags & 0x0100);
 	auto Send = [&](dns::Message *sending) {
 		set_edns0(sending, udp_payload);
 		return send_dns_message(d, client_proto, *sending, false, false);
 	};
-	auto MakeMessage = [&](uint16_t flags) {
+	auto MakeMessage = [&](uint16_t rcode) {
 		dns::Message sending;
 		sending.header.id = received.header.id;
-		sending.header.flags = flags;
+		sending.header.flags = reply_flags | rcode;
 		sending.questions = { q };
 		sending.authorities = { dns::Record() };
 		dns::Record *r = &sending.authorities.back();
@@ -2777,17 +2789,17 @@ bool Behind::process_local_query(InternalData *d, ProtocolFamilyType const &clie
 		r->set_soa(fake_soa());
 		return sending;
 	};
-	
+
 	auto SendNXDOMAIN = [&]() {
-		dns::Message sending = MakeMessage(0x8003);
+		dns::Message sending = MakeMessage(3);
 		Send(&sending);
 	};
-	
+
 	auto SendNODATA = [&]() {
-		dns::Message sending = MakeMessage(0x8000);
+		dns::Message sending = MakeMessage(0);
 		Send(&sending);
 	};
-	
+
 	if (q.clas == DNS_CLASS::IN && !q.name.empty()) {
 		if (!accept_dns_type(q.type)) {
 			SendNODATA();
@@ -2811,7 +2823,7 @@ bool Behind::process_local_query(InternalData *d, ProtocolFamilyType const &clie
 					
 					dns::Message sending;
 					sending.header.id = received.header.id;
-					sending.header.flags = 0x8180;
+					sending.header.flags = reply_flags;
 					sending.questions = { q };
 					sending.answers = { r };
 					Send(&sending);
@@ -2836,7 +2848,7 @@ bool Behind::process_local_query(InternalData *d, ProtocolFamilyType const &clie
 					}
 					dns::Message sending;
 					sending.header.id = received.header.id;
-					sending.header.flags = 0x8180;
+					sending.header.flags = reply_flags;
 					sending.questions = { q };
 					sending.answers = rec;
 					Send(&sending);
@@ -2844,7 +2856,13 @@ bool Behind::process_local_query(InternalData *d, ProtocolFamilyType const &clie
 				}
 				SendNODATA();
 			} else {
-				SendNXDOMAIN();
+				// The name exists in [hosts], only this record type does not, so
+				// this is NODATA. NXDOMAIN would assert the name does not exist for
+				// *any* type (RFC 2308 5, RFC 8020) and a stub resolver would
+				// negative-cache the whole name: a browser that asks for
+				// printer1.lan HTTPS (type 65) before A would then be unable to
+				// resolve it at all.
+				SendNODATA();
 			}
 			return true;
 		}
@@ -3161,18 +3179,25 @@ void Behind::process_upstream_udp_channel(InternalData *d, std::shared_ptr<UdpCh
 			size = recvmsg(channel->fd, &message, MSG_TRUNC);
 		} while (size < 0 && errno == EINTR);
 		
-		if (size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
-		if (size <= 0 || (message.msg_flags & MSG_TRUNC) || (size_t)size > buffer.size()) continue;
+		if (size < 0) {
+			// Only EAGAIN/EWOULDBLOCK means "drained". Any other error must also
+			// stop the loop: a sticky error such as EBADF or ENOTCONN would
+			// otherwise spin here forever, so the event loop would never return
+			// and clean() would never run again.
+			if (errno != EAGAIN && errno != EWOULDBLOCK) {
+				logprintf(LOG_DEFAULT, "recvmsg upstream udp (fd=%d): %s\n", channel->fd, strerror(errno));
+			}
+			return;
+		}
+		if (size == 0 || (message.msg_flags & MSG_TRUNC) || (size_t)size > buffer.size()) continue;
 		dns::Message received;
 		if (!parse_dns_message(buffer.data(), buffer.data() + size, &received)) continue;
 		auto found = m->udp_queries_by_socket_txid.find(udp_socket_txid_key(channel->fd, received.header.id));
 		if (found == m->udp_queries_by_socket_txid.end()) continue;
 		std::shared_ptr<UdpQuery> query = found->second;
 		if (!query || query->channel_fd != channel->fd || query->upstream_id != received.header.id) continue;
-		{
-			auto it = m->udp_queries_by_local_txid.find(query->local_transaction_id);
-			if (it == m->udp_queries_by_local_txid.end()) continue;
-		}
+		// The transaction may already have been answered by a sibling forwarder.
+		if (!is_udp_query_active(query)) continue;
 		if (!is_matching_udp_response(query, received)) continue;
 		
 		drop_aa_flag(&received);
@@ -3210,6 +3235,13 @@ void Behind::process_upstream_udp_channel(InternalData *d, std::shared_ptr<UdpCh
 			}
 		}
 		if (reply_to_client_udp(d, query, received)) {
+			// First valid answer wins: retire this query and cancel every sibling
+			// that was fanned out for the same client transaction.
+			finish_udp_transaction(query->local_transaction_id);
+		} else {
+			// The answer could not be delivered (e.g. it could not be
+			// re-serialized). Retire just this query so the remaining siblings
+			// still have a chance to answer before the deadline.
 			finish_udp_query(query);
 		}
 	}
@@ -3223,8 +3255,10 @@ void Behind::process_receive(InternalData *d, int upstream_fd)
 	}
 	std::shared_ptr<Task> task = find_task_by_fd(upstream_fd);
 	if (!task) return; // stale epoll event; the fd may already have been reused
-	assert(task->upstream_fd == upstream_fd);
-	
+	// Behave identically with and without NDEBUG: drop the event instead of
+	// aborting the daemon if the task map ever disagrees with the event fd.
+	if (task->upstream_fd != upstream_fd) return;
+
 	auto QueueTcpResponse = [&](dns::Message sending) {
 		int client_fd = task->client_fd;
 		ProtocolFamilyType client_proto = task->client_proto;
@@ -3347,7 +3381,6 @@ void Behind::process_receive(InternalData *d, int upstream_fd)
 			if (task->op == Operation::WRITING_TO_CLIENT_TCP) return;
 			// Ownership of the client fd moved to the upstream TCP task.
 			m->tasks_by_fd.erase(client_fd);
-			erase_txid_fd(&m->fds_by_txid, task->local_transaction_id, client_fd);
 			ctl_del(client_fd, task->ev.get());
 			task->upstream_fd = -1;
 			return;
@@ -3464,27 +3497,35 @@ void Behind::drop_aa_flag(dns::Message *msg)
 
 void Behind::process_udp(InternalData *d, sa_family_t family)
 {
+	// The client listener is level-triggered, so returning after a single
+	// datagram loses nothing - but it costs one epoll_wait syscall per query.
+	// Drain in a bounded batch instead. The bound matters: without it one busy
+	// UDP socket could starve the TCP listener and the other address family.
+	constexpr int MAX_DATAGRAMS_PER_WAKEUP = 64;
+	for (int i = 0; i < MAX_DATAGRAMS_PER_WAKEUP; i++) {
+		if (!process_udp_datagram(d, family)) break;
+	}
+}
+
+// Returns true when a datagram was consumed, i.e. the socket may hold more.
+bool Behind::process_udp_datagram(InternalData *d, sa_family_t family)
+{
 	ProtocolFamilyType client_proto = { family, SOCK_DGRAM };
-	
-	auto Return = [](Behind::ConnectionStatus s)-> void {
-		(void)s;
-		return void();
-	};
-	
+
 	if (client_proto.is_inet4() || client_proto.is_inet6()) {
 		std::vector<char> buf;
 		buf = read(d, client_proto);
-		if (buf.empty()) return Return(ConnectionStatus::ERROR);
+		if (buf.empty()) return false; // drained (or a read error): stop the batch
 		if (client_proto.is_dgram()) {
 			void const *address = client_proto.is_inet4()
 									  ? (void const *)&d->in4_udp.sa4.sin_addr
 									  : (void const *)&d->in6_udp.sa6.sin6_addr;
 			if (!is_client_allowed(client_proto.family(), address) || !consume_rate_limit(client_proto.family(), address)) {
-				return Return(ConnectionStatus::ERROR); // silently drop unauthorized/rate-limited UDP
+				return true; // silently drop unauthorized/rate-limited UDP
 			}
 		}
-		if (buf.size() < 12) return Return(ConnectionStatus::CONTINUE);
-		
+		if (buf.size() < 12) return true;
+
 		dns::Message received;
 		if (!parse_dns_message(buf.data(), buf.data() + buf.size(), &received)) {
 			uint16_t request_flags = ntohs_p(buf.data() + 2);
@@ -3494,10 +3535,10 @@ void Behind::process_udp(InternalData *d, sa_family_t family)
 				error.header.flags = 0x8081 | (request_flags & 0x0100);
 				send_dns_message(d, client_proto, error, false, false);
 			}
-			return Return(ConnectionStatus::ERROR);
+			return true;
 		}
-		if (received.header.flags & 0x8000) return Return(ConnectionStatus::ERROR);
-		
+		if (received.header.flags & 0x8000) return true;
+
 		uint16_t error_rcode = 0;
 		if ((received.header.flags & 0x7800) != 0) {
 			error_rcode = 4;
@@ -3529,7 +3570,7 @@ void Behind::process_udp(InternalData *d, sa_family_t family)
 			error.questions = received.questions;
 			set_edns0(&error, badvers_payload, 1);
 			send_dns_message(d, client_proto, error, false, false);
-			return Return(ConnectionStatus::DONE);
+			return true;
 		}
 		if (error_rcode) {
 			dns::Message error;
@@ -3538,20 +3579,15 @@ void Behind::process_udp(InternalData *d, sa_family_t family)
 			if (received.questions.size() == 1) error.questions = received.questions;
 			set_edns0(&error, client_edns_payload(received));
 			send_dns_message(d, client_proto, error, false, false);
-			return Return(ConnectionStatus::DONE);
+			return true;
 		}
-		
-		dns::Question const &q = received.questions.front();
-		if (client_proto.is_dgram()) {
-			process_query_udp(d, client_proto, received, q);
-			return Return(ConnectionStatus::DONE);
-		} else if (client_proto.is_stream()) {
-			int client_fd = client_proto.is_inet4() ? d->in4_tcp.fd : d->in6_tcp.fd;
-			auto r = process_query_tcp(d, client_proto, client_fd, received, q);
-			return Return(r);
-		}
+
+		// This path only ever runs for the UDP listener, so client_proto is always
+		// a datagram socket here.
+		process_query_udp(d, client_proto, received, received.questions.front());
+		return true;
 	}
-	return Return(ConnectionStatus::ERROR);
+	return false;
 }
 
 void Behind::process_tcp(InternalData *d, sa_family_t family)
@@ -4059,9 +4095,8 @@ bool Behind::main(std::function<bool(bool)> const &reload_requested)
 					process_receive(&d, fd);
 				}
 			}
-			uptime();
-			clean(&d);
-			
+			periodic(&d);
+
 			if (sigint_caught.load(std::memory_order_relaxed)) break;
 			if (ShouldStopForReload()) break;
 		}
@@ -4110,27 +4145,36 @@ bool Behind::main(std::function<bool(bool)> const &reload_requested)
 				}
 				for (int i = 0; i < n; i++) {
 					auto fd = m->epoll_events[i].data.fd;
-					if (fd == d.in4_udp.fd) {
-						process_udp(&d, AF_INET);
-					} else if (fd == d.in6_udp.fd) {
-						process_udp(&d, AF_INET6);
-					} else if (fd == d.in4_tcp.listener_fd) {
-						process_tcp(&d, AF_INET);
-					} else if (fd == d.in6_tcp.listener_fd) {
-						process_tcp(&d, AF_INET6);
-					} else {
-						// static bool f = false;
-						// if (!f) {
-						// 	f = true;
-						// } else {
-						// 	fprintf(stderr, "---B\n");
-						// }
-						process_receive(&d, fd);
+					// A daemon must not die because one packet caused an
+					// exception (std::bad_alloc from a large resize, or anything
+					// escaping the DNS codec). Drop the offending event and keep
+					// serving; std::terminate() here would abort the server.
+					try {
+						if (fd == d.in4_udp.fd) {
+							process_udp(&d, AF_INET);
+						} else if (fd == d.in6_udp.fd) {
+							process_udp(&d, AF_INET6);
+						} else if (fd == d.in4_tcp.listener_fd) {
+							process_tcp(&d, AF_INET);
+						} else if (fd == d.in6_tcp.listener_fd) {
+							process_tcp(&d, AF_INET6);
+						} else {
+							process_receive(&d, fd);
+						}
+					} catch (std::exception const &e) {
+						logprintf(LOG_BOTH, "dropped event on fd=%d after exception: %s\n", fd, e.what());
+					} catch (...) {
+						logprintf(LOG_BOTH, "dropped event on fd=%d after unknown exception\n", fd);
 					}
 				}
-				uptime();
-				clean(&d);
-				
+				try {
+					periodic(&d);
+				} catch (std::exception const &e) {
+					logprintf(LOG_BOTH, "periodic maintenance failed: %s\n", e.what());
+				} catch (...) {
+					logprintf(LOG_BOTH, "periodic maintenance failed: unknown exception\n");
+				}
+
 				if (sigint_caught.load(std::memory_order_relaxed)) break;
 				if (ShouldStopForReload()) break;
 			}
@@ -4184,8 +4228,27 @@ bool Behind::main(std::function<bool(bool)> const &reload_requested)
 }
 
 // test
+//
+// These checks used to be `assert()`s that ran inside the daemon at every
+// startup *and* every SIGHUP reload, which meant two bad outcomes at once: a
+// failure abort()ed a live DNS server, and a build with -DNDEBUG silently turned
+// the whole suite into a no-op that did not even evaluate its expressions.
+// Now failures are counted and reported, and self_test() is only reached via the
+// --self-test command-line flag, so `behind --self-test` is a usable CI step.
 
-#define EXPECT_EQ(a, b) assert((a) == (b))
+namespace {
+size_t self_test_failures = 0;
+size_t self_test_checks = 0;
+}
+
+#define EXPECT_EQ(a, b)                                                                          \
+	do {                                                                                         \
+		self_test_checks++;                                                                      \
+		if (!((a) == (b))) {                                                                     \
+			self_test_failures++;                                                                \
+			logprintf(LOG_DEFAULT, "self-test failed: %s:%d: %s == %s\n", __FILE__, __LINE__, #a, #b); \
+		}                                                                                        \
+	} while (0)
 
 std::string to_string(std::vector<uint8_t> const &buf)
 {
@@ -4195,7 +4258,20 @@ std::string to_string(std::vector<uint8_t> const &buf)
 	return std::string((char const *)buf.data(), buf.size());
 }
 
-void Behind::self_test()
+// A missing fixture used to make the packet tests skip silently, so a "passing"
+// run from the wrong directory proved nothing. --self-test is explicit, so treat
+// an unreadable fixture as a failure.
+static bool load_testcase(char const *file, std::vector<char> *buf)
+{
+	if (readfile(file, buf) && !buf->empty()) return true;
+	self_test_failures++;
+	logprintf(LOG_DEFAULT, "self-test failed: cannot read fixture %s"
+						" (run from the directory that contains testcase/)\n",
+		file);
+	return false;
+}
+
+bool Behind::self_test()
 {
 	// host-name qualification test
 	{
@@ -4464,7 +4540,7 @@ void Behind::self_test()
 	char const *file;
 	
 	file = "testcase/google_response.bin";
-	if (readfile(file, &buf) && !buf.empty()) {
+	if (load_testcase(file, &buf)) {
 		dns::Message msg;
 		char const *begin = buf.data();
 		char const *end = begin + buf.size();
@@ -4505,7 +4581,7 @@ void Behind::self_test()
 	}
 	
 	file = "testcase/amazon_response.bin";
-	if (readfile(file, &buf) && !buf.empty()) {
+	if (load_testcase(file, &buf)) {
 		dns::Message msg;
 		char const *begin = buf.data();
 		char const *end = begin + buf.size();
@@ -4558,7 +4634,7 @@ void Behind::self_test()
 	}
 	
 	file = "testcase/doubleclick_response.bin";
-	if (readfile(file, &buf) && !buf.empty()) {
+	if (load_testcase(file, &buf)) {
 		dns::Message msg;
 		char const *begin = buf.data();
 		char const *end = begin + buf.size();
@@ -4575,4 +4651,7 @@ void Behind::self_test()
 		EXPECT_EQ(msg.questions[0].type, DNS_TYPE::A);
 		EXPECT_EQ(msg.questions[0].name, "doubleclick.net");
 	}
+
+	logprintf(LOG_DEFAULT, "self-test: %zu checks, %zu failures\n", self_test_checks, self_test_failures);
+	return self_test_failures == 0;
 }

@@ -17,6 +17,11 @@
 
 Logger x_logger;
 
+// Set to true to include the source file and line in every log line. Kept as a
+// single flag so that x_logprint() does not pay for capturing the file name
+// (a std::string allocation per log line) while it is disabled.
+static constexpr bool FILELINE = false;
+
 struct Logger::LogItem {
 	Logger::time_point_t tp = { };
 	int level = 0;
@@ -30,8 +35,15 @@ struct Logger::Private {
 	bool paused = false;
 	int fd_log = -1;
 	std::vector<Logger::LogItem> items;
+	size_t dropped = 0;
 	std::thread thread;
 	std::mutex mutex;
+	// Guards fd_log and the log file itself. Separate from `mutex` so that file
+	// I/O in the writer thread never blocks producers on the query hot path.
+	// Without it, x_open() on SIGHUP reload could close fd_log while the writer
+	// held that number in a register; the fd is then handed to a new listening
+	// socket and log text gets written into a DNS socket.
+	std::mutex file_mutex;
 	std::condition_variable cv;
 	bool interrupted = false;
 };
@@ -63,8 +75,6 @@ void Logger::write(char const *ptr, size_t len)
 
 void Logger::write(LogItem const &item)
 {
-	const bool FILELINE = false; // set to true to enable file/line logging
-
 	if (item.level == LOG_RAW) {
 		write(item.message.c_str(), item.message.size());
 	} else {
@@ -127,16 +137,21 @@ void Logger::rotate()
 
 void Logger::x_open(std::string const &log_file)
 {
-	x_close();
+	std::lock_guard lock(m->file_mutex);
+	if (m->fd_log != -1) {
+		close(m->fd_log);
+		m->fd_log = -1;
+	}
 	m->log_file = log_file;
 	m->fd_log = ::open(m->log_file.c_str(), O_RDWR | O_CREAT | O_APPEND, log_file_permission());
 	if (m->fd_log == -1) {
-		fprintf(stderr, "failed to open log file: %s", m->log_file.c_str());
+		fprintf(stderr, "failed to open log file: %s\n", m->log_file.c_str());
 	}
 }
 
 void Logger::x_close()
 {
+	std::lock_guard lock(m->file_mutex);
 	if (m->fd_log != -1) {
 		close(m->fd_log);
 		m->fd_log = -1;
@@ -145,29 +160,45 @@ void Logger::x_close()
 
 void Logger::x_start()
 {
-	m->paused = false;
-	m->interrupted = false;
+	{
+		std::lock_guard lock(m->mutex);
+		m->paused = false;
+		m->interrupted = false;
+		m->dropped = 0;
+	}
 
 	m->thread = std::thread([this]() {
 		while (1) {
 			std::vector<LogItem> items;
+			size_t dropped = 0;
 			{
 				std::unique_lock lock(m->mutex);
-				if (m->items.empty()) {
-					if (m->interrupted) break;
+				// `paused` is a wait condition, not a reason to loop: the old
+				// `if (m->paused) continue;` re-acquired the mutex as fast as it
+				// could whenever the queue was non-empty while paused, pinning a
+				// core. Keep flushing once interrupted so shutdown loses nothing.
+				while (!m->interrupted && (m->paused || m->items.empty())) {
 					m->cv.wait(lock);
 				}
-				if (m->paused) continue;
+				if (m->items.empty()) return; // interrupted and drained
 				std::swap(items, m->items);
+				dropped = m->dropped;
+				m->dropped = 0;
 			}
+			std::lock_guard file_lock(m->file_mutex);
 			{
 				struct stat st;
-				if (fstat(m->fd_log, &st) == 0 && st.st_size >= log_rotate_size()) {
+				if (m->fd_log != -1 && fstat(m->fd_log, &st) == 0 && st.st_size >= log_rotate_size()) {
 					rotate();
 				}
 			}
 			for (LogItem const &item : items) {
 				write(item);
+			}
+			if (dropped > 0) {
+				char text[128];
+				int len = snprintf(text, sizeof(text), "(warning) %zu log lines dropped: the log queue was full\n", dropped);
+				if (len > 0) write(text, (size_t)len);
 			}
 		}
 	});
@@ -175,13 +206,17 @@ void Logger::x_start()
 
 void Logger::x_stop()
 {
-	m->paused = false;
-	m->interrupted = true;
+	{
+		std::lock_guard lock(m->mutex);
+		m->paused = false;
+		m->interrupted = true;
+	}
 	m->cv.notify_all();
 	if (m->thread.joinable()) {
 		m->thread.join();
 	}
 	x_close();
+	std::lock_guard lock(m->mutex);
 	m->interrupted = false;
 }
 
@@ -209,10 +244,24 @@ void Logger::open(const std::string &log_file)
 	x_logger.x_open(log_file);
 }
 
-void Logger::push(Logger::LogItem const &item)
+void Logger::push(Logger::LogItem &&item)
 {
-	std::lock_guard lock(m->mutex);
-	m->items.push_back(item);
+	bool notify = false;
+	{
+		std::lock_guard lock(m->mutex);
+		if (m->items.size() >= MAX_QUEUED_ITEMS) {
+			m->dropped++;
+			return;
+		}
+		m->items.push_back(std::move(item));
+		// Only the empty -> non-empty transition needs a wakeup; the writer swaps
+		// the whole queue in one go. Notifying per line cost a futex syscall per
+		// log line on the query hot path.
+		notify = m->items.size() == 1 && !m->paused;
+	}
+	if (notify) {
+		m->cv.notify_one();
+	}
 }
 
 void Logger::x_logprint(const char *file, int line, int level, std::string_view str)
@@ -220,16 +269,17 @@ void Logger::x_logprint(const char *file, int line, int level, std::string_view 
 	LogItem item;
 	item.tp = now();
 	item.level = level;
-	item.file = file;
 	item.line = line;
+	if (FILELINE) {
+		item.file = file;
+	}
 	if (level != LOG_RAW) {
 		while (!str.empty() && isspace((unsigned char)str.back())) {
 			str.remove_suffix(1);
 		}
 	}
 	item.message = std::string(str);
-	push(item);
-	m->cv.notify_all();
+	push(std::move(item));
 }
 
 void Logger::x_logprintf(char const *file, int line, int level, char const *fmt, ...)

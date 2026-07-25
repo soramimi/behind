@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN_PATH="$ROOT_DIR/_bin/behind"
 CONF_PATH="${CONF_PATH:-$ROOT_DIR/scripts/behind.conf}"
-QUERYFILE="${QUERYFILE:-/home/soramimi/dnsperf/queryfile-example-10million-201202_part01}"
+QUERYFILE="${QUERYFILE:-/home/soramimi/dnsperf/query.txt}"
 SERVER_ADDR="${SERVER_ADDR:-127.0.0.1}"
 SERVER_PORT="${SERVER_PORT:-5301}"
 STARTUP_WAIT_SECS="${STARTUP_WAIT_SECS:-5}"

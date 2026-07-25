@@ -91,6 +91,9 @@ struct Options {
 	InetAddrPort listen6;
 	std::string working_dir = "/var/lib/behind";
 	std::string log_file = "/var/log/behind/behind.log";
+	// Log one line per answered query. Defaults to on to keep the historical
+	// behaviour; turning it off is the single biggest CPU saving at high QPS.
+	bool log_queries = true;
 	struct Zone {
 		std::string zone;
 		std::string name;
@@ -245,17 +248,16 @@ private:
 	static int parse_question_section(char const *begin, char const *end, char const *ptr, dns::Question *out);
 	std::vector<const Forwarder *> choose_forwarder(const std::string &name, size_t max) const;
 	void init_forwarder();
+	void periodic(InternalData *d);
 	void clean(InternalData *d);
-	void clean_transaction(uint32_t id);
 	size_t active_task_count() const;
 	void push_task(std::shared_ptr<Task> task, int timeout, uint32_t epoll_events);
 	void finish_task(std::shared_ptr<Task> task, bool close_client = true);
+	bool is_udp_query_active(std::shared_ptr<UdpQuery> const &query) const;
 	void finish_udp_query(std::shared_ptr<UdpQuery> const &query);
+	void finish_udp_transaction(uint32_t local_transaction_id);
 	static bool parse_dns_message(char const *begin, char const *end, dns::Message *msg);
-	
-	bool is_nodata(std::string const &name) const;
-	bool is_nxdomain(std::string const &name) const;
-	bool is_nodata_aaaa(std::string const &name) const;
+
 	bool is_matching_response(std::shared_ptr<Task> task, dns::Message const &received) const;
 	bool is_cacheable_response(std::shared_ptr<Task> task, dns::Message const &received) const;
 	
@@ -288,6 +290,7 @@ private:
 	TcpWriteResult write_tcp_buffer(std::shared_ptr<Task> task);
 	
 	void process_udp(InternalData *d, sa_family_t family);
+	bool process_udp_datagram(InternalData *d, sa_family_t family);
 	void process_tcp(InternalData *d, sa_family_t family);
 	
 	bool init_socket(void *private_in, ProtocolFamilyType proto);
@@ -356,7 +359,8 @@ public:
 	Behind(Options const &opts);
 	~Behind();
 	bool main(std::function<bool(bool)> const &reload_requested = { });
-	void self_test();
+	// Returns false if any check failed. Only reached via --self-test.
+	bool self_test();
 };
 
 #endif // BEHIND_H

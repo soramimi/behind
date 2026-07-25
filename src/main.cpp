@@ -5,6 +5,7 @@
 #include "misc.h"
 #include "network.h"
 #include "rwfile.h"
+#include <atomic>
 #include <cerrno>
 #include <charconv>
 #include <cstdint>
@@ -16,6 +17,16 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#define BEHIND_VERSION "0.1"
+
+enum class RunMode {
+	SERVE,
+	CHECK_CONFIG,
+	SELF_TEST,
+	HELP,
+	VERSION,
+};
 
 namespace {
 
@@ -36,6 +47,19 @@ bool parse_unsigned(std::string const &text, uint64_t minimum, uint64_t maximum,
 	}
 	*out = value;
 	return true;
+}
+
+bool parse_boolean(std::string const &text, bool *out)
+{
+	if (text == "yes" || text == "true" || text == "on" || text == "1") {
+		*out = true;
+		return true;
+	}
+	if (text == "no" || text == "false" || text == "off" || text == "0") {
+		*out = false;
+		return true;
+	}
+	return false;
 }
 
 bool validate_section(std::vector<std::string_view> const &parts, std::string *error)
@@ -191,6 +215,10 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 			opts->log_file = value;
 			return true;
 		}
+		if (key == "query-log") {
+			if (parse_boolean(value, &opts->log_queries)) return true;
+			return option_error(error, "invalid query-log value (expected yes or no): " + value);
+		}
 	} else if (sec == "forward-zone") {
 		if (key == "forward-addr") {
 			if (value.empty()) return option_error(error, "forward-addr must not be empty");
@@ -268,10 +296,28 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 	return option_error(error, "unknown option in [" + sec + "]: " + key);
 }
 
-bool parse_option(int argc, char **argv, std::string const &startup_directory, Options *opts, bool *check_config)
+void print_usage(FILE *fp)
+{
+	fprintf(fp,
+		"BEHIND " BEHIND_VERSION " - a lightweight DNS forwarding server\n"
+		"\n"
+		"usage: behind [options]\n"
+		"\n"
+		"  -C, --conf <file>   read the configuration from <file>\n"
+		"      --check-config  validate the configuration and exit\n"
+		"      --self-test     run the built-in test suite and exit\n"
+		"      --log-file <p>  override the configured log file path\n"
+		"  -h, --help          show this help and exit\n"
+		"  -v, --version       show the version and exit\n"
+		"\n"
+		"See README.md for the configuration file syntax.\n");
+}
+
+bool parse_option(int argc, char **argv, std::string const &startup_directory, Options *opts,
+	RunMode *run_mode)
 {
 	*opts = { };
-	*check_config = false;
+	*run_mode = RunMode::SERVE;
 	std::optional<std::string> log_file_override;
 	int argi = 1;
 	while (argi < argc) {
@@ -283,7 +329,7 @@ bool parse_option(int argc, char **argv, std::string const &startup_directory, O
 					std::string path = path_from_startup_directory(argv[argi++], startup_directory);
 					std::string confpath = misc::realpath(path);
 					if (confpath.empty()) {
-						fprintf(stderr, "%s: cannot resolve configuration path: %s", path.c_str(), strerror(errno));
+						fprintf(stderr, "%s: cannot resolve configuration path: %s\n", path.c_str(), strerror(errno));
 						return false;
 					}
 					if (!ConfigParser::parse(confpath.c_str(), [](std::string const &section, std::string const &key, std::string const &value, void *cookie, std::string *error) {
@@ -293,29 +339,39 @@ bool parse_option(int argc, char **argv, std::string const &startup_directory, O
 						return false;
 					}
 				} else {
-					fprintf(stderr, "option %s requires an argument.", c_arg);
+					fprintf(stderr, "option %s requires an argument.\n", c_arg);
 					return false;
 				}
 			} else if (arg_v == "--log-file") {
 				if (argi < argc) {
 					std::string value = argv[argi++];
 					if (value.empty()) {
-						fprintf(stderr, "option %s requires a non-empty argument.", c_arg);
+						fprintf(stderr, "option %s requires a non-empty argument.\n", c_arg);
 						return false;
 					}
 					log_file_override = std::move(value);
 				} else {
-					fprintf(stderr, "option %s requires an argument.", c_arg);
+					fprintf(stderr, "option %s requires an argument.\n", c_arg);
 					return false;
 				}
 			} else if (arg_v == "--check-config") {
-				*check_config = true;
+				*run_mode = RunMode::CHECK_CONFIG;
+			} else if (arg_v == "--self-test") {
+				*run_mode = RunMode::SELF_TEST;
+			} else if (arg_v == "-h" || arg_v == "--help") {
+				*run_mode = RunMode::HELP;
+				return true;
+			} else if (arg_v == "-v" || arg_v == "--version") {
+				*run_mode = RunMode::VERSION;
+				return true;
 			} else {
-				fprintf(stderr, "unknown option: %s", c_arg);
+				fprintf(stderr, "unknown option: %s\n", c_arg);
+				print_usage(stderr);
 				return false;
 			}
 		} else {
-			fprintf(stderr, "unexpected positional argument: %s", c_arg);
+			fprintf(stderr, "unexpected positional argument: %s\n", c_arg);
+			print_usage(stderr);
 			return false;
 		}
 	}
@@ -332,11 +388,6 @@ std::string current_working_directory()
 	return { };
 }
 
-#include "DomainFilter.h"
-#include <assert.h>
-#define EXPECT_EQ(a, b) assert((a) == (b))
-
-#include <atomic>
 extern std::atomic<bool> sigint_caught;
 
 bool validate_configuration(Options *opts, std::string const &startup_directory)
@@ -419,7 +470,8 @@ bool main2(Options const &opts, std::string const &startup_directory, std::funct
 
 	Behind behind(opts);
 
-	behind.self_test();
+	// self_test() deliberately does not run here: main2() is re-entered on every
+	// SIGHUP reload, so the suite used to re-run on a live server. Use --self-test.
 	return behind.main(reload_requested);
 }
 
@@ -433,11 +485,37 @@ int main(int argc, char **argv)
 	}
 
 	Options opts;
-	bool check_config = false;
-	if (!parse_option(argc, argv, startup_directory, &opts, &check_config) || !validate_configuration(&opts, startup_directory)) {
+	RunMode run_mode = RunMode::SERVE;
+	if (!parse_option(argc, argv, startup_directory, &opts, &run_mode)) {
 		return 1;
 	}
-	if (check_config) {
+	if (run_mode == RunMode::HELP) {
+		print_usage(stdout);
+		return 0;
+	}
+	if (run_mode == RunMode::VERSION) {
+		printf("behind %s\n", BEHIND_VERSION);
+		return 0;
+	}
+	if (run_mode == RunMode::SELF_TEST) {
+		// No log file is opened in this mode, so the logger falls back to stderr.
+		// The writer thread still has to run for anything to be emitted at all.
+		Logger::start();
+		Logger::pause(false);
+		bool ok = false;
+		{
+			Options test_options;
+			Behind behind(test_options);
+			ok = behind.self_test();
+		}
+		Logger::stop();
+		fprintf(stderr, "%s\n", ok ? "self-test passed" : "self-test FAILED");
+		return ok ? 0 : 1;
+	}
+	if (!validate_configuration(&opts, startup_directory)) {
+		return 1;
+	}
+	if (run_mode == RunMode::CHECK_CONFIG) {
 		printf("configuration is valid\n");
 		return 0;
 	}
@@ -464,9 +542,9 @@ int main(int argc, char **argv)
 				[argc, argv, startup_directory]() -> std::optional<Options> {
 					try {
 						Options candidate;
-						bool ignored_check_config = false;
+						RunMode ignored_run_mode = RunMode::SERVE;
 						if (parse_option(argc, argv, startup_directory, &candidate,
-								&ignored_check_config)
+								&ignored_run_mode)
 							&& validate_configuration(&candidate, startup_directory)) {
 							return candidate;
 						}

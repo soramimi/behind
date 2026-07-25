@@ -22,10 +22,16 @@ private:
 		return 10 * 1024 * 1024;
 	}
 
+	// The queue is unbounded work handed to a single writer thread. If the log
+	// filesystem is slow or stalls in rotate(), an unbounded queue grows with the
+	// producer/consumer gap and becomes a memory-exhaustion path under load, so
+	// drop lines (and report how many) instead.
+	static constexpr size_t MAX_QUEUED_ITEMS = 100000;
+
 	time_point_t now();
 	void write(const char *ptr, size_t len);
 	void write(const LogItem &item);
-	void push(const LogItem &item);
+	void push(LogItem &&item);
 	void rotate();
 	void x_close();
 	void x_start();

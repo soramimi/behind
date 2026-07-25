@@ -9,11 +9,12 @@ Designed for home networks and small organizations, BEHIND is typically deployed
 ## Features
 
 - **DNS Forwarding**: Forward DNS queries to upstream DNS servers with support for multiple forwarders and automatic random selection
+- **UDP Multiple Forwarding**: Optionally send each UDP query to several upstream forwarders at once and use the first valid response, reducing tail latency
 - **TCP/UDP Dual Protocol Support**: Support both UDP and TCP protocols for DNS queries. Large UDP responses are truncated with the TC flag so clients can retry over TCP
-- **UDP Port Randomization**: Randomized source port selection (IANA ephemeral range 49152-65535, per RFC 6056) for UDP forwarding to enhance security and prevent DNS spoofing attacks
+- **Randomized Upstream Sockets**: Up to 4 connected UDP sockets are opened per upstream forwarder, each on a kernel-assigned ephemeral source port, and responses are accepted only from the connected endpoint. Note that these sockets are reused for the lifetime of the process, so the source port is not re-randomized per query
 - **Dual Stack Support**: Full IPv4 and IPv6 support
 - **PTR Record Support**: Forward and cache reverse DNS lookups, including static reverse lookups for hosts entries
-- **DNS Cache**: Intelligent response caching with per-record TTL tracking (up to 4096 entries), supporting A, AAAA, PTR, SOA, TXT, and HTTPS responses over both UDP and TCP
+- **DNS Cache**: Intelligent response caching with per-record TTL tracking, bounded by `max-cache-bytes` with LRU eviction, supporting A, AAAA, CNAME, NS, MX, PTR, SOA, TXT, and HTTPS responses over both UDP and TCP
 - **DNS Compression**: DNS name compression in response packets for reduced bandwidth usage
 - **Security**: DNS 0x20 encoding (case randomization), randomized transaction IDs, randomized UDP source ports, upstream response validation, and bounds-checked parsing that rejects malformed DNS packets. All randomness is derived from a ChaCha20-based CSPRNG seeded from the operating system (`getrandom`)
 - **Advanced Domain Filtering**: Block domains using exact match, prefix match, suffix match, or regex patterns (useful for ad-blocking)
@@ -72,6 +73,7 @@ allow-client = 192.0.2.0/24    ; Allowed client CIDR (repeatable)
 rate-limit-qps = 1000          ; Per-client and global sustained query rate
 rate-limit-burst = 2000        ; Token-bucket burst size
 upstream-timeout-ms = 3000     ; Upstream response timeout
+udp-multiple-forwarding = 2    ; Number of upstreams to query in parallel per UDP request (1-4)
 ```
 
 If no `allow-client` entry is configured, only loopback clients (`127.0.0.0/8`
@@ -80,12 +82,19 @@ network. `max-tasks` must also fit within the process file-descriptor limit;
 startup fails safely when it does not.
 
 #### [logging]
-Configure log file location:
+Configure log file location and verbosity:
 
 ```ini
 [logging]
 file = /var/log/behind/behind.log  ; Log file path
+query-log = yes                    ; Log one line per answered query (default yes)
 ```
+
+Per-query logging is the largest single CPU cost on the response path. Set
+`query-log = no` on a busy resolver; startup, reload, and error messages are
+still logged. If the log queue ever backs up (a slow or stalled log filesystem),
+lines are dropped rather than buffered without limit, and a
+`log lines dropped` warning is written once the queue drains.
 
 #### [forward-zone]
 Specify one or more upstream DNS servers to forward queries to. When multiple servers are configured, BEHIND will randomly select one for each query:
@@ -114,7 +123,13 @@ forward-addr = 8.8.8.8              ; Default DNS for all other queries
 forward-addr = 1.1.1.1
 ```
 
-When a query matches a specific zone, BEHIND will use the forwarders configured for that zone. Otherwise, it will use the default forwarders (configured without a zone name).
+When a query matches a specific zone, BEHIND uses the forwarders configured for that zone. Otherwise, it uses the default forwarders (configured without a zone name).
+
+Zone selection is a **longest match**: with both `[forward-zone "example.com."]`
+and `[forward-zone "sub.example.com."]` configured, a query for
+`host.sub.example.com` goes only to the forwarders of `sub.example.com.`. If
+several `forward-addr` entries share that same most-specific zone, they are used
+as equivalent alternatives (see `udp-multiple-forwarding`).
 
 #### [filter]
 Block specific domains by returning NXDOMAIN. Supports exact match, prefix match, suffix match, and regex patterns:
@@ -127,6 +142,9 @@ nxdomain = ad.*              ; Prefix match (e.g., ad.network.com)
 nxdomain = *.tracking.com    ; Suffix match (e.g., tracker.tracking.com)
 nxdomain  = *html-load*      ; Middle match (e.g., html-load.com, html-load.cc)
 nxdomain = /^ad[0-9]+\..*/         ; Regex pattern (enclosed in slashes)
+
+; Return NODATA (empty answer) instead of NXDOMAIN, for all query types
+nodata = example.org
 
 ; Return NODATA for AAAA records only (useful for forcing IPv4)
 nodata-aaaa = youtube.com          ; Force YouTube to use IPv4
@@ -219,9 +237,9 @@ BEHIND acts as a DNS proxy/forwarder with support for both UDP and TCP protocols
 2. Checks if there's a static host mapping in the [hosts] section, including reverse PTR lookups for configured host addresses
 3. Checks if the domain should be blocked using the domain filter (supports exact, prefix, suffix, and regex matching)
 4. Checks the local cache for recent responses (with per-record TTL tracking)
-5. If not cached, randomly selects one of the configured upstream DNS servers and forwards the query:
-   - **UDP forwarding**: Uses randomized source ports and connected UDP sockets for stronger upstream response validation
-   - **TCP forwarding**: Uses non-blocking connections with epoll for efficient connection management
+5. If not cached, randomly selects from the configured upstream DNS servers and forwards the query:
+   - **UDP forwarding**: Uses randomized source ports and connected UDP sockets for stronger upstream response validation. When `udp-multiple-forwarding` is greater than 1, the query is sent to that many randomly chosen upstreams at once and the first valid response is used
+   - **TCP forwarding**: Uses non-blocking connections with epoll for efficient connection management, always against a single randomly chosen upstream
    - UDP responses that exceed the client's negotiated payload limit are truncated at a record boundary and returned with the TC flag set
 6. Caches the response based on each record's TTL value (supports both UDP and TCP responses)
 7. Returns the response to the client with DNS name compression for efficiency

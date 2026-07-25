@@ -24,11 +24,15 @@ private:
 		std::regex expression;
 		Kind kind = NORMAL;
 	};
+	// Regex rules are the only filter form whose per-query cost is not O(1), so
+	// they get a much tighter cap than entry_count_'s 100000.
+	static constexpr size_t MAX_REGEX_RULES = 256;
 	std::unordered_map<std::string, std::vector<Item>> suffix_map_;
 	std::unordered_map<std::string, std::vector<Item>> prefix_map_;
 	std::vector<Item> middle_map_;
 	std::vector<RegexItem> regex_list_;
 	size_t entry_count_ = 0;
+	size_t regex_count_ = 0;
 	bool add_entry(std::string const &name, Kind kind, std::string *error);
 
 public:
