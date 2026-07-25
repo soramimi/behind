@@ -79,7 +79,14 @@ udp-multiple-forwarding = 2    ; Number of upstreams to query in parallel per UD
 If no `allow-client` entry is configured, only loopback clients (`127.0.0.0/8`
 and `::1/128`) are accepted. Add explicit CIDRs before exposing BEHIND to a
 network. `max-tasks` must also fit within the process file-descriptor limit;
-startup fails safely when it does not.
+startup attempts to raise the soft limit when possible and fails safely when
+the resulting limit is insufficient. The hard upper bound for `max-tasks` is
+10000. Each in-flight upstream query consumes one task, so a UDP cache miss can
+consume up to `udp-multiple-forwarding` tasks. For example, `max-tasks = 10000`
+with `udp-multiple-forwarding = 2` permits roughly 5000 simultaneous client
+cache misses. Very large values also increase timeout scanning and worst-case
+memory use; 500 is a conservative default and values above a few thousand
+should be load-tested on the target host.
 
 #### [logging]
 Configure log file location and verbosity:
@@ -154,6 +161,13 @@ nodata-aaaa = googlevideo.com      ; Force Google Video to use IPv4
 include nxdomain.conf
 ```
 
+Filter input is limited to 100000 rules, 4096 bytes per rule, and 256 regular
+expressions. Invalid regular expressions make configuration validation fail.
+At match time, a `std::regex_error` is handled fail-closed. Because
+`std::regex` provides no execution-step limit, operators should still avoid
+patterns with nested or ambiguous repetition that can backtrack
+catastrophically; prefer the exact and wildcard forms where possible.
+
 #### [hosts]
 Define static hostname-to-IP address mappings:
 
@@ -195,7 +209,32 @@ Validate a configuration without binding sockets:
 
 - `-C, --conf <config-file>`: Specify the configuration file path
 - `--check-config`: Validate syntax, referenced hosts files, and forwarder resolution, then exit
+- `--self-test`: Run the built-in DNS codec/cache tests and exit
 - `--log-file <path>`: Override the configured log file path
+- `-h, --help`: Show command-line help
+- `-v, --version`: Show the version
+
+Run the self-test from the repository root so the packet fixtures under
+`testcase/` can be found:
+
+```bash
+./_bin/behind --self-test
+```
+
+### Benchmarking
+
+`benchmark.sh` uses `resperf` and the configured server limits. By default, its
+maximum QPS is taken from `rate-limit-qps`, and its outstanding-query limit is
+90% of `max-tasks / udp-multiple-forwarding`. This avoids benchmarking the
+speed of BEHIND's overload/SERVFAIL path instead of successful resolution.
+These values can be overridden for an intentional saturation test:
+
+```bash
+RESPERF_MAX_QPS=100000 RESPERF_OUTSTANDING=20000 ./benchmark.sh
+```
+
+Use the same query file and equivalent cold/warm cache state when comparing
+versions. `QUERYFILE` can be used to select the input data set.
 
 ### Installing as a systemd Service
 
@@ -248,7 +287,7 @@ The case randomization feature is always enabled and randomly changes the case o
 
 All security-sensitive randomness (transaction IDs, UDP source ports, and 0x20 case bits) is produced by a ChaCha20-based CSPRNG. Its key and nonce are seeded from the operating system's `getrandom` at startup; if the OS entropy source is unavailable, the server aborts rather than running with a predictable key.
 
-Malformed DNS messages are rejected during parsing. BEHIND validates response transaction IDs, QR/opcode fields, the exact case-randomized question name, type, class, and connected upstream endpoint before accepting a response. Upstream timeouts and exhausted task capacity fail safely with DNS errors instead of leaving clients waiting indefinitely.
+Malformed DNS messages are rejected during parsing. BEHIND validates response transaction IDs, QR/opcode fields, the exact case-randomized question name, type, class, and connected upstream endpoint before accepting a response. Upstream timeouts and exhausted task capacity fail safely with SERVFAIL instead of leaving clients waiting indefinitely. Sustained capacity rejection is normally a sign that the offered load, `max-tasks`, UDP fan-out, or upstream latency needs tuning.
 
 ### Protocol Handling
 
@@ -264,7 +303,7 @@ Malformed DNS messages are rejected during parsing. BEHIND validates response tr
 ### Logging
 
 BEHIND automatically manages log files:
-- Log files are created in the configured log directory
-- The main log file is named `behind.log`
+- The active log is written to the path configured by `[logging] file`
 - When rotation occurs, older logs are renamed with suffixes `.0` through `.9` (e.g., `behind.log.0`, `behind.log.1`)
-- All DNS queries and responses are logged for troubleshooting
+- DNS queries and responses are logged when `query-log = yes`; lifecycle and error messages remain enabled when it is `no`
+- The asynchronous queue is bounded; log lines are dropped and later reported if the writer cannot keep up

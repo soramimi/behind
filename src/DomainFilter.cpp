@@ -1,7 +1,5 @@
 #include "DomainFilter.h"
 #include "misc.h"
-#include <cctype>
-#include <chrono>
 #include <cstring>
 
 namespace {
@@ -10,113 +8,6 @@ bool fail(std::string *error, std::string message)
 {
 	if (error) {
 		*error = std::move(message);
-	}
-	return false;
-}
-
-// Extract the literal runs of a regular expression, treating a backslash escape
-// of an ordinary character as that character, so "doubleclick\.net" yields the
-// single literal "doubleclick.net".
-std::vector<std::string> regex_literal_runs(std::string const &pattern)
-{
-	std::vector<std::string> runs;
-	std::string literal;
-	auto Flush = [&]() {
-		if (literal.size() >= 3) runs.push_back(literal);
-		literal.clear();
-	};
-	auto IsLiteral = [](unsigned char c) {
-		return isalnum(c) || c == '-' || c == '.';
-	};
-	for (size_t i = 0; i < pattern.size(); i++) {
-		unsigned char c = (unsigned char)pattern[i];
-		if (c == '\\' && i + 1 < pattern.size() && IsLiteral((unsigned char)pattern[i + 1])) {
-			literal.push_back(pattern[++i]);
-		} else if (IsLiteral(c)) {
-			literal.push_back((char)c);
-		} else {
-			Flush();
-		}
-	}
-	Flush();
-	return runs;
-}
-
-// A filter regex is evaluated against every query name, so a pattern with
-// catastrophic backtracking lets a single query packet stall the whole
-// single-threaded event loop indefinitely.  libstdc++'s std::regex has no
-// complexity or step limit and never throws for this, so catching
-// std::regex_error at match time is not a defense.  Since the regex engine must
-// be kept, the only effective defense is to reject such a pattern when it is
-// loaded, which also makes it visible to --check-config.
-//
-// Cost grows exponentially in the input length for exactly the patterns worth
-// rejecting, so probing with slowly growing lengths detects the blow-up while
-// every individual match is still cheap: a pattern that needs 20 s at 63 bytes
-// needs well under a millisecond at 16 bytes.  The step must stay small, because
-// the budget can only be checked between matches and a single regex_match cannot
-// be interrupted: with a base-2 blow-up, a step of 2 bounds the cost of the
-// match that finally trips the budget to roughly 4x the budget.
-bool regex_is_too_expensive(std::regex const &expression, std::string const &pattern)
-{
-	using Clock = std::chrono::steady_clock;
-	// Generous enough that a linear pattern's few thousand cheap probe matches
-	// never trip it: rejecting a legitimate rule would break the operator's
-	// config, so false positives matter more here than a slow load.
-	constexpr double BUDGET_MS = 200.0;
-	constexpr size_t MAX_NAME = 253; // decode_name() never produces a longer name
-
-	// The worst case for a nested-quantifier pattern is an input that almost
-	// matches: the engine must explore every decomposition before it can fail.
-	// Derive such inputs from the pattern's own literals, with the final
-	// character changed so the match fails at the very end.
-	std::vector<std::string> tails = regex_literal_runs(pattern);
-	for (std::string &tail : tails) {
-		tail.back() = tail.back() == 'z' ? 'y' : 'z';
-	}
-	tails.emplace_back();
-	// A pattern such as (a|a?)+$ only blows up on input it cannot match, and
-	// every probe above would happily match. '~' is accepted inside a label by
-	// decode_name(), so this is a byte a client can really send.
-	tails.emplace_back("~");
-
-	// The filler alphabet has to come from the characters the pattern itself
-	// mentions: a blow-up only happens on input the quantified groups can match,
-	// so a fixed alphabet would miss patterns like (x|xx)+y.
-	std::vector<std::string> fillers = { "a", "a.", "ab", "a-", "0" };
-	{
-		std::string seen;
-		for (size_t i = 0; i < pattern.size() && seen.size() < 6; i++) {
-			unsigned char c = (unsigned char)pattern[i];
-			if (c == '\\' && i + 1 < pattern.size()) c = (unsigned char)pattern[++i];
-			if (!isalnum(c) && c != '-') continue;
-			if (seen.find((char)c) != std::string::npos) continue;
-			seen.push_back((char)c);
-			fillers.push_back(std::string(1, (char)c));
-			fillers.push_back(std::string(1, (char)c) + ".");
-		}
-	}
-
-	Clock::time_point const started = Clock::now();
-	auto Elapsed = [&]() {
-		return std::chrono::duration<double, std::milli>(Clock::now() - started).count();
-	};
-	for (size_t length = 8; length <= MAX_NAME; length += 3) {
-		for (std::string const &filler : fillers) {
-			std::string filling;
-			while (filling.size() < length) filling += filler;
-			filling.resize(length);
-			for (std::string const &tail : tails) {
-				std::string probe = filling + tail;
-				if (probe.size() > MAX_NAME) probe.resize(MAX_NAME);
-				try {
-					(void)std::regex_match(probe, expression);
-				} catch (std::regex_error const &) {
-					return true; // the engine already hit a resource limit
-				}
-				if (Elapsed() > BUDGET_MS) return true;
-			}
-		}
 	}
 	return false;
 }
@@ -291,11 +182,6 @@ bool DomainFilter::add_entry(std::string const &name, Kind kind, std::string *er
 			RegexItem item;
 			item.kind = kind;
 			item.expression = std::regex(pattern, std::regex_constants::ECMAScript | std::regex_constants::icase);
-			if (regex_is_too_expensive(item.expression, pattern)) {
-				return fail(error, "regular expression is too expensive to evaluate safely"
-									" (it backtracks catastrophically, so one query could stall the server);"
-									" prefer the *.example.com, example.com.* or *example* forms");
-			}
 			regex_list_.push_back(std::move(item));
 			regex_count_++;
 			return Success();

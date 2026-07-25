@@ -92,18 +92,24 @@ fi
 trap cleanup EXIT INT TERM
 
 MAX_TASKS="$(read_config_number max-tasks 500)"
+UDP_MULTIPLE_FORWARDING="$(read_config_number udp-multiple-forwarding 2)"
+RATE_LIMIT_QPS="$(read_config_number rate-limit-qps 1000)"
 RESPERF_TIMEOUT="${RESPERF_TIMEOUT:-45}"
-RESPERF_MAX_QPS="${RESPERF_MAX_QPS:-100000}"
+RESPERF_MAX_QPS="${RESPERF_MAX_QPS:-$RATE_LIMIT_QPS}"
 RESPERF_RAMP_TIME="${RESPERF_RAMP_TIME:-5}"
 RESPERF_CONSTANT_TIME="${RESPERF_CONSTANT_TIME:-20}"
 RESPERF_CLIENTS="${RESPERF_CLIENTS:-1}"
 RESPERF_MAX_LOSS="${RESPERF_MAX_LOSS:-100}"
 RESPERF_FALL_BEHIND="${RESPERF_FALL_BEHIND:-0}"
-RESPERF_OUTSTANDING="${RESPERF_OUTSTANDING:-$((MAX_TASKS * 8))}"
-
-if (( RESPERF_OUTSTANDING < 1024 )); then
-	RESPERF_OUTSTANDING=1024
+# max-tasks counts individual upstream queries. A client cache miss normally
+# consumes udp-multiple-forwarding slots, so using max-tasks * 8 here forced the
+# server into its overload/SERVFAIL path and measured rejection throughput.
+# Keep 10% headroom for tasks already in flight around sampling boundaries.
+DEFAULT_OUTSTANDING=$((MAX_TASKS * 9 / (UDP_MULTIPLE_FORWARDING * 10)))
+if (( DEFAULT_OUTSTANDING < 1 )); then
+	DEFAULT_OUTSTANDING=1
 fi
+RESPERF_OUTSTANDING="${RESPERF_OUTSTANDING:-$DEFAULT_OUTSTANDING}"
 
 make -j2
 "$BIN_PATH" --check-config -C "$CONF_PATH"
@@ -134,6 +140,8 @@ echo "  config:        $CONF_PATH"
 echo "  queryfile:     $QUERYFILE"
 echo "  server:        $SERVER_ADDR:$SERVER_PORT"
 echo "  max-tasks:     $MAX_TASKS"
+echo "  udp fan-out:   $UDP_MULTIPLE_FORWARDING"
+echo "  rate-limit:    $RATE_LIMIT_QPS qps"
 echo "  outstanding:   $RESPERF_OUTSTANDING"
 echo "  max-qps:       $RESPERF_MAX_QPS"
 echo "  ramp-time:     $RESPERF_RAMP_TIME"
