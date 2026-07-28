@@ -5,6 +5,7 @@
 #else
 #include <unistd.h>
 #endif
+#include <cerrno>
 #include <fcntl.h>
 #include <sys/stat.h>
 
@@ -17,13 +18,13 @@ bool readfile(char const *path, std::vector<char> *out, int maxsize)
 	out->clear();
 	bool ok = false;
 #ifdef WIN32
-	int fd = open(path, O_RDONLY | O_BINARY);
+	int fd = open(path, O_RDONLY | O_BINARY | O_CLOEXEC);
 #else
-	int fd = open(path, O_RDONLY);
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
 #endif
 	if (fd != -1) {
 		struct stat st;
-		if (fstat(fd, &st) == 0) {
+		if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
 			if (maxsize < 0 || st.st_size <= maxsize) {
 				ok = true;
 				out->resize(st.st_size);
@@ -33,7 +34,9 @@ bool readfile(char const *path, std::vector<char> *out, int maxsize)
 					if (n > 65536) {
 						n = 65536;
 					}
-					if (read(fd, &out->at(pos), n) != n) {
+					ssize_t r = read(fd, &out->at(pos), n);
+					if (r < 0 && errno == EINTR) continue;
+					if (r != n) {
 						out->clear();
 						ok = false;
 						break;
@@ -51,9 +54,9 @@ bool writefile(char const *path, std::vector<char> const *vec)
 {
 	bool ok = false;
 #ifdef WIN32
-	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, S_IREAD | S_IWRITE);
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY | O_CLOEXEC, S_IREAD | S_IWRITE);
 #else
-	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
 #endif
 	if (fd != -1) {
 		ok = true;
@@ -63,7 +66,9 @@ bool writefile(char const *path, std::vector<char> const *vec)
 			if (n > 65536) {
 				n = 65536;
 			}
-			if (write(fd, &vec->at(pos), n) != n) {
+			ssize_t w = write(fd, &vec->at(pos), n);
+			if (w < 0 && errno == EINTR) continue;
+			if (w != n) {
 				ok = false;
 				break;
 			}

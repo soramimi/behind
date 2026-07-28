@@ -34,14 +34,14 @@
   - per-client/global token bucket による rate limit を行う。
 - resource limit を強化した。
   - `max-tasks`、FD 上限、cache bytes、cache entry size、task 数を検証する。
-  - `max-tasks` の hard upper bound は `10000`。
+  - `max-tasks` の hard upper bound は `50000`。
   - 通常の `rlim_cur = 1024` 環境では、FD 安全計算により実効上限はおおむね `504`。
 - UDP/TCP の正確性を改善した。
   - nonblocking TCP state machine、partial read/write、deadline、SIGPIPE 対策を入れた。
   - malformed/timeout/overload では適切な DNS エラーを返す。
   - UDP 上流応答は transaction id、QR/opcode、case-randomized question、qtype/qclass を検証する。
   - 不正または不一致の UDP 応答で、同じ問い合わせの正常な sibling 応答を潰さない。
-  - 同一 UDP query の coalescing は 64 waiters に制限する。
+  - 同一 UDP query の coalescing は 200 waiters に制限する。
 - DNS codec と cache を堅牢化した。
   - unaligned type-punning load を避けた。
   - compression pointer の offset、backward pointer、jump 数、RDATA bounds を検証する。

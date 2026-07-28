@@ -16,7 +16,7 @@ Designed for home networks and small organizations, BEHIND is typically deployed
 - **PTR Record Support**: Forward and cache reverse DNS lookups, including static reverse lookups for hosts entries
 - **DNS Cache**: Intelligent response caching with per-record TTL tracking, bounded by `max-cache-bytes` with LRU eviction, supporting A, AAAA, CNAME, NS, MX, PTR, SOA, TXT, and HTTPS responses over both UDP and TCP
 - **DNS Compression**: DNS name compression in response packets for reduced bandwidth usage
-- **Security**: DNS 0x20 encoding (case randomization), randomized transaction IDs, randomized UDP source ports, upstream response validation, and bounds-checked parsing that rejects malformed DNS packets. All randomness is derived from a ChaCha20-based CSPRNG seeded from the operating system (`getrandom`)
+- **Security**: DNS 0x20 encoding (case randomization), randomized transaction IDs, randomized UDP source ports, upstream response validation, and bounds-checked parsing that rejects malformed DNS packets. Security-sensitive randomness for transaction IDs and 0x20 case bits is produced by a ChaCha20-based CSPRNG seeded from the operating system (`getrandom`); UDP source ports are kernel-assigned ephemeral ports.
 - **Advanced Domain Filtering**: Block domains using exact match, prefix match, suffix match, or regex patterns (useful for ad-blocking)
 - **Static Host Resolution**: Define custom hostname-to-IP mappings in the configuration, with reverse PTR answers generated from the same host table
 - **Modular Configuration**: Support for nested configuration files using include directives
@@ -81,7 +81,7 @@ and `::1/128`) are accepted. Add explicit CIDRs before exposing BEHIND to a
 network. `max-tasks` must also fit within the process file-descriptor limit;
 startup attempts to raise the soft limit when possible and fails safely when
 the resulting limit is insufficient. The hard upper bound for `max-tasks` is
-10000. Each in-flight upstream query consumes one task, so a UDP cache miss can
+50000. Each in-flight upstream query consumes one task, so a UDP cache miss can
 consume up to `udp-multiple-forwarding` tasks. For example, `max-tasks = 10000`
 with `udp-multiple-forwarding = 2` permits roughly 5000 simultaneous client
 cache misses. Very large values also increase timeout scanning and worst-case
@@ -277,7 +277,7 @@ BEHIND acts as a DNS proxy/forwarder with support for both UDP and TCP protocols
 
 The case randomization feature is always enabled and randomly changes the case of letters in domain names to help detect and prevent DNS spoofing attacks.
 
-All security-sensitive randomness (transaction IDs, UDP source ports, and 0x20 case bits) is produced by a ChaCha20-based CSPRNG. Its key and nonce are seeded from the operating system's `getrandom` at startup; if the OS entropy source is unavailable, the server aborts rather than running with a predictable key.
+Security-sensitive randomness for transaction IDs and 0x20 case bits is produced by a ChaCha20-based CSPRNG. UDP source ports are kernel-assigned ephemeral ports. The CSPRNG's key and nonce are seeded from the operating system's `getrandom` at startup; if the OS entropy source is unavailable, the server aborts rather than running with a predictable key.
 
 Malformed DNS messages are rejected during parsing. BEHIND validates response transaction IDs, QR/opcode fields, the exact case-randomized question name, type, class, and connected upstream endpoint before accepting a response. Upstream timeouts and exhausted task capacity fail safely with SERVFAIL instead of leaving clients waiting indefinitely. Sustained capacity rejection is normally a sign that the offered load, `max-tasks`, UDP fan-out, or upstream latency needs tuning.
 

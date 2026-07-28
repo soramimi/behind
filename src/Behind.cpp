@@ -303,6 +303,15 @@ struct Message {
 	std::vector<Record> answers;
 	std::vector<Record> authorities;
 	std::vector<Record> additionals;
+	
+	static Message SERVFAIL(char const *file, int line)
+	{
+		(void)file;
+		logprintf(LOG_STDERR, "--- (debug) servfail: line=%d\n", line);
+		Message response;
+		response.header.flags = 0x8182; // SERVFAIL
+		return response;
+	}
 };
 
 static void normalize_negative_ttl(Message *message)
@@ -1221,9 +1230,37 @@ std::vector<Forwarder const *> Behind::choose_forwarder(std::string const &name,
 	return *forwarders;
 }
 
-uint16_t Behind::next_txid()
+std::optional<TransactionID> Behind::allocate_txid(Forwarder const &fw)
 {
-	return m->rng.next_txid();
+	constexpr int max_retry = 100;
+	TransactionID item;
+	item.d->k.af_type = fw.af_type;
+	memcpy(item.d->k.addr, fw.addr, sizeof(item.d->k.addr));
+	item.d->timestamp = misc::get_tick_count();
+	for (int retry = 0; retry < max_retry; retry++) {
+		item.d->k.txid = m->rng.next_u32() & 0xffff;
+		auto it = active_txids_.find(item);
+		if (it == active_txids_.end()) {
+			active_txids_.insert({item});
+			logprintf(LOG_DEFAULT, "(debug) transaction tracking [+] n=%d\n", active_txids_.size());
+			return item;
+		}
+	}
+	logprintf(LOG_DEFAULT, "(debug) transaction tracking: allocation failed after %d retries\n", max_retry);
+	return std::nullopt;
+}
+
+void Behind::release_txid(Forwarder const &forwarder, int upstream_id)
+{
+	TransactionID item;
+	item.d->k.af_type = forwarder.af_type;
+	memcpy(item.d->k.addr, forwarder.addr, sizeof(item.d->k.addr));
+	item.d->k.txid = upstream_id;
+	auto it = active_txids_.find(item);
+	if (it != active_txids_.end()) {
+		active_txids_.erase(it);
+	}
+	logprintf(LOG_DEFAULT, "(debug) transaction tracking [-] n=%d\n", active_txids_.size());
 }
 
 InetAddrPort InetAddrPort::parse(std::string name)
@@ -1476,6 +1513,8 @@ void Behind::finish_udp_query(std::shared_ptr<UdpQuery> const &query)
 			m->pending_udp.erase(found);
 		}
 	}
+
+	release_txid(query->forwarder, query->upstream_id);
 }
 
 // Complete a whole client transaction: retire every sibling that was fanned out
@@ -1510,96 +1549,120 @@ void Behind::periodic(InternalData *d)
 
 void Behind::clean(InternalData *d)
 {
+	enum State {
+		CLEAN_PAUSED_LISTENDERS,
+		CLEAN_EXPIRED_TCP,
+		CLEAN_EXPIRED_UDP,
+		CLEAN_ACTIVATE_TXIDS,
+	};
+	static int state_ = 0;
+	
 	uint64_t now = misc::get_tick_count();
-	for (auto it = m->paused_listeners.begin(); it != m->paused_listeners.end();) {
-		if (now < it->second) {
-			it++;
-			continue;
+	if (state_ == CLEAN_PAUSED_LISTENDERS) {
+		for (auto it = m->paused_listeners.begin(); it != m->paused_listeners.end();) {
+			if (now < it->second) {
+				it++;
+				continue;
+			}
+			InternalData::In *input = nullptr;
+			if (d->in4_tcp.listener_fd == it->first)
+				input = &d->in4_tcp;
+			else if (d->in6_tcp.listener_fd == it->first)
+				input = &d->in6_tcp;
+			if (input && ctl_mod(it->first, &input->ev, true, false) == 0) {
+				it = m->paused_listeners.erase(it);
+			} else {
+				it->second = now + 1000;
+				it++;
+			}
 		}
-		InternalData::In *input = nullptr;
-		if (d->in4_tcp.listener_fd == it->first)
-			input = &d->in4_tcp;
-		else if (d->in6_tcp.listener_fd == it->first)
-			input = &d->in6_tcp;
-		if (input && ctl_mod(it->first, &input->ev, true, false) == 0) {
-			it = m->paused_listeners.erase(it);
-		} else {
-			it->second = now + 1000;
-			it++;
+	} else if (state_ == CLEAN_EXPIRED_TCP) {
+		std::vector<std::shared_ptr<Task>> expired;
+		for (auto const &item : m->tasks_by_fd) {
+			std::shared_ptr<Task> const &task = item.second;
+			if (now - task->timestamp >= (uint64_t)task->timeout) {
+				expired.push_back(task);
+			}
 		}
-	}
-	std::vector<std::shared_ptr<Task>> expired;
-	for (auto const &item : m->tasks_by_fd) {
-		std::shared_ptr<Task> const &task = item.second;
-		if (now - task->timestamp >= (uint64_t)task->timeout) {
-			expired.push_back(task);
+		for (auto const &task : expired) {
+			if (!task || task->upstream_fd == -1 || find_task_by_fd(task->upstream_fd) != task) continue;
+			if (task->op == Operation::FORWARD_TO_UPSTREAM_TCP || task->op == Operation::REPLY_TO_CLIENT_TCP) {
+				dns::Message failure;
+				failure.header.id = task->requester_id;
+				failure.header.flags = 0x8182;
+				dns::Question question;
+				question.name = task->request_name;
+				question.type = task->type;
+				question.clas = task->clas;
+				failure.questions = { question };
+				set_edns0(&failure, task->client_udp_payload);
+				if (dns::Cache *cache = get_cache(task->type)) {
+					cache->insert_failure(task->forward_name, task->type, task->clas, failure);
+				}
+				int client_fd = task->client_fd;
+				ProtocolFamilyType client_proto = task->client_proto;
+				InternalData client = make_client_data(*d, client_proto, client_fd);
+				finish_task(task, false);
+				task->client_fd = -1;
+				if (!send_dns_message(&client, client_proto, failure, false, false)) {
+					delete_socket(client_fd, nullptr);
+				}
+				continue;
+			}
+			finish_task(task);
 		}
-	}
-	for (auto const &task : expired) {
-		if (!task || task->upstream_fd == -1 || find_task_by_fd(task->upstream_fd) != task) continue;
-		if (task->op == Operation::FORWARD_TO_UPSTREAM_TCP || task->op == Operation::REPLY_TO_CLIENT_TCP) {
+	} else if (state_ == CLEAN_EXPIRED_UDP) {
+		std::vector<std::shared_ptr<UdpQuery>> expired_udp_queries;
+		for (auto const &item : m->udp_queries_by_local_txid) {
+			std::shared_ptr<UdpQuery> const &query = item.second;
+			if (query && now - query->timestamp >= (uint64_t)query->timeout) {
+				expired_udp_queries.push_back(query);
+			}
+		}
+		for (std::shared_ptr<UdpQuery> const &query : expired_udp_queries) {
+			// A sibling of this query may already have retired the whole transaction
+			// earlier in this same loop; skip whatever is no longer registered.
+			if (!is_udp_query_active(query)) continue;
 			dns::Message failure;
-			failure.header.id = task->requester_id;
 			failure.header.flags = 0x8182;
 			dns::Question question;
-			question.name = task->request_name;
-			question.type = task->type;
-			question.clas = task->clas;
+			question.name = query->request_name;
+			question.type = query->type;
+			question.clas = query->clas;
 			failure.questions = { question };
-			set_edns0(&failure, task->client_udp_payload);
-			if (dns::Cache *cache = get_cache(task->type)) {
-				cache->insert_failure(task->forward_name, task->type, task->clas, failure);
+			if (dns::Cache *cache = get_cache(query->type)) {
+				cache->insert_failure(query->forward_name, query->type, query->clas, failure);
 			}
-			int client_fd = task->client_fd;
-			ProtocolFamilyType client_proto = task->client_proto;
-			InternalData client = make_client_data(*d, client_proto, client_fd);
-			finish_task(task, false);
-			task->client_fd = -1;
-			if (!send_dns_message(&client, client_proto, failure, false, false)) {
-				delete_socket(client_fd, nullptr);
+			std::vector<PendingQuery::Waiter> waiters = query->pending ? query->pending->waiters : std::vector<PendingQuery::Waiter>();
+			for (PendingQuery::Waiter const &waiter : waiters) {
+				dns::Message sending = failure;
+				sending.header.id = waiter.requester_id;
+				sending.questions.front().name = waiter.request_name;
+				set_edns0(&sending, waiter.udp_payload);
+				InternalData client = *d;
+				if (waiter.proto.is_inet4()) {
+					client.in4_udp.sa4 = waiter.sa4;
+				} else {
+					client.in6_udp.sa6 = waiter.sa6;
+				}
+				send_dns_message(&client, waiter.proto, sending, false, false);
 			}
-			continue;
+			// Retire every sibling of the timed-out transaction, not just this one.
+			finish_udp_transaction(query->local_transaction_id);
 		}
-		finish_task(task);
-	}
-	std::vector<std::shared_ptr<UdpQuery>> expired_udp_queries;
-	for (auto const &item : m->udp_queries_by_local_txid) {
-		std::shared_ptr<UdpQuery> const &query = item.second;
-		if (query && now - query->timestamp >= (uint64_t)query->timeout) {
-			expired_udp_queries.push_back(query);
-		}
-	}
-	for (std::shared_ptr<UdpQuery> const &query : expired_udp_queries) {
-		// A sibling of this query may already have retired the whole transaction
-		// earlier in this same loop; skip whatever is no longer registered.
-		if (!is_udp_query_active(query)) continue;
-		dns::Message failure;
-		failure.header.flags = 0x8182;
-		dns::Question question;
-		question.name = query->request_name;
-		question.type = query->type;
-		question.clas = query->clas;
-		failure.questions = { question };
-		if (dns::Cache *cache = get_cache(query->type)) {
-			cache->insert_failure(query->forward_name, query->type, query->clas, failure);
-		}
-		std::vector<PendingQuery::Waiter> waiters = query->pending ? query->pending->waiters : std::vector<PendingQuery::Waiter>();
-		for (PendingQuery::Waiter const &waiter : waiters) {
-			dns::Message sending = failure;
-			sending.header.id = waiter.requester_id;
-			sending.questions.front().name = waiter.request_name;
-			set_edns0(&sending, waiter.udp_payload);
-			InternalData client = *d;
-			if (waiter.proto.is_inet4()) {
-				client.in4_udp.sa4 = waiter.sa4;
-			} else {
-				client.in6_udp.sa6 = waiter.sa6;
+	} else if (state_ == CLEAN_ACTIVATE_TXIDS) {
+		std::unordered_set<TransactionID> new_set;
+		for (TransactionID const &item : active_txids_) {
+			if (now - item.d->timestamp < m->options.upstream_timeout_ms) {
+				new_set.emplace(item);
 			}
-			send_dns_message(&client, waiter.proto, sending, false, false);
 		}
-		// Retire every sibling of the timed-out transaction, not just this one.
-		finish_udp_transaction(query->local_transaction_id);
+		active_txids_ = std::move(new_set);
+	} else {
+		state_ = 0;
+		return;
 	}
+	state_++;
 }
 
 std::shared_ptr<Behind::Task> Behind::find_task_by_fd(int fd) const
@@ -1627,6 +1690,7 @@ void Behind::finish_task(std::shared_ptr<Task> task, bool close_client)
 		delete_socket(task->client_fd, nullptr);
 		task->client_fd = -1;
 	}
+	release_txid(task->forwarder, task->upstream_id);
 }
 
 void Behind::push_task(std::shared_ptr<Task> task, int timeout, uint32_t epoll_events)
@@ -2201,15 +2265,15 @@ bool Behind::send_dns_message(InternalData *d, ProtocolFamilyType const &proto, 
 	Packet packet = make_dns_packet(msg, tcp, udp_limit);
 	if (!packet) return false;
 
-	auto [sock, client] = sock_and_address(d, proto);
+	auto [upstream_fd, client] = sock_and_address(d, proto);
 	bool ok = false;
 	if (tcp) {
-		if (sock == -1 || forward) return false;
-		std::shared_ptr<Task> task = find_task_by_fd(sock);
+		if (upstream_fd == -1 || forward) return false;
+		std::shared_ptr<Task> task = find_task_by_fd(upstream_fd);
 		if (!task) {
 			if (active_task_count() >= m->options.max_tasks) return false;
 			task = make_task(Operation::WRITING_TO_CLIENT_TCP, next_local_transaction_id());
-			task->upstream_fd = sock;
+			task->upstream_fd = upstream_fd;
 			task->client_proto = proto;
 			task->buffer = std::move(packet.buffer);
 			push_task(task, 3000, EPOLLOUT | EPOLLERR | EPOLLHUP);
@@ -2217,7 +2281,7 @@ bool Behind::send_dns_message(InternalData *d, ProtocolFamilyType const &proto, 
 			task->op = Operation::WRITING_TO_CLIENT_TCP;
 			task->buffer = std::move(packet.buffer);
 			task->send_offset = 0;
-			if (ctl_mod(sock, task->ev.get(), false, true) != 0) return false;
+			if (ctl_mod(upstream_fd, task->ev.get(), false, true) != 0) return false;
 		}
 		ok = true;
 	} else {
@@ -2542,19 +2606,6 @@ std::shared_ptr<Behind::UdpChannel> Behind::get_or_create_udp_channel(Forwarder 
 	return channel;
 }
 
-bool Behind::allocate_udp_upstream_id(int fd, uint16_t *out)
-{
-	if (!out) return false;
-	for (size_t attempt = 0; attempt < 65536; ++attempt) {
-		uint16_t candidate = next_txid();
-		if (!m->udp_queries_by_socket_txid.count(udp_socket_txid_key(fd, candidate))) {
-			*out = candidate;
-			return true;
-		}
-	}
-	return false;
-}
-
 void Behind::init_epoll_event(Behind::Task *task, int fd, uint32_t events)
 {
 	*task->ev = { };
@@ -2562,9 +2613,14 @@ void Behind::init_epoll_event(Behind::Task *task, int fd, uint32_t events)
 	task->ev->data.fd = fd;
 }
 
-void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client_proto,
-	dns::Header const &header, dns::Question const &question, uint16_t client_udp_payload,
-	uint32_t local_transaction_id, Forwarder const &forwarder,
+void Behind::forward_udp(
+	InternalData const &d,
+	ProtocolFamilyType const &client_proto,
+	dns::Header const &header,
+	dns::Question const &question,
+	uint16_t client_udp_payload,
+	uint32_t local_transaction_id,
+	Forwarder const &forwarder,
 	std::shared_ptr<PendingQuery> const &pending)
 {
 	if (active_task_count() >= m->options.max_tasks) {
@@ -2584,7 +2640,9 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 	std::shared_ptr<UdpChannel> channel = get_or_create_udp_channel(forwarder);
 	if (!channel) return;
 	uint16_t upstream_id = 0;
-	if (!allocate_udp_upstream_id(channel->fd, &upstream_id)) {
+	if (auto opt = allocate_txid(forwarder)) {
+		upstream_id = *opt;
+	} else {
 		logprintf(LOG_DEFAULT, "too many active UDP upstream txids on fd=%d\n", channel->fd);
 		return;
 	}
@@ -2622,10 +2680,15 @@ void Behind::forward_udp(InternalData const &d, ProtocolFamilyType const &client
 	}
 }
 
-Behind::ConnectionStatus Behind::forward_tcp(InternalData *d,
-	ProtocolFamilyType const &client_proto, int client_fd, uint16_t client_request_id,
-	dns::Question const &question, uint16_t client_udp_payload,
-	uint32_t local_transaction_id, Forwarder const &forwarder)
+Behind::ConnectionStatus Behind::forward_tcp(
+	InternalData *d,
+	ProtocolFamilyType const &client_proto,
+	int client_fd,
+	uint16_t client_request_id,
+	dns::Question const &question,
+	uint16_t client_udp_payload,
+	uint32_t local_transaction_id,
+	Forwarder const &forwarder)
 {
 	std::shared_ptr<Task> task = make_task(Operation::FORWARD_TO_UPSTREAM_TCP, local_transaction_id);
 
@@ -2644,7 +2707,6 @@ Behind::ConnectionStatus Behind::forward_tcp(InternalData *d,
 	task->client_fd = client_fd;
 	task->requester_id = client_request_id;
 	task->client_udp_payload = client_udp_payload;
-	task->upstream_id = next_txid();
 	task->request_name = question.name;
 	task->forward_name = m->options.case_randomize ? randomize_case(question.name, &m->rng) : question.name;
 	task->type = question.type;
@@ -2652,14 +2714,9 @@ Behind::ConnectionStatus Behind::forward_tcp(InternalData *d,
 	task->client_proto = client_proto;
 	task->forwarder = forwarder;
 
-	task->fwdata->msg.header.id = task->upstream_id;
 	task->fwdata->msg.header.flags = 0x0100;
 	task->fwdata->msg.questions = { question };
 	task->fwdata->msg.questions.front().name = task->forward_name;
-	set_edns0(&task->fwdata->msg, m->options.edns0_buffer_size);
-	Packet upstream_packet = make_dns_packet(task->fwdata->msg, true);
-	if (!upstream_packet) return ConnectionStatus::ERROR;
-	task->buffer = std::move(upstream_packet.buffer);
 	task->send_offset = 0;
 
 	int sock = socket(task->fwdata->forwarder.af_type, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -2667,6 +2724,20 @@ Behind::ConnectionStatus Behind::forward_tcp(InternalData *d,
 		logprintf(LOG_DEFAULT, "socket: %s\n", strerror(errno));
 		return ConnectionStatus::ERROR;
 	}
+	auto opt = allocate_txid(forwarder);
+	if (!opt) {
+		logprintf(LOG_DEFAULT, "too many active upstream txids on fd=%d\n", sock);
+		return ConnectionStatus::ERROR;
+	}
+	task->upstream_id = *opt;
+	task->fwdata->msg.header.id = task->upstream_id;
+	
+	Packet upstream_packet = make_dns_packet(task->fwdata->msg, true);
+	if (!upstream_packet) return ConnectionStatus::ERROR;
+	task->buffer = std::move(upstream_packet.buffer);
+	
+	set_edns0(&task->fwdata->msg, m->options.edns0_buffer_size);
+	
 	ProtocolFamilyType upstream_proto = { task->fwdata->forwarder.af_type, SOCK_STREAM };
 	struct sockaddr_in sa4;
 	struct sockaddr_in6 sa6;
@@ -2889,10 +2960,9 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 {
 	if (process_local_query(d, client_proto, received, q)) return;
 
-	auto SendFailure = [&]() {
-		dns::Message sending;
+	auto SendFailure = [&](char const *file, int line) {
+		auto sending = dns::Message::SERVFAIL(file, line);
 		sending.header.id = received.header.id;
-		sending.header.flags = 0x8182; // SERVFAIL
 		sending.questions = { q };
 		set_edns0(&sending, client_edns_payload(received));
 		send_dns_message(d, client_proto, sending, false, false);
@@ -2904,7 +2974,7 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 
 	if (forwarders.empty()) {
 		logprintf(LOG_DEFAULT, "No forwarder configured.\n");
-		SendFailure();
+		SendFailure(__FILE__, __LINE__);
 		return;
 	}
 
@@ -2922,9 +2992,10 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 	std::string key = pending_query_key(q);
 	auto existing = m->pending_udp.find(key);
 	if (existing != m->pending_udp.end()) {
-		constexpr size_t MAX_WAITERS_PER_QUERY = 64;
+		constexpr size_t MAX_WAITERS_PER_QUERY = 200;
+		// fprintf(stderr, "--- %d\n", (int)existing->second->waiters.size());
 		if (existing->second->waiters.size() >= MAX_WAITERS_PER_QUERY) {
-			SendFailure();
+			SendFailure(__FILE__, __LINE__);
 			return;
 		}
 		existing->second->waiters.push_back(std::move(waiter));
@@ -2942,7 +3013,8 @@ void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client
 	}
 	if (m->udp_queries_by_local_txid.count(local_transaction_id) == 0) {
 		m->pending_udp.erase(key);
-		SendFailure();
+		// fprintf(stderr, "--- %d/%d\n", (int)active_task_count(), (int)m->options.max_tasks);
+		SendFailure(__FILE__, __LINE__);
 	}
 }
 
@@ -3051,9 +3123,8 @@ Behind::ConnectionStatus Behind::process_query_tcp(InternalData *d, ProtocolFami
 	std::vector<Forwarder const *> forwarders = choose_forwarder(q.name, 1);
 	if (forwarders.empty()) {
 		logprintf(LOG_DEFAULT, "No forwarder configured for TCP.\n");
-		dns::Message sending;
+		auto sending = dns::Message::SERVFAIL(__FILE__, __LINE__);
 		sending.header.id = received.header.id;
-		sending.header.flags = 0x8182; // SERVFAIL
 		sending.questions = { q };
 		set_edns0(&sending, client_edns_payload(received));
 		return send_dns_message(&d2, client_proto, sending, false, false) ? ConnectionStatus::CONTINUE : ConnectionStatus::ERROR;
@@ -3214,7 +3285,8 @@ void Behind::process_upstream_udp_channel(InternalData *d, std::shared_ptr<UdpCh
 			question.clas = query->clas;
 			retry.questions = { question };
 			uint16_t retry_id = 0;
-			if (allocate_udp_upstream_id(channel->fd, &retry_id)) {
+			if (auto opt = allocate_txid(channel->forwarder)) {
+				retry_id = *opt;
 				retry.header.id = retry_id;
 				InternalData upstream;
 				if (query->upstream_proto.is_inet4()) {
@@ -3279,9 +3351,8 @@ void Behind::process_receive(InternalData *d, int upstream_fd)
 		return true;
 	};
 	auto QueueServfail = [&]() {
-		dns::Message sending;
+		auto sending = dns::Message::SERVFAIL(__FILE__, __LINE__);
 		sending.header.id = task->requester_id;
-		sending.header.flags = 0x8182; // SERVFAIL
 		dns::Question q;
 		q.name = task->request_name;
 		q.type = task->type;
@@ -3389,9 +3460,8 @@ void Behind::process_receive(InternalData *d, int upstream_fd)
 			return;
 		}
 
-		dns::Message sending;
+		auto sending = dns::Message::SERVFAIL(__FILE__, __LINE__);
 		sending.header.id = received.header.id;
-		sending.header.flags = 0x8182; // SERVFAIL
 		sending.questions = received.questions;
 		set_edns0(&sending, client_edns_payload(received));
 		auto d2 = make_client_data(*d, task->upstream_proto, client_fd);
@@ -3437,7 +3507,12 @@ void Behind::process_receive(InternalData *d, int upstream_fd)
 		uint16_t upstream_rcode = received.header.flags & 0x000f;
 		if ((upstream_rcode == 1 || upstream_rcode == 4) && task->used_edns && task->fwdata) {
 			dns::Message retry = task->fwdata->msg;
-			retry.header.id = next_txid();
+			auto opt = allocate_txid(task->forwarder);
+			if (!opt) {
+				QueueServfail();
+				return;
+			}
+			retry.header.id = *opt;
 			retry.additionals.clear();
 			Packet packet = make_dns_packet(retry, true);
 			if (!packet) {

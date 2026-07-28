@@ -12,6 +12,8 @@
 #include <sys/socket.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <cstring>
+#include <set>
 
 #define STANDARD_DNS_PORT 53
 #define DEFAUT_LISTEN_PORT 5300
@@ -173,6 +175,74 @@ struct Cache;
 struct Message;
 }
 
+static inline uint64_t hash_compose(uint64_t seed, uint64_t value)
+{
+	seed ^= value + 0x9e3779b97f4a7c15 + (seed << 6) + (seed >> 2);
+	return seed;
+}
+
+struct TransactionID {
+	struct D {
+		union {
+			struct {
+				uint16_t af_type;
+				uint8_t addr[16];
+				uint16_t txid;
+				uint8_t reserved[4];
+			} k;
+			uint64_t raw[3] = {};
+		};
+		uint64_t timestamp = 0;
+	};
+	std::shared_ptr<D> d;
+	TransactionID()
+		: d(std::make_shared<D>())
+	{
+	}
+	operator uint16_t() const
+	{
+		return d->k.txid;
+	}
+	int compare(TransactionID const &other) const
+	{
+		return memcmp(&d->raw, &other.d->raw, sizeof(d->raw)); // don't compare timestamps
+	}
+	bool operator==(TransactionID const &other) const
+	{
+		return compare(other) == 0;
+	}
+	bool operator<(TransactionID const &other) const
+	{
+		return compare(other) < 0;
+	}
+	size_t hash() const
+	{
+		uint64_t h;
+		h = ::hash_compose(h, d->raw[0]);
+		h ^= ::hash_compose(h, d->raw[1]);
+		h ^= ::hash_compose(h, d->raw[2]);
+		return h;
+	}
+};
+
+namespace std {
+
+template <> struct equal_to<TransactionID> {
+	bool operator()(TransactionID const &l, TransactionID const &r) const
+	{
+		return l == r;
+	}
+};
+
+template <> struct hash<TransactionID> {
+	size_t operator()(TransactionID const &txid) const
+	{
+		return std::hash<uint16_t>()(txid.d->k.txid);
+	}
+};
+
+} // namespace std
+
 class Behind {
 public:
 	struct InternalData;
@@ -246,6 +316,7 @@ private:
 	static void write_dns_question_rr(std::vector<char> *out, NameMap *namemap, std::string const &name, DNS_TYPE type, DNS_CLASS clas);
 	static bool write_dns_answer_rr(std::vector<char> *out, NameMap *namemap, std::string const &name, dns::Record const &item);
 	static int parse_question_section(char const *begin, char const *end, char const *ptr, dns::Question *out);
+	
 	std::vector<const Forwarder *> choose_forwarder(const std::string &name, size_t max) const;
 	void init_forwarder();
 	void periodic(InternalData *d);
@@ -306,7 +377,8 @@ private:
 	void delete_socket(std::shared_ptr<Task> task);
 	bool accept_dns_type(DNS_TYPE t);
 
-	ConnectionStatus forward_tcp(InternalData *d,
+	ConnectionStatus forward_tcp(
+		InternalData *d,
 		const ProtocolFamilyType &client_proto,
 		int client_fd,
 		uint16_t client_request_id,
@@ -314,7 +386,8 @@ private:
 		uint16_t client_udp_payload,
 		uint32_t local_transaction_id,
 		const Forwarder &forwarder);
-	void forward_udp(const InternalData &d,
+	void forward_udp(
+		const InternalData &d,
 		const ProtocolFamilyType &proto,
 		const dns::Header &header,
 		const dns::Question &q,
@@ -323,17 +396,19 @@ private:
 		const Forwarder &forwarder,
 		std::shared_ptr<PendingQuery> const &pending);
 
+	std::unordered_set<TransactionID> active_txids_;
+	std::optional<TransactionID> allocate_txid(Forwarder const &fw);
+	void release_txid(const Forwarder &forwarder, int upstream_id);
+	
 	std::vector<char> read(InternalData *d, const ProtocolFamilyType &proto);
 	dns::Cache *get_cache(DNS_TYPE type);
 	bool process_local_query(InternalData *d, const ProtocolFamilyType &client_proto, const dns::Message &received, const dns::Question &q);
 	void process_query_udp(InternalData *d, const ProtocolFamilyType &proto, const dns::Message &received, const dns::Question &question);
 	ConnectionStatus process_query_tcp(InternalData *d, const ProtocolFamilyType &client_proto, int client_fd, const dns::Message &received, const dns::Question &q);
-	uint16_t next_txid();
 	std::shared_ptr<UdpChannel> find_udp_channel(const Forwarder &forwarder) const;
 	std::shared_ptr<UdpChannel> find_udp_channel_by_fd(int fd) const;
 	std::shared_ptr<UdpChannel> choose_udp_channel(const Forwarder &forwarder) const;
 	std::shared_ptr<UdpChannel> get_or_create_udp_channel(const Forwarder &forwarder);
-	bool allocate_udp_upstream_id(int fd, uint16_t *out);
 	bool is_matching_udp_response(std::shared_ptr<UdpQuery> const &query, const dns::Message &received) const;
 	bool is_cacheable_udp_response(std::shared_ptr<UdpQuery> const &query, const dns::Message &received) const;
 	void process_upstream_udp_channel(InternalData *d, std::shared_ptr<UdpChannel> const &channel);

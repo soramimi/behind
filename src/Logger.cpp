@@ -64,12 +64,26 @@ Logger::time_point_t Logger::now()
 	return std::chrono::system_clock::now();
 }
 
+static size_t safe_write(int fd, char const *ptr, size_t len)
+{
+	size_t total = 0;
+	while (total < len) {
+		ssize_t n = ::write(fd, ptr + total, len - total);
+		if (n < 0) {
+			if (errno == EINTR) continue;
+			break;
+		}
+		total += (size_t)n;
+	}
+	return total;
+}
+
 void Logger::write(char const *ptr, size_t len)
 {
 	if (m->fd_log != -1) {
-		::write(m->fd_log, ptr, len);
+		safe_write(m->fd_log, ptr, len);
 	} else {
-		::write(fileno(stderr), ptr, len);
+		safe_write(fileno(stderr), ptr, len);
 	}
 }
 
@@ -120,14 +134,31 @@ void Logger::rotate()
 		dst = src;
 	}
 
-	int fd_dst = ::open(dst.c_str(), O_WRONLY | O_CREAT | O_TRUNC, log_file_permission());
+	int fd_dst = ::open(dst.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, log_file_permission());
 	if (fd_dst != -1) {
 		lseek(m->fd_log, 0, SEEK_SET);
-		while (1) {
+		bool copy_ok = true;
+		while (copy_ok) {
 			char buf[4096];
-			int n = read(m->fd_log, buf, sizeof(buf));
-			if (n < 1) break;
-			if (::write(fd_dst, buf, n) != n) break;
+			ssize_t n = read(m->fd_log, buf, sizeof(buf));
+			if (n == 0) break;
+			if (n < 0) {
+				if (errno == EINTR) continue;
+				copy_ok = false;
+				break;
+			}
+			char *out = buf;
+			ssize_t remaining = n;
+			while (remaining > 0) {
+				ssize_t w = ::write(fd_dst, out, remaining);
+				if (w < 0) {
+					if (errno == EINTR) continue;
+					copy_ok = false;
+					break;
+				}
+				out += w;
+				remaining -= w;
+			}
 		}
 		::close(fd_dst);
 	}
@@ -143,7 +174,15 @@ void Logger::x_open(std::string const &log_file)
 		m->fd_log = -1;
 	}
 	m->log_file = log_file;
-	m->fd_log = ::open(m->log_file.c_str(), O_RDWR | O_CREAT | O_APPEND, log_file_permission());
+	m->fd_log = ::open(m->log_file.c_str(), O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC, log_file_permission());
+	if (m->fd_log != -1) {
+		struct stat st = { };
+		if (fstat(m->fd_log, &st) != 0 || !S_ISREG(st.st_mode)) {
+			fprintf(stderr, "log path is not a regular file: %s\n", m->log_file.c_str());
+			close(m->fd_log);
+			m->fd_log = -1;
+		}
+	}
 	if (m->fd_log == -1) {
 		fprintf(stderr, "failed to open log file: %s\n", m->log_file.c_str());
 	}

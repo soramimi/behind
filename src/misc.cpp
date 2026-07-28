@@ -68,7 +68,7 @@ std::string_view misc::trimmed(std::string_view const &sv)
 		left++;
 	while (left < right && isspace((unsigned char)right[-1]))
 		right--;
-	return { left, right - left };
+	return { left, size_t(right - left) };
 }
 
 std::vector<std::string_view> misc::split(char const *begin, char const *end)

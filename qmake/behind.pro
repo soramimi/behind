@@ -9,6 +9,8 @@ INCLUDEPATH += $$PWD/../src
 
 gcc:QMAKE_CXXFLAGS += -Wall -Wextra -Werror=return-type -Werror=trigraphs -Wno-switch -Wno-reorder -Wno-unused-parameter -Wno-unused-parameter
 
+LIBS += -ljemalloc
+
 SOURCES += \
     ../src/Behind.cpp \
     ../src/ChaCha20.cpp \
