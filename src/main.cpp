@@ -3,7 +3,6 @@
 #include "ConfigParser.h"
 #include "Logger.h"
 #include "misc.h"
-#include "network.h"
 #include "rwfile.h"
 #include <atomic>
 #include <cerrno>

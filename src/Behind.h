@@ -2,18 +2,17 @@
 #define BEHIND_H
 
 #include "DomainFilter.h"
-#include "RandomNumberGenerator.h"
 #include "inetresolver.h"
+#include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unordered_map>
 #include <unordered_set>
-#include <cstring>
-#include <set>
 
 #define STANDARD_DNS_PORT 53
 #define DEFAUT_LISTEN_PORT 5300
@@ -175,7 +174,7 @@ struct Cache;
 struct Message;
 }
 
-static inline uint64_t hash_compose(uint64_t seed, uint64_t value)
+static inline uint64_t hash_combine(uint64_t seed, uint64_t value)
 {
 	seed ^= value + 0x9e3779b97f4a7c15 + (seed << 6) + (seed >> 2);
 	return seed;
@@ -218,9 +217,9 @@ struct TransactionID {
 	size_t hash() const
 	{
 		uint64_t h;
-		h = ::hash_compose(h, d->raw[0]);
-		h ^= ::hash_compose(h, d->raw[1]);
-		h ^= ::hash_compose(h, d->raw[2]);
+		h = ::hash_combine(h, d->raw[0]);
+		h ^= ::hash_combine(h, d->raw[1]);
+		h ^= ::hash_combine(h, d->raw[2]);
 		return h;
 	}
 };
@@ -365,7 +364,9 @@ private:
 	void process_tcp(InternalData *d, sa_family_t family);
 
 	bool init_socket(void *private_in, ProtocolFamilyType proto);
-
+	
+	std::string randomize_case(std::string qname);
+	
 	const InetResolver::Addr *find_host(std::string const &name);
 	std::string find_host_name_by_addr(InetResolver::Addr const &addr) const;
 	void initialize_hosts();
@@ -376,6 +377,7 @@ private:
 	void delete_socket(int fd, struct epoll_event *e);
 	void delete_socket(std::shared_ptr<Task> task);
 	bool accept_dns_type(DNS_TYPE t);
+	
 
 	ConnectionStatus forward_tcp(
 		InternalData *d,
@@ -426,7 +428,7 @@ private:
 	void update_hosts_files(bool force);
 	bool is_client_allowed(sa_family_t family, const void *address) const;
 	bool consume_rate_limit(sa_family_t family, const void *address);
-
+	
 public:
 	static bool validate_options(Options const &opts, std::string *error = nullptr);
 	static bool validate_runtime_inputs(Options *opts, std::string const &working_directory, std::string *error = nullptr);

@@ -1,7 +1,7 @@
 #include "Behind.h"
+#include "ChaCha20.h"
 #include "LineReader.h"
 #include "Logger.h"
-#include "RandomNumberGenerator.h"
 #include "misc.h"
 #include "rwfile.h"
 #include <algorithm>
@@ -50,25 +50,7 @@ static inline uint32_t ntohl_p(void const *p)
 	return ntohl(v);
 }
 
-std::string randomize_case(std::string qname, RandomNumberGenerator *rng)
-{
-	uint32_t bits = 0;
-	int remaining = 0;
-	for (size_t i = 0; i < qname.size(); i++) {
-		if (isalpha((unsigned char)qname[i])) {
-			if (remaining == 0) {
-				bits = rng->next_u32();
-				remaining = 32;
-			}
-			if (bits & 1) {
-				qname[i] ^= 0x20;
-			}
-			bits >>= 1;
-			remaining--;
-		}
-	}
-	return qname;
-}
+
 
 std::string addr_to_string(int family, struct sockaddr *addr)
 {
@@ -711,8 +693,8 @@ std::string client_key(sa_family_t family, void const *address)
 
 struct Behind::Private {
 	Options options;
-
-	RandomNumberGenerator rng;
+	
+	ChaCha20 rng;
 
 	uint64_t start_time = 0;
 	uint64_t last_uptime_min = 0;
@@ -1553,7 +1535,7 @@ void Behind::clean(InternalData *d)
 		CLEAN_PAUSED_LISTENDERS,
 		CLEAN_EXPIRED_TCP,
 		CLEAN_EXPIRED_UDP,
-		CLEAN_ACTIVATE_TXIDS,
+		CLEAN_ACTIVE_TXIDS,
 	};
 	static int state_ = 0;
 	
@@ -1650,7 +1632,7 @@ void Behind::clean(InternalData *d)
 			// Retire every sibling of the timed-out transaction, not just this one.
 			finish_udp_transaction(query->local_transaction_id);
 		}
-	} else if (state_ == CLEAN_ACTIVATE_TXIDS) {
+	} else if (state_ == CLEAN_ACTIVE_TXIDS) {
 		std::unordered_set<TransactionID> new_set;
 		for (TransactionID const &item : active_txids_) {
 			if (now - item.d->timestamp < m->options.upstream_timeout_ms) {
@@ -2613,6 +2595,26 @@ void Behind::init_epoll_event(Behind::Task *task, int fd, uint32_t events)
 	task->ev->data.fd = fd;
 }
 
+std::string Behind::randomize_case(std::string qname)
+{
+	uint32_t bits = 0;
+	int remaining = 0;
+	for (size_t i = 0; i < qname.size(); i++) {
+		if (isalpha((unsigned char)qname[i])) {
+			if (remaining == 0) {
+				bits = m->rng.next_u32();
+				remaining = 32;
+			}
+			if (bits & 1) {
+				qname[i] ^= 0x20;
+			}
+			bits >>= 1;
+			remaining--;
+		}
+	}
+	return qname;
+}
+
 void Behind::forward_udp(
 	InternalData const &d,
 	ProtocolFamilyType const &client_proto,
@@ -2630,7 +2632,7 @@ void Behind::forward_udp(
 
 	std::string query_name = question.name;
 	if (m->options.case_randomize) {
-		query_name = randomize_case(query_name, &m->rng);
+		query_name = randomize_case(query_name);
 	}
 
 	dns::Message sending;
@@ -2708,7 +2710,7 @@ Behind::ConnectionStatus Behind::forward_tcp(
 	task->requester_id = client_request_id;
 	task->client_udp_payload = client_udp_payload;
 	task->request_name = question.name;
-	task->forward_name = m->options.case_randomize ? randomize_case(question.name, &m->rng) : question.name;
+	task->forward_name = m->options.case_randomize ? randomize_case(question.name) : question.name;
 	task->type = question.type;
 	task->clas = question.clas;
 	task->client_proto = client_proto;
@@ -3540,15 +3542,15 @@ void Behind::process_receive(InternalData *d, int upstream_fd)
 		for (dns::Question &question : sending.questions) {
 			question.name = AmendName(question.name);
 		}
-		for (dns::Record &answer : sending.answers) {
-			answer.name = AmendName(answer.name);
-			if (answer.type == DNS_TYPE::CNAME && answer.cname()) {
-				answer.cname()->cname = AmendName(answer.cname()->cname);
-			} else if (answer.type == DNS_TYPE::SOA && answer.soa()) {
-				answer.soa()->nname = AmendName(answer.soa()->nname);
-				answer.soa()->rname = AmendName(answer.soa()->rname);
-			} else if (answer.type == DNS_TYPE::HTTPS && answer.https()) {
-				answer.https()->name = AmendName(answer.https()->name);
+		for (dns::Record &a : sending.answers) {
+			a.name = AmendName(a.name);
+			if (a.type == DNS_TYPE::CNAME && a.cname()) {
+				a.cname()->cname = AmendName(a.cname()->cname);
+			} else if (a.type == DNS_TYPE::SOA && a.soa()) {
+				a.soa()->nname = AmendName(a.soa()->nname);
+				a.soa()->rname = AmendName(a.soa()->rname);
+			} else if (a.type == DNS_TYPE::HTTPS && a.https()) {
+				a.https()->name = AmendName(a.https()->name);
 			}
 		}
 		set_edns0(&sending, task->client_udp_payload);

@@ -18,11 +18,9 @@ SOURCES += \
     ../src/DomainFilter.cpp \
     ../src/LineReader.cpp \
     ../src/Logger.cpp \
-    ../src/RandomNumberGenerator.cpp \
     ../src/inetresolver.cpp \
     ../src/main.cpp \
     ../src/misc.cpp \
-    ../src/network.cpp \
     ../src/rwfile.cpp
 
 HEADERS += \
@@ -32,10 +30,8 @@ HEADERS += \
     ../src/DomainFilter.h \
     ../src/LineReader.h \
     ../src/Logger.h \
-    ../src/RandomNumberGenerator.h \
     ../src/inetresolver.h \
     ../src/misc.h \
-    ../src/network.h \
     ../src/rwfile.h
 
 DISTFILES += \
