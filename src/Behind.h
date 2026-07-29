@@ -189,7 +189,7 @@ struct TransactionID {
 				uint16_t txid;
 				uint8_t reserved[4];
 			} k;
-			uint64_t raw[3] = {};
+			uint64_t raw[3] = { };
 		};
 		uint64_t timestamp = 0;
 	};
@@ -216,27 +216,29 @@ struct TransactionID {
 	}
 	size_t hash() const
 	{
-		uint64_t h;
-		h = ::hash_combine(h, d->raw[0]);
-		h ^= ::hash_combine(h, d->raw[1]);
-		h ^= ::hash_combine(h, d->raw[2]);
+		uint64_t h = 0;
+		for (int i = 0; i < 3; i++) {
+			h ^= ::hash_combine(h, d->raw[i]);
+		}
 		return h;
 	}
 };
 
 namespace std {
 
-template <> struct equal_to<TransactionID> {
+template <>
+struct equal_to<TransactionID> {
 	bool operator()(TransactionID const &l, TransactionID const &r) const
 	{
 		return l == r;
 	}
 };
 
-template <> struct hash<TransactionID> {
+template <>
+struct hash<TransactionID> {
 	size_t operator()(TransactionID const &txid) const
 	{
-		return std::hash<uint16_t>()(txid.d->k.txid);
+		return txid.hash();
 	}
 };
 
@@ -315,7 +317,7 @@ private:
 	static void write_dns_question_rr(std::vector<char> *out, NameMap *namemap, std::string const &name, DNS_TYPE type, DNS_CLASS clas);
 	static bool write_dns_answer_rr(std::vector<char> *out, NameMap *namemap, std::string const &name, dns::Record const &item);
 	static int parse_question_section(char const *begin, char const *end, char const *ptr, dns::Question *out);
-	
+
 	std::vector<const Forwarder *> choose_forwarder(const std::string &name, size_t max) const;
 	void init_forwarder();
 	void periodic(InternalData *d);
@@ -364,9 +366,9 @@ private:
 	void process_tcp(InternalData *d, sa_family_t family);
 
 	bool init_socket(void *private_in, ProtocolFamilyType proto);
-	
+
 	std::string randomize_case(std::string qname);
-	
+
 	const InetResolver::Addr *find_host(std::string const &name);
 	std::string find_host_name_by_addr(InetResolver::Addr const &addr) const;
 	void initialize_hosts();
@@ -377,7 +379,6 @@ private:
 	void delete_socket(int fd, struct epoll_event *e);
 	void delete_socket(std::shared_ptr<Task> task);
 	bool accept_dns_type(DNS_TYPE t);
-	
 
 	ConnectionStatus forward_tcp(
 		InternalData *d,
@@ -401,7 +402,7 @@ private:
 	std::unordered_set<TransactionID> active_txids_;
 	std::optional<TransactionID> allocate_txid(Forwarder const &fw);
 	void release_txid(const Forwarder &forwarder, int upstream_id);
-	
+
 	std::vector<char> read(InternalData *d, const ProtocolFamilyType &proto);
 	dns::Cache *get_cache(DNS_TYPE type);
 	bool process_local_query(InternalData *d, const ProtocolFamilyType &client_proto, const dns::Message &received, const dns::Question &q);
@@ -428,7 +429,7 @@ private:
 	void update_hosts_files(bool force);
 	bool is_client_allowed(sa_family_t family, const void *address) const;
 	bool consume_rate_limit(sa_family_t family, const void *address);
-	
+
 public:
 	static bool validate_options(Options const &opts, std::string *error = nullptr);
 	static bool validate_runtime_inputs(Options *opts, std::string const &working_directory, std::string *error = nullptr);

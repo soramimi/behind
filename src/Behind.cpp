@@ -50,8 +50,6 @@ static inline uint32_t ntohl_p(void const *p)
 	return ntohl(v);
 }
 
-
-
 std::string addr_to_string(int family, struct sockaddr *addr)
 {
 	char buf[INET6_ADDRSTRLEN];
@@ -285,7 +283,7 @@ struct Message {
 	std::vector<Record> answers;
 	std::vector<Record> authorities;
 	std::vector<Record> additionals;
-	
+
 	static Message SERVFAIL(char const *file, int line)
 	{
 		(void)file;
@@ -625,6 +623,7 @@ struct RateBucket {
 	double tokens = 0;
 	uint64_t updated = 0;
 	uint64_t last_seen = 0;
+	uint64_t last_limited_log = 0;
 };
 
 uint64_t udp_socket_txid_key(int fd, uint16_t txid)
@@ -693,7 +692,7 @@ std::string client_key(sa_family_t family, void const *address)
 
 struct Behind::Private {
 	Options options;
-	
+
 	ChaCha20 rng;
 
 	uint64_t start_time = 0;
@@ -739,6 +738,7 @@ struct Behind::Private {
 	std::unordered_map<std::string, RateBucket> client_rates;
 	uint64_t last_rate_cleanup = 0;
 	std::unordered_map<int, uint64_t> paused_listeners;
+	int clean_state = 0;
 };
 
 const InetResolver::Addr *Hosts::find(const std::string &name) const
@@ -1223,7 +1223,7 @@ std::optional<TransactionID> Behind::allocate_txid(Forwarder const &fw)
 		item.d->k.txid = m->rng.next_u32() & 0xffff;
 		auto it = active_txids_.find(item);
 		if (it == active_txids_.end()) {
-			active_txids_.insert({item});
+			active_txids_.insert({ item });
 			logprintf(LOG_DEFAULT, "(debug) transaction tracking [+] n=%d\n", active_txids_.size());
 			return item;
 		}
@@ -1532,15 +1532,14 @@ void Behind::periodic(InternalData *d)
 void Behind::clean(InternalData *d)
 {
 	enum State {
-		CLEAN_PAUSED_LISTENDERS,
+		CLEAN_PAUSED_LISTENERS,
 		CLEAN_EXPIRED_TCP,
 		CLEAN_EXPIRED_UDP,
 		CLEAN_ACTIVE_TXIDS,
 	};
-	static int state_ = 0;
-	
+
 	uint64_t now = misc::get_tick_count();
-	if (state_ == CLEAN_PAUSED_LISTENDERS) {
+	if (m->clean_state == CLEAN_PAUSED_LISTENERS) {
 		for (auto it = m->paused_listeners.begin(); it != m->paused_listeners.end();) {
 			if (now < it->second) {
 				it++;
@@ -1558,7 +1557,7 @@ void Behind::clean(InternalData *d)
 				it++;
 			}
 		}
-	} else if (state_ == CLEAN_EXPIRED_TCP) {
+	} else if (m->clean_state == CLEAN_EXPIRED_TCP) {
 		std::vector<std::shared_ptr<Task>> expired;
 		for (auto const &item : m->tasks_by_fd) {
 			std::shared_ptr<Task> const &task = item.second;
@@ -1593,7 +1592,7 @@ void Behind::clean(InternalData *d)
 			}
 			finish_task(task);
 		}
-	} else if (state_ == CLEAN_EXPIRED_UDP) {
+	} else if (m->clean_state == CLEAN_EXPIRED_UDP) {
 		std::vector<std::shared_ptr<UdpQuery>> expired_udp_queries;
 		for (auto const &item : m->udp_queries_by_local_txid) {
 			std::shared_ptr<UdpQuery> const &query = item.second;
@@ -1632,7 +1631,7 @@ void Behind::clean(InternalData *d)
 			// Retire every sibling of the timed-out transaction, not just this one.
 			finish_udp_transaction(query->local_transaction_id);
 		}
-	} else if (state_ == CLEAN_ACTIVE_TXIDS) {
+	} else if (m->clean_state == CLEAN_ACTIVE_TXIDS) {
 		std::unordered_set<TransactionID> new_set;
 		for (TransactionID const &item : active_txids_) {
 			if (now - item.d->timestamp < m->options.upstream_timeout_ms) {
@@ -1641,10 +1640,10 @@ void Behind::clean(InternalData *d)
 		}
 		active_txids_ = std::move(new_set);
 	} else {
-		state_ = 0;
+		m->clean_state = 0;
 		return;
 	}
-	state_++;
+	m->clean_state++;
 }
 
 std::shared_ptr<Behind::Task> Behind::find_task_by_fd(int fd) const
@@ -1964,7 +1963,13 @@ bool Behind::consume_rate_limit(sa_family_t family, void const *address)
 		bucket->last_seen = now;
 	};
 	Refill(&m->global_rate);
-	if (m->global_rate.tokens < 1.0) return false;
+	if (m->global_rate.tokens < 1.0) {
+		if (now - m->global_rate.last_limited_log >= 60000) {
+			m->global_rate.last_limited_log = now;
+			logprintf(LOG_DEFAULT, "global rate limit reached: dropping query from %s\n", key.c_str());
+		}
+		return false;
+	}
 
 	const size_t maximum_clients = std::max<size_t>(1024, m->options.max_tasks * 4);
 	if (m->client_rates.size() >= maximum_clients && !m->client_rates.count(key)) {
@@ -1988,7 +1993,13 @@ bool Behind::consume_rate_limit(sa_family_t family, void const *address)
 		client.updated = now;
 	}
 	Refill(&client);
-	if (client.tokens < 1.0) return false;
+	if (client.tokens < 1.0) {
+		if (now - client.last_limited_log >= 60000) {
+			client.last_limited_log = now;
+			logprintf(LOG_DEFAULT, "per-client rate limit reached: dropping query from %s\n", key.c_str());
+		}
+		return false;
+	}
 	m->global_rate.tokens -= 1.0;
 	client.tokens -= 1.0;
 	return true;
@@ -2428,35 +2439,6 @@ std::vector<char> Behind::read(InternalData *d, ProtocolFamilyType const &proto)
 		if (len > 0 && !(message.msg_flags & MSG_TRUNC) && (size_t)len <= datagram.size()) {
 			return std::vector<char>(datagram.data(), datagram.data() + len);
 		}
-	} else if (proto.is_stream()) {
-		int sock = INVALID_SOCKET;
-		if (proto.is_inet4()) {
-			sock = d->in4_tcp.fd;
-		} else if (proto.is_inet6()) {
-			sock = d->in6_tcp.fd;
-		} else {
-			return { };
-		}
-		uint16_t len;
-		if (::read(sock, &len, 2) == 2) {
-			len = ntohs(len);
-			const size_t MAX_TCP_DNS_LEN = 65535;
-			if (len >= 12 && len <= MAX_TCP_DNS_LEN) {
-				buf.resize(len);
-				size_t pos = 0;
-				while (pos < len) {
-					ssize_t n = ::read(sock, buf.data() + pos, len - pos);
-					if (n > 0) {
-						pos += n;
-					} else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-						return { };
-					} else {
-						return { }; // partial read
-					}
-				}
-				return buf;
-			}
-		}
 	}
 	return { };
 }
@@ -2733,13 +2715,13 @@ Behind::ConnectionStatus Behind::forward_tcp(
 	}
 	task->upstream_id = *opt;
 	task->fwdata->msg.header.id = task->upstream_id;
-	
+
 	Packet upstream_packet = make_dns_packet(task->fwdata->msg, true);
 	if (!upstream_packet) return ConnectionStatus::ERROR;
 	task->buffer = std::move(upstream_packet.buffer);
-	
+
 	set_edns0(&task->fwdata->msg, m->options.edns0_buffer_size);
-	
+
 	ProtocolFamilyType upstream_proto = { task->fwdata->forwarder.af_type, SOCK_STREAM };
 	struct sockaddr_in sa4;
 	struct sockaddr_in6 sa6;
