@@ -17,16 +17,23 @@ std::string unquote(std::string s);
 std::string strtolower(std::string_view const &s);
 
 std::string_view trimmed(std::string_view const &sv);
+
 std::vector<std::string_view> split(char const *begin, char const *end);
 static inline std::vector<std::string_view> split(std::string_view const &s)
 {
 	return split(s.data(), s.data() + s.size());
 }
 
+std::vector<std::string_view> split_lines(char const *begin, char const *end);
+static inline std::vector<std::string_view> split_lines(std::string_view const &s)
+{
+	return split_lines(s.data(), s.data() + s.size());
+}
+
 std::string realpath(char const *path);
 std::string realpath(std::string const &path);
 
-size_t parse_int(char const *p, int *out);
+size_t parse_int(const std::string_view &s, int *out);
 
 bool is_valid_domain(std::string_view const &s);
 

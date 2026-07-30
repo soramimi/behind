@@ -8,12 +8,10 @@ SRCS := \
     ../src/DomainFilter.cpp \
     ../src/LineReader.cpp \
     ../src/Logger.cpp \
-    ../src/RandomNumberGenerator.cpp \
     ../src/ChaCha20.cpp \
     ../src/inetresolver.cpp \
     ../src/main.cpp \
     ../src/misc.cpp \
-    ../src/network.cpp \
     ../src/rwfile.cpp
 LIBS := 
 

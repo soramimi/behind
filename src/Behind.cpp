@@ -287,7 +287,7 @@ struct Message {
 	static Message SERVFAIL(char const *file, int line)
 	{
 		(void)file;
-		logprintf(LOG_STDERR, "--- (debug) servfail: line=%d\n", line);
+		// logprintf(LOG_STDERR, "--- (debug) servfail: line=%d\n", line);
 		Message response;
 		response.header.flags = 0x8182; // SERVFAIL
 		return response;
@@ -843,11 +843,6 @@ Behind::Behind(const Options &opts)
 Behind::~Behind()
 {
 	delete m;
-}
-
-inline bool Behind::eqi(const std::string &l, const std::string &r)
-{
-	return stricmp(l.c_str(), r.c_str()) == 0;
 }
 
 inline uint16_t Behind::listen_port() const
@@ -1432,20 +1427,78 @@ void Behind::delete_socket(std::shared_ptr<Task> task)
 	}
 }
 
-void Behind::uptime()
+void Behind::uptime(bool force)
 {
 	uint64_t now = misc::get_tick_count();
 	uint64_t uptime_ms = now - m->start_time;
 	uint64_t uptime_sec = uptime_ms / 1000;
 	uint64_t uptime_min = uptime_sec / 60;
 
-	if (uptime_min != m->last_uptime_min) {
+	if (force || uptime_min != m->last_uptime_min) {
 		m->last_uptime_min = uptime_min;
-		int days = int(uptime_min / (60 * 24));
-		int minutes = int(uptime_min % (60 * 24));
-		int hours = minutes / 60;
-		minutes %= 60;
-		logprintf(LOG_DEFAULT, "(info) uptime: %d days %d:%02d\n", days, hours, minutes);
+		
+		{
+			int days = int(uptime_min / (60 * 24));
+			int minutes = int(uptime_min % (60 * 24));
+			int hours = minutes / 60;
+			minutes %= 60;
+			logprintf(LOG_DEFAULT, "(info) uptime: %d days %d:%02d\n", days, hours, minutes);
+		}
+		
+		{
+			bool error = false;
+			int mem_total = 0;
+			int vm_size = 0;
+			
+			auto ReadFile = [&](char const *path, std::function<void (std::string_view key, std::string_view value)> callback) {
+				std::vector<char> buf;
+				if (readfile(path, &buf, 10000)) {
+					std::vector<std::string_view> lines = misc::split_lines({ buf.data(), buf.size() });
+					for (std::string_view line : lines) {
+						auto i = line.find(':');
+						if (i != std::string_view::npos) {
+							std::string_view key = line.substr(0, i);
+							std::string_view value = misc::trimmed(line.substr(i + 1));
+							callback(key, value);
+						}
+					}
+				} else {
+					logprintf(LOG_DEFAULT, "(error) failed to read %s\n", path);
+					error = true;
+				}
+			};
+			{
+				ReadFile("/proc/meminfo", [&](std::string_view key, std::string_view value){
+					if (key == "MemTotal") {
+						int v = 0;
+						if (misc::parse_int(value, &v) > 0) {
+							mem_total = v;
+						}
+					}
+				});
+			}
+			{
+				pid_t pid = getpid();
+				char path[100];
+				snprintf(path, sizeof(path), "/proc/%d/status", (int)pid);
+				
+				ReadFile(path, [&](std::string_view key, std::string_view value){
+					if (key == "VmSize") {
+						int v = 0;
+						if (misc::parse_int(value, &v) > 0) {
+							vm_size = v;
+						}
+					}
+				});
+			}
+			if (!error) {
+				float usage_percent = 0;
+				if (mem_total > 0) {
+					usage_percent = (vm_size * 100.0f) / mem_total;
+				}
+				logprintf(LOG_DEFAULT, "(info) memory: VmSize %d kB, MemTotal %d kB, usage %.1f%%\n", vm_size, mem_total, usage_percent);
+			}
+		}
 	}
 }
 
@@ -1519,13 +1572,16 @@ void Behind::finish_udp_transaction(uint32_t local_transaction_id)
 // datagram at low concurrency. Timeout granularity is bounded by the loop's
 // interval_ms anyway, so running them at most every MAINTENANCE_INTERVAL_MS
 // keeps the same behaviour and removes a full hash-table walk per query.
-void Behind::periodic(InternalData *d)
+void Behind::periodic(InternalData *d, bool force)
 {
-	constexpr uint64_t MAINTENANCE_INTERVAL_MS = 100;
 	uint64_t now = misc::get_tick_count();
-	if (now - m->last_maintenance < MAINTENANCE_INTERVAL_MS) return;
+	if (!force) {
+		constexpr uint64_t MAINTENANCE_INTERVAL_MS = 100;
+		if (now - m->last_maintenance < MAINTENANCE_INTERVAL_MS) return;
+	}
 	m->last_maintenance = now;
-	uptime();
+	
+	uptime(false);
 	clean(d);
 }
 
@@ -1537,7 +1593,7 @@ void Behind::clean(InternalData *d)
 		CLEAN_EXPIRED_UDP,
 		CLEAN_ACTIVE_TXIDS,
 	};
-
+	
 	uint64_t now = misc::get_tick_count();
 	if (m->clean_state == CLEAN_PAUSED_LISTENERS) {
 		for (auto it = m->paused_listeners.begin(); it != m->paused_listeners.end();) {
@@ -4040,6 +4096,7 @@ bool Behind::main(std::function<bool(bool)> const &reload_requested)
 	}
 
 	m->start_time = misc::get_tick_count();
+	
 
 	InternalData d;
 	bool socket_ok = true;
@@ -4066,7 +4123,10 @@ bool Behind::main(std::function<bool(bool)> const &reload_requested)
 		CloseIfOpen(d.in6_tcp.listener_fd);
 		return false;
 	}
-
+	
+	uptime(true);
+	
+	// m->socket_mode = SocketMode::SELECT;
 	m->socket_mode = SocketMode::EPOLL;
 
 	const int interval_ms = 100;
@@ -4116,8 +4176,8 @@ bool Behind::main(std::function<bool(bool)> const &reload_requested)
 			timeval tv;
 			tv.tv_sec = 0;
 			tv.tv_usec = interval_ms * 1000;
-			int selected = select(maxfd + 1, &infds, &outfds, nullptr, &tv);
-			if (selected < 0) {
+			const int n = select(maxfd + 1, &infds, &outfds, nullptr, &tv);
+			if (n < 0) {
 				if (errno == EINTR) continue;
 				logprintf(LOG_BOTH, "select: %s\n", strerror(errno));
 				run_ok = false;
@@ -4157,7 +4217,8 @@ bool Behind::main(std::function<bool(bool)> const &reload_requested)
 					process_receive(&d, fd);
 				}
 			}
-			periodic(&d);
+			bool force = (n == 0);
+			periodic(&d, force);
 
 			if (sigint_caught.load(std::memory_order_relaxed)) break;
 			if (ShouldStopForReload()) break;
@@ -4230,7 +4291,8 @@ bool Behind::main(std::function<bool(bool)> const &reload_requested)
 					}
 				}
 				try {
-					periodic(&d);
+					bool force = (n == 0);
+					periodic(&d, force);
 				} catch (std::exception const &e) {
 					logprintf(LOG_BOTH, "periodic maintenance failed: %s\n", e.what());
 				} catch (...) {

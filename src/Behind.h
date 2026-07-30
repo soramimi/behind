@@ -272,7 +272,6 @@ private:
 	};
 
 private:
-	static inline bool eqi(std::string const &l, std::string const &r);
 	uint16_t listen_port() const;
 	int cache_min_ttl() const
 	{
@@ -320,7 +319,7 @@ private:
 
 	std::vector<const Forwarder *> choose_forwarder(const std::string &name, size_t max) const;
 	void init_forwarder();
-	void periodic(InternalData *d);
+	void periodic(InternalData *d, bool force);
 	void clean(InternalData *d);
 	size_t active_task_count() const;
 	void push_task(std::shared_ptr<Task> task, int timeout, uint32_t epoll_events);
@@ -423,7 +422,7 @@ private:
 	bool reply_from_cache(InternalData *d, const ProtocolFamilyType &client_proto, const dns::Header &header, const dns::Question &q, uint16_t client_udp_payload);
 	std::shared_ptr<Task> make_task(Operation op, uint32_t local_transaction_id);
 	void init_epoll_event(Task *task, int fd, uint32_t events);
-	void uptime();
+	void uptime(bool force);
 	void drop_aa_flag(dns::Message *msg);
 	Hosts load_hosts_file(const std::string &suffix, const std::string &path);
 	void update_hosts_files(bool force);

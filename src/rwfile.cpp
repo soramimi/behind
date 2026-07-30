@@ -25,23 +25,35 @@ bool readfile(char const *path, std::vector<char> *out, int maxsize)
 	if (fd != -1) {
 		struct stat st;
 		if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
-			if (maxsize < 0 || st.st_size <= maxsize) {
+			decltype(st.st_size) size = st.st_size;
+			if (size == 0 && maxsize > 0) {
+				size = maxsize;
+			}
+			if (maxsize < 0 || size <= maxsize) {
 				ok = true;
-				out->resize(st.st_size);
+				out->resize(size);
 				int pos = 0;
-				while (pos < st.st_size) {
-					int n = st.st_size - pos;
+				while (pos < size) {
+					int n = size - pos;
 					if (n > 65536) {
 						n = 65536;
 					}
 					ssize_t r = read(fd, &out->at(pos), n);
 					if (r < 0 && errno == EINTR) continue;
-					if (r != n) {
-						out->clear();
-						ok = false;
-						break;
+					if (r == 0) {
+						if (st.st_size == 0) {
+							out->resize(pos);
+							break;
+						}
 					}
-					pos += n;
+					if (r != n) {
+						if (st.st_size > 0) {
+							out->clear();
+							ok = false;
+							break;
+						}
+					}
+					pos += r;
 				}
 			}
 		}

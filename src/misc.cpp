@@ -110,6 +110,36 @@ std::vector<std::string_view> misc::split(char const *begin, char const *end)
 	return r;
 }
 
+std::vector<std::string_view> misc::split_lines(char const *begin, char const *end)
+{
+	std::vector<std::string_view> ret;
+	char const *ptr = begin;
+	char const *left = ptr;
+	while (1) {
+		int c = 0;
+		if (ptr < end) {
+			c = (unsigned char)*ptr;
+		}
+		if (c == '\n' || c == '\r' || c == 0) {
+			char const *right = ptr;
+			if (c == '\n') {
+				ptr++;
+			} else if (c == '\r') {
+				ptr++;
+				if (ptr < end && *ptr == '\n') {
+					ptr++;
+				}
+			}
+			ret.push_back({ left, (size_t)(right - left) });
+			if (c == 0) break;
+			left = ptr;
+		} else {
+			ptr++;
+		}
+	}
+	return ret;
+}
+
 std::string misc::realpath(const char *path)
 {
 	char tmp[PATH_MAX];
@@ -124,12 +154,12 @@ std::string misc::realpath(std::string const &path)
 	return realpath(path.c_str());
 }
 
-size_t misc::parse_int(char const *p, int *out)
+size_t misc::parse_int(std::string_view const &s, int *out)
 {
 	unsigned long int val = 0;
 	size_t i = 0;
-	while (p[i]) {
-		int c = (unsigned char)p[i];
+	while (i < s.size()) {
+		int c = (unsigned char)s.data()[i];
 		if (!isdigit(c)) break;
 		val = val * 10 + (c - '0');
 		if (val > std::numeric_limits<int>::max()) {

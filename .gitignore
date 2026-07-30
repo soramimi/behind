@@ -5,3 +5,4 @@ build/
 src/nxdomain
 *.d
 resperf.gnuplot
+*.autosave
