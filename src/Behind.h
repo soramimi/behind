@@ -417,7 +417,6 @@ private:
 	void process_receive(InternalData *d, int upstream_fd);
 	std::shared_ptr<Task> find_task_by_fd(int fd) const;
 
-	bool reply_to_client_udp(InternalData *d, std::shared_ptr<Task> task, const dns::Message &received);
 	bool reply_to_client_udp(InternalData *d, std::shared_ptr<UdpQuery> const &query, const dns::Message &received);
 	bool reply_from_cache(InternalData *d, const ProtocolFamilyType &client_proto, const dns::Header &header, const dns::Question &q, uint16_t client_udp_payload);
 	std::shared_ptr<Task> make_task(Operation op, uint32_t local_transaction_id);

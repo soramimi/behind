@@ -2871,8 +2871,7 @@ bool Behind::reply_from_cache(InternalData *d, ProtocolFamilyType const &client_
 	return false;
 }
 
-bool Behind::process_local_query(InternalData *d, ProtocolFamilyType const &client_proto,
-	dns::Message const &received, dns::Question const &q)
+bool Behind::process_local_query(InternalData *d, ProtocolFamilyType const &client_proto, dns::Message const &received, dns::Question const &q)
 {
 	uint16_t const udp_payload = client_edns_payload(received);
 	// QR + RA, with RD copied from the query (RFC 1035 4.1.1: RD "is copied into
@@ -2998,6 +2997,10 @@ bool Behind::process_local_query(InternalData *d, ProtocolFamilyType const &clie
 
 void Behind::process_query_udp(InternalData *d, ProtocolFamilyType const &client_proto, dns::Message const &received, dns::Question const &q)
 {
+	if (m->options.log_queries) {
+		logprintf(LOG_DEFAULT, "Q: %s\n", q.name.c_str());
+	}
+	
 	if (process_local_query(d, client_proto, received, q)) return;
 
 	auto SendFailure = [&](char const *file, int line) {
@@ -3175,65 +3178,6 @@ Behind::ConnectionStatus Behind::process_query_tcp(InternalData *d, ProtocolFami
 	return forward_tcp(d, client_proto, client_fd, received.header.id, q, client_edns_payload(received), local_transaction_id, *f);
 }
 
-bool Behind::reply_to_client_udp(InternalData *d, std::shared_ptr<Task> task, dns::Message const &received)
-{
-	if (!task || received.questions.size() != 1 || received.questions.front().name != task->forward_name || received.questions.front().type != task->type || received.questions.front().clas != task->clas) return false;
-
-	std::vector<PendingQuery::Waiter> waiters;
-	if (task->pending) {
-		waiters = task->pending->waiters;
-	} else {
-		PendingQuery::Waiter waiter;
-		waiter.proto = task->client_proto;
-		waiter.requester_id = task->requester_id;
-		waiter.udp_payload = task->client_udp_payload;
-		waiter.request_name = task->request_name;
-		if (waiter.proto.is_inet4()) {
-			waiter.sa4 = task->client_sa4;
-		} else {
-			waiter.sa6 = task->client_sa6;
-		}
-		waiters.push_back(std::move(waiter));
-	}
-
-	bool sent = false;
-	for (PendingQuery::Waiter const &waiter : waiters) {
-		auto AmendOwner = [&](std::string const &name) {
-			return stricmp(task->forward_name.c_str(), name.c_str()) == 0
-				? waiter.request_name
-				: misc::strtolower(name);
-		};
-		dns::Message sending = received;
-		dns::normalize_negative_ttl(&sending);
-		sending.header.id = waiter.requester_id;
-		for (dns::Question &question : sending.questions) {
-			question.name = waiter.request_name;
-		}
-		for (dns::Record &record : sending.answers) {
-			record.name = AmendOwner(record.name);
-		}
-		for (dns::Record &record : sending.authorities) {
-			record.name = AmendOwner(record.name);
-		}
-		set_edns0(&sending, waiter.udp_payload);
-		InternalData client = *d;
-		if (waiter.proto.is_inet4()) {
-			client.in4_udp.sa4 = waiter.sa4;
-		} else {
-			client.in6_udp.sa6 = waiter.sa6;
-		}
-		sent = send_dns_message(&client, waiter.proto, sending, false, false) || sent;
-	}
-	if (sent && is_cacheable_response(task, received)) {
-		dns::Message cached = received;
-		cached.additionals.clear();
-		if (dns::Cache *cache = get_cache(task->type)) {
-			cache->insert(task->forward_name, task->type, task->clas, cached);
-		}
-	}
-	return sent;
-}
-
 bool Behind::reply_to_client_udp(InternalData *d, std::shared_ptr<UdpQuery> const &query, dns::Message const &received)
 {
 	if (!query || received.questions.size() != 1 || received.questions.front().name != query->forward_name || received.questions.front().type != query->type || received.questions.front().clas != query->clas) return false;
@@ -3264,7 +3208,6 @@ bool Behind::reply_to_client_udp(InternalData *d, std::shared_ptr<UdpQuery> cons
 		} else {
 			client.in6_udp.sa6 = waiter.sa6;
 		}
-		// fprintf(stderr, "---A %d\n", query->local_transaction_id);
 		sent = send_dns_message(&client, waiter.proto, sending, false, false) || sent;
 	}
 	if (sent) {
@@ -4354,6 +4297,7 @@ bool Behind::main(std::function<bool(bool)> const &reload_requested)
 // self test
 
 #define EXPECT_EQ(a, b) assert((a) == (b))
+#define EXPECT_NE(a, b) assert((a) != (b))
 
 std::string to_string(std::vector<uint8_t> const &buf)
 {
@@ -4483,9 +4427,13 @@ void Behind::self_test()
 		DomainFilter filter;
 		filter.add_nxdomain("*.lan");
 		filter.add_nxdomain("example.com");
+		filter.add_nxdomain("example.net.*");
 		EXPECT_EQ(filter.find("hoge.lan"), DomainFilter::NXDOMAIN);
 		EXPECT_EQ(filter.find("example.com"), DomainFilter::NXDOMAIN);
 		EXPECT_EQ(filter.find("ads.example.com"), DomainFilter::NXDOMAIN);
+		EXPECT_EQ(filter.find("example.net"), DomainFilter::NXDOMAIN);
+		EXPECT_EQ(filter.find("example.net.com"), DomainFilter::NXDOMAIN);
+		EXPECT_NE(filter.find("example.netcom"), DomainFilter::NXDOMAIN);
 	}
 
 	// PTR serializer/deserializer test

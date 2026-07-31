@@ -121,7 +121,10 @@ DomainFilter::Kind DomainFilter::find(std::string const &name) const
 			if (it != prefix_map_.end()) {
 				for (Item const &item : it->second) {
 					if (strncmp(loname.c_str(), item.name.c_str(), item.name.size()) == 0) {
-						return item.kind;
+						char c = loname.c_str()[item.name.size()];
+						if (c == 0 || c == '.') {
+							return item.kind;
+						}
 					}
 				}
 			}
@@ -202,9 +205,9 @@ bool DomainFilter::add_entry(std::string const &name, Kind kind, std::string *er
 		return Success();
 	}
 
-	if (loname.size() >= 3 && loname.compare(loname.size() - 2, 2, ".*") == 0) {
-		std::string prefix = loname.substr(0, loname.size() - 1);
-		if (prefix == "." || !misc::is_valid_domain(prefix)) {
+	if (loname.size() > 2 && loname.compare(loname.size() - 2, 2, ".*") == 0) {
+		std::string prefix = loname.substr(0, loname.size() - 2);
+		if (!misc::is_valid_domain(prefix)) {
 			return fail(error, "invalid prefix-match domain");
 		}
 		std::string key = domain_prefix_key(loname);
