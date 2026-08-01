@@ -4428,12 +4428,14 @@ void Behind::self_test()
 		filter.add_nxdomain("*.lan");
 		filter.add_nxdomain("example.com");
 		filter.add_nxdomain("example.net.*");
+		filter.add_nxdomain("*.video.twitter.*");
 		EXPECT_EQ(filter.find("hoge.lan"), DomainFilter::NXDOMAIN);
 		EXPECT_EQ(filter.find("example.com"), DomainFilter::NXDOMAIN);
 		EXPECT_EQ(filter.find("ads.example.com"), DomainFilter::NXDOMAIN);
 		EXPECT_EQ(filter.find("example.net"), DomainFilter::NXDOMAIN);
 		EXPECT_EQ(filter.find("example.net.com"), DomainFilter::NXDOMAIN);
 		EXPECT_NE(filter.find("example.netcom"), DomainFilter::NXDOMAIN);
+		EXPECT_EQ(filter.find("dualstack.video.twitter.map.fastly.net"), DomainFilter::NXDOMAIN);
 	}
 
 	// PTR serializer/deserializer test
