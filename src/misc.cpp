@@ -71,6 +71,13 @@ std::string_view misc::trimmed(std::string_view const &sv)
 	return { left, size_t(right - left) };
 }
 
+
+bool misc::ends_with(const std::string_view &s, const std::string_view &t)
+{
+	if (s.size() < t.size()) return false;
+	return s.substr(s.size() - t.size()) == t;
+}
+
 std::vector<std::string_view> misc::split(char const *begin, char const *end)
 {
 	char const *left = begin;

@@ -18,6 +18,8 @@ std::string strtolower(std::string_view const &s);
 
 std::string_view trimmed(std::string_view const &sv);
 
+bool ends_with(std::string_view const &s, std::string_view const &t);
+
 std::vector<std::string_view> split(char const *begin, char const *end);
 static inline std::vector<std::string_view> split(std::string_view const &s)
 {

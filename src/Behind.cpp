@@ -2965,6 +2965,13 @@ bool Behind::process_local_query(InternalData *d, ProtocolFamilyType const &clie
 					return true;
 				}
 			}
+			if (1) { // block reverse DNS for local addresses, even if not in [hosts]
+				constexpr std::string_view suffix = ".f.ip6.arpa";
+				if (misc::ends_with(misc::strtolower(q.name), suffix)) {
+					SendNXDOMAIN();
+					return true;
+				}
+			}
 		}
 
 		InetResolver::Addr const *addr = find_host(q.name);
@@ -3015,7 +3022,7 @@ bool Behind::process_local_query(InternalData *d, ProtocolFamilyType const &clie
 			SendNODATA();
 			return true;
 		}
-
+		
 		if (reply_from_cache(d, client_proto, received.header, q, udp_payload)) {
 			return true;
 		}
