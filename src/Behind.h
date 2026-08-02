@@ -127,6 +127,12 @@ struct Options {
 	uint32_t upstream_timeout_ms = 3000;
 	//
 	int udp_multiple_forwarding = 2;
+	//
+	struct MinTTLOverride {
+		std::string name;
+		int ttl = -1;
+	};
+	std::vector<MinTTLOverride> min_ttl_override;
 };
 
 enum class DNS_CLASS : uint16_t {
@@ -427,7 +433,10 @@ private:
 	void update_hosts_files(bool force);
 	bool is_client_allowed(sa_family_t family, const void *address) const;
 	bool consume_rate_limit(sa_family_t family, const void *address);
+	int min_ttl_override_for(std::string const &name) const;
 
+	void cache_insert(const std::string &name, DNS_TYPE type, DNS_CLASS clas, const dns::Message &value);
+	void modify_received(dns::Message *received);
 public:
 	static bool validate_options(Options const &opts, std::string *error = nullptr);
 	static bool validate_runtime_inputs(Options *opts, std::string const &working_directory, std::string *error = nullptr);

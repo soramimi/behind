@@ -2061,6 +2061,25 @@ bool Behind::consume_rate_limit(sa_family_t family, void const *address)
 	return true;
 }
 
+int Behind::min_ttl_override_for(std::string const &name) const
+{
+	std::string const loname = misc::strtolower(name);
+	int best = -1;
+	size_t best_len = 0;
+	for (Options::MinTTLOverride const &o : m->options.min_ttl_override) {
+		if (loname == o.name) {
+			return o.ttl;
+		}
+		if (o.name.size() < loname.size() && loname[loname.size() - o.name.size() - 1] == '.' && loname.compare(loname.size() - o.name.size(), o.name.size(), o.name) == 0) {
+			if (o.name.size() > best_len) {
+				best = o.ttl;
+				best_len = o.name.size();
+			}
+		}
+	}
+	return best;
+}
+
 bool Behind::is_matching_response(std::shared_ptr<Task> task, dns::Message const &received) const
 {
 	if (!task) {
@@ -2908,6 +2927,13 @@ bool Behind::process_local_query(InternalData *d, ProtocolFamilyType const &clie
 		dns::Message sending = MakeMessage(0);
 		Send(&sending);
 	};
+	auto local_ttl = [&](std::string const &name) -> uint32_t {
+		int override = min_ttl_override_for(name);
+		if (override >= 0) {
+			return std::max<uint32_t>(cache_min_ttl(), std::min<uint32_t>(override, m->options.max_ttl));
+		}
+		return cache_min_ttl();
+	};
 
 	if (q.clas == DNS_CLASS::IN && !q.name.empty()) {
 		if (!accept_dns_type(q.type)) {
@@ -2925,7 +2951,7 @@ bool Behind::process_local_query(InternalData *d, ProtocolFamilyType const &clie
 					r.name = q.name;
 					r.type = DNS_TYPE::PTR;
 					r.clas = q.clas;
-					r.ttl = cache_min_ttl();
+					r.ttl = local_ttl(q.name);
 					std::shared_ptr<dns::PTR> p = std::make_shared<dns::PTR>();
 					p->ptr = host_name;
 					r.set_ptr(p);
@@ -2950,7 +2976,7 @@ bool Behind::process_local_query(InternalData *d, ProtocolFamilyType const &clie
 					r.name = q.name;
 					r.type = q.type;
 					r.clas = q.clas;
-					r.ttl = cache_min_ttl();
+					r.ttl = local_ttl(q.name);
 					for (std::vector<uint8_t> const &a : addr->addr) {
 						r.bin = a;
 						rec.push_back(r);
@@ -2990,7 +3016,9 @@ bool Behind::process_local_query(InternalData *d, ProtocolFamilyType const &clie
 			return true;
 		}
 
-		return reply_from_cache(d, client_proto, received.header, q, udp_payload);
+		if (reply_from_cache(d, client_proto, received.header, q, udp_payload)) {
+			return true;
+		}
 	}
 	return false;
 }
@@ -3178,6 +3206,13 @@ Behind::ConnectionStatus Behind::process_query_tcp(InternalData *d, ProtocolFami
 	return forward_tcp(d, client_proto, client_fd, received.header.id, q, client_edns_payload(received), local_transaction_id, *f);
 }
 
+void Behind::cache_insert(std::string const &name, DNS_TYPE type, DNS_CLASS clas, dns::Message const &value)
+{
+	if (dns::Cache *cache = get_cache(type)) {
+		cache->insert(name, type, clas, value);
+	}
+}
+
 bool Behind::reply_to_client_udp(InternalData *d, std::shared_ptr<UdpQuery> const &query, dns::Message const &received)
 {
 	if (!query || received.questions.size() != 1 || received.questions.front().name != query->forward_name || received.questions.front().type != query->type || received.questions.front().clas != query->clas) return false;
@@ -3214,12 +3249,37 @@ bool Behind::reply_to_client_udp(InternalData *d, std::shared_ptr<UdpQuery> cons
 		if (is_cacheable_udp_response(query, received)) {
 			dns::Message cached = received;
 			cached.additionals.clear();
-			if (dns::Cache *cache = get_cache(query->type)) {
-				cache->insert(query->forward_name, query->type, query->clas, cached);
-			}
+			cache_insert(query->forward_name, query->type, query->clas, cached);
 		}
 	}
 	return sent;
+}
+
+void Behind::modify_received(dns::Message *received)
+{
+	if (received->questions.size() != 1) return;
+	int min_ttl_override = min_ttl_override_for(received->questions.front().name);
+	if (min_ttl_override < 0) return;
+	uint32_t const effective_min = std::min<uint32_t>(min_ttl_override, m->options.max_ttl);
+	uint16_t const rcode = received->header.flags & 0x000f;
+	auto apply_to_soa = [&](dns::Record *record) {
+		record->ttl = std::max<uint32_t>(effective_min, record->ttl);
+		if (record->type == DNS_TYPE::SOA && record->soa()) {
+			record->soa()->minimum = std::max<uint32_t>(effective_min, record->soa()->minimum);
+		}
+	};
+	if (rcode == 0) {
+		for (dns::Record &record : received->answers) {
+			record.ttl = std::max<uint32_t>(effective_min, record.ttl);
+		}
+		for (dns::Record &record : received->authorities) {
+			apply_to_soa(&record);
+		}
+	} else if (rcode == 3) {
+		for (dns::Record &record : received->authorities) {
+			apply_to_soa(&record);
+		}
+	}
 }
 
 void Behind::process_upstream_udp_channel(InternalData *d, std::shared_ptr<UdpChannel> const &channel)
@@ -3258,6 +3318,8 @@ void Behind::process_upstream_udp_channel(InternalData *d, std::shared_ptr<UdpCh
 		if (!is_matching_udp_response(query, received)) continue;
 
 		drop_aa_flag(&received);
+		modify_received(&received);
+
 		uint16_t rcode = received.header.flags & 0x000f;
 		if ((rcode == 1 || rcode == 4) && query->used_edns) {
 			dns::Message retry;
@@ -3287,6 +3349,7 @@ void Behind::process_upstream_udp_channel(InternalData *d, std::shared_ptr<UdpCh
 				}
 			}
 		}
+
 		if (rcode != 0 && rcode != 3) {
 			if (dns::Cache *cache = get_cache(query->type)) {
 				cache->insert_failure(query->forward_name, query->type, query->clas, received);
@@ -3390,8 +3453,7 @@ void Behind::process_receive(InternalData *d, int upstream_fd)
 				opt_count++;
 				if (!additional.name.empty()) error_rcode = 1;
 				if (((additional.ttl >> 16) & 0xff) != 0) {
-					badvers_payload = std::min<uint16_t>(m->options.edns0_buffer_size,
-						std::max<uint16_t>(512, (uint16_t)additional.clas));
+					badvers_payload = std::min<uint16_t>(m->options.edns0_buffer_size, std::max<uint16_t>(512, (uint16_t)additional.clas));
 				}
 			}
 		}
@@ -3502,51 +3564,52 @@ void Behind::process_receive(InternalData *d, int upstream_fd)
 				QueueServfail();
 				return;
 			}
-			task->upstream_id = retry.header.id;
-			task->used_edns = false;
-			task->buffer = std::move(packet.buffer);
-			task->send_offset = 0;
-			task->op = Operation::FORWARD_TO_UPSTREAM_TCP;
-			if (ctl_mod(upstream_fd, task->ev.get(), false, true) != 0) QueueServfail();
-			return;
-		}
-		drop_aa_flag(&received);
-		auto AmendName = [&task](std::string const &name) {
-			if (stricmp(task->request_name.c_str(), name.c_str()) == 0 || stricmp(task->forward_name.c_str(), name.c_str()) == 0) {
-				return task->request_name;
-			}
-			return misc::strtolower(name);
-		};
-		dns::Message sending = received;
-		dns::normalize_negative_ttl(&sending);
-		sending.header.id = task->requester_id;
-		for (dns::Question &question : sending.questions) {
-			question.name = AmendName(question.name);
-		}
-		for (dns::Record &a : sending.answers) {
-			a.name = AmendName(a.name);
-			if (a.type == DNS_TYPE::CNAME && a.cname()) {
-				a.cname()->cname = AmendName(a.cname()->cname);
-			} else if (a.type == DNS_TYPE::SOA && a.soa()) {
-				a.soa()->nname = AmendName(a.soa()->nname);
-				a.soa()->rname = AmendName(a.soa()->rname);
-			} else if (a.type == DNS_TYPE::HTTPS && a.https()) {
-				a.https()->name = AmendName(a.https()->name);
-			}
-		}
-		set_edns0(&sending, task->client_udp_payload);
-		if (is_cacheable_response(task, received)) {
-			if (dns::Cache *cache = get_cache(task->type)) {
-				cache->insert(task->forward_name, task->type, task->clas, sending);
-			}
-		} else if ((received.header.flags & 0x000f) != 0 && (received.header.flags & 0x000f) != 3) {
-			if (dns::Cache *cache = get_cache(task->type)) {
-				cache->insert_failure(task->forward_name, task->type, task->clas, sending);
-			}
-		}
-		QueueTcpResponse(std::move(sending));
+		task->upstream_id = retry.header.id;
+		task->used_edns = false;
+		task->buffer = std::move(packet.buffer);
+		task->send_offset = 0;
+		task->op = Operation::FORWARD_TO_UPSTREAM_TCP;
+		if (ctl_mod(upstream_fd, task->ev.get(), false, true) != 0) QueueServfail();
 		return;
 	}
+
+	drop_aa_flag(&received);
+	modify_received(&received);
+
+	auto AmendName = [&task](std::string const &name) {
+		if (stricmp(task->request_name.c_str(), name.c_str()) == 0 || stricmp(task->forward_name.c_str(), name.c_str()) == 0) {
+			return task->request_name;
+		}
+		return misc::strtolower(name);
+	};
+	dns::Message sending = received;
+	dns::normalize_negative_ttl(&sending);
+	sending.header.id = task->requester_id;
+	for (dns::Question &question : sending.questions) {
+		question.name = AmendName(question.name);
+	}
+	for (dns::Record &a : sending.answers) {
+		a.name = AmendName(a.name);
+		if (a.type == DNS_TYPE::CNAME && a.cname()) {
+			a.cname()->cname = AmendName(a.cname()->cname);
+		} else if (a.type == DNS_TYPE::SOA && a.soa()) {
+			a.soa()->nname = AmendName(a.soa()->nname);
+			a.soa()->rname = AmendName(a.soa()->rname);
+		} else if (a.type == DNS_TYPE::HTTPS && a.https()) {
+			a.https()->name = AmendName(a.https()->name);
+		}
+	}
+	set_edns0(&sending, task->client_udp_payload);
+	if (is_cacheable_response(task, received)) {
+		cache_insert(task->forward_name, task->type, task->clas, sending);
+	} else if ((received.header.flags & 0x000f) != 0 && (received.header.flags & 0x000f) != 3) {
+		if (dns::Cache *cache = get_cache(task->type)) {
+			cache->insert_failure(task->forward_name, task->type, task->clas, sending);
+		}
+	}
+	QueueTcpResponse(std::move(sending));
+	return;
+}
 
 	finish_task(task);
 }

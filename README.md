@@ -191,6 +191,26 @@ These mappings take precedence over DNS queries and are useful for:
 
 **Note**: Avoid using `.local` domain names as they are reserved for mDNS (multicast DNS) and may cause conflicts.
 
+#### [min-ttl-override]
+Force a minimum TTL for responses matching a domain. This is useful when an upstream returns records with very short TTLs that you prefer to keep cached longer:
+
+```ini
+[min-ttl-override]
+"firetvcaptiveportal.com" = 3600
+"example.com" = 300
+```
+
+The domain key is case-insensitive and may be written with or without a trailing dot. Matching is suffix-based with longest-match precedence, so `example.com` also applies to `www.example.com` and `deep.sub.example.com`. A more specific entry such as `sub.example.com` takes precedence over `example.com`.
+
+The override applies to:
+
+- Answer records in successful responses (A, AAAA, CNAME, MX, TXT, HTTPS, etc.)
+- Authority records, including the SOA `minimum` field used for negative caching
+- NXDOMAIN and NODATA responses when a SOA record is present
+- Local `[hosts]` and reverse PTR responses
+
+The effective value is always clamped by `max-ttl`. A value of `0` is not accepted; use `1` or greater.
+
 ## Usage
 
 ### Running Manually

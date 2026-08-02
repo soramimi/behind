@@ -59,30 +59,6 @@ bool parse_boolean(std::string const &text, bool *out)
 	return false;
 }
 
-bool validate_section(std::vector<std::string_view> const &parts, std::string *error)
-{
-	if (parts.empty()) {
-		return option_error(error, "an option must appear inside a section");
-	}
-	std::string const section(parts.front());
-	if (section == "options" || section == "logging" || section == "filter") {
-		if (parts.size() != 1) {
-			return option_error(error, "section [" + section + "] does not accept a qualifier");
-		}
-		return true;
-	}
-	if (section == "forward-zone" || section == "hosts") {
-		if (parts.size() > 2) {
-			return option_error(error, "section [" + section + "] accepts at most one qualifier");
-		}
-		if (parts.size() == 2 && misc::unquote(parts[1]).empty()) {
-			return option_error(error, "section [" + section + "] qualifier must not be empty");
-		}
-		return true;
-	}
-	return option_error(error, "unknown section: [" + section + "]");
-}
-
 std::string path_from_startup_directory(std::string const &path, std::string const &startup_directory)
 {
 	if (path.empty() || path.front() == '/') return path;
@@ -97,7 +73,6 @@ std::string path_from_startup_directory(std::string const &path, std::string con
 bool set_option(std::string const &section, std::string const &key, std::string const &value, Options *opts, std::string *error)
 {
 	std::vector<std::string_view> section_parts = misc::split(section);
-	if (!validate_section(section_parts, error)) return false;
 	if (key.empty()) return true; // Section declaration validation.
 	std::string const sec(section_parts.front());
 
@@ -287,6 +262,29 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 			hf.path = value;
 			opts->hostsfiles.push_back(std::move(hf));
 			return true;
+		}
+	} else if (sec == "min-ttl-override") {
+		if (key.size() >= 2 && key.front() == '"' && key.back() == '"') {
+			std::string name = misc::unquote(key);
+			if (name.empty()) return option_error(error, "host name must not be empty");
+			if (!misc::is_valid_domain(name)) {
+				return option_error(error, "invalid host name: " + name);
+			}
+			name = misc::strtolower(name);
+			if (!name.empty() && name.back() == '.') name.pop_back();
+			if (name.empty()) return option_error(error, "min-ttl-override name must not be root");
+			uint64_t v = 0;
+			if (parse_unsigned(value, 1, 24 * 60 * 60, &v)) {
+				Options::MinTTLOverride o;
+				o.name = name;
+				o.ttl = static_cast<int>(v);
+				opts->min_ttl_override.push_back(std::move(o));
+				return true;
+			} else {
+				return option_error(error, "invalid min-ttl-override value (must be 1-86400 seconds): " + value);
+			}
+		} else {
+			return option_error(error, "invalid min-ttl-override key (expected quoted domain name): " + key);
 		}
 	}
 	return option_error(error, "unknown option in [" + sec + "]: " + key);
