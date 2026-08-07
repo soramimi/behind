@@ -65,6 +65,7 @@ directory = /var/lib/behind    ; Working directory for the server
 listen = 127.0.0.1@5301        ; IPv4 listen address and port
 listen = ::1@5301              ; IPv6 listen address and port
 max-tasks = 500                ; Maximum number of active forwarding tasks
+max-tcp-clients = 100          ; Maximum concurrent TCP client connections
 max-cache-entry-size = 65535   ; Maximum serialized cache entry size
 max-cache-bytes = 67108864     ; Global cache memory limit
 max-ttl = 86400                ; Maximum cached TTL in seconds

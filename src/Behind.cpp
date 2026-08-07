@@ -781,6 +781,9 @@ bool Behind::validate_options(Options const &opts, std::string *error)
 	if (opts.max_cache_entry_size == 0 || opts.max_cache_bytes == 0 || opts.max_cache_entry_size > opts.max_cache_bytes) {
 		return Fail("max-cache-entry-size must not exceed max-cache-bytes");
 	}
+	if (opts.max_tcp_clients == 0 || opts.max_tcp_clients > 1000) {
+		return Fail("max-tcp-clients must be between 1 and 1000");
+	}
 	if (opts.max_ttl == 0) return Fail("max-ttl must be greater than zero");
 	if (opts.edns0_buffer_size < 512) return Fail("edns0-buffer-size must be at least 512");
 	if (opts.rate_limit_qps == 0 || opts.rate_limit_burst == 0) {
@@ -2558,6 +2561,18 @@ size_t Behind::active_task_count() const
 	return m->tasks_by_fd.size() + m->udp_queries_by_local_txid.size();
 }
 
+int Behind::connected_tcp_client_count() const
+{
+	int count = 0;
+	for (auto const &item : m->tasks_by_fd) {
+		std::shared_ptr<Task> const &task = item.second;
+		if (task && task->client_proto.is_stream()) {
+			count++;
+		}
+	}
+	return count;
+}
+
 std::shared_ptr<Behind::UdpChannel> Behind::find_udp_channel(Forwarder const &forwarder) const
 {
 	for (std::shared_ptr<UdpChannel> const &channel : m->udp_channels) {
@@ -3760,6 +3775,11 @@ void Behind::process_tcp(InternalData *d, sa_family_t family)
 		}
 		if (active_task_count() >= m->options.max_tasks) {
 			logprintf(LOG_DEFAULT, "too many tasks (%zu): rejecting TCP connection\n", active_task_count());
+			closesocket(sock);
+			return;
+		}
+		if (connected_tcp_client_count() >= (int)m->options.max_tcp_clients) {
+			logprintf(LOG_DEFAULT, "too many TCP clients (%d): rejecting connection\n", connected_tcp_client_count());
 			closesocket(sock);
 			return;
 		}

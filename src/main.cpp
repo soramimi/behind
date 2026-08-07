@@ -106,6 +106,14 @@ bool set_option(std::string const &section, std::string const &key, std::string 
 			}
 			return option_error(error, "invalid max-cache-bytes value: " + value);
 		}
+		if (key == "max-tcp-clients") {
+			uint64_t v = 0;
+			if (parse_unsigned(value, 1, std::numeric_limits<size_t>::max(), &v)) {
+				opts->max_tcp_clients = static_cast<size_t>(v);
+				return true;
+			}
+			return option_error(error, "invalid max-tcp-clients value: " + value);
+		}
 		if (key == "max-ttl") {
 			uint64_t v = 0;
 			if (parse_unsigned(value, 1, std::numeric_limits<uint32_t>::max(), &v)) {

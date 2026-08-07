@@ -119,6 +119,7 @@ struct Options {
 	size_t max_tasks = 500;
 	size_t max_cache_entry_size = 65535;
 	size_t max_cache_bytes = 64 * 1024 * 1024;
+	size_t max_tcp_clients = 100;
 	uint32_t max_ttl = 86400;
 	uint16_t edns0_buffer_size = 1232;
 	std::vector<std::string> allow_clients;
@@ -328,6 +329,7 @@ private:
 	void periodic(InternalData *d, bool force);
 	void clean(InternalData *d);
 	size_t active_task_count() const;
+	int connected_tcp_client_count() const;
 	void push_task(std::shared_ptr<Task> task, int timeout, uint32_t epoll_events);
 	void finish_task(std::shared_ptr<Task> task, bool close_client = true);
 	bool is_udp_query_active(std::shared_ptr<UdpQuery> const &query) const;
