@@ -120,6 +120,8 @@ struct Options {
 	size_t max_cache_entry_size = 65535;
 	size_t max_cache_bytes = 64 * 1024 * 1024;
 	size_t max_tcp_clients = 100;
+	size_t tcp_client_timeout = 3000;
+	size_t tcp_upstream_timeout = 3000;
 	uint32_t max_ttl = 86400;
 	uint16_t edns0_buffer_size = 1232;
 	std::vector<std::string> allow_clients;

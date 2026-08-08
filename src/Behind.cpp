@@ -2347,7 +2347,7 @@ bool Behind::send_dns_message(InternalData *d, ProtocolFamilyType const &proto, 
 			task->upstream_fd = upstream_fd;
 			task->client_proto = proto;
 			task->buffer = std::move(packet.buffer);
-			push_task(task, 3000, EPOLLOUT | EPOLLERR | EPOLLHUP);
+			push_task(task, m->options.tcp_upstream_timeout, EPOLLOUT | EPOLLERR | EPOLLHUP);
 		} else {
 			task->op = Operation::WRITING_TO_CLIENT_TCP;
 			task->buffer = std::move(packet.buffer);
@@ -3792,7 +3792,7 @@ void Behind::process_tcp(InternalData *d, sa_family_t family)
 		} else {
 			task->client_sa6 = d->in6_tcp.sa6;
 		}
-		push_task(task, 3000, EPOLLIN | EPOLLERR | EPOLLHUP);
+		push_task(task, m->options.tcp_client_timeout, EPOLLIN | EPOLLERR | EPOLLHUP);
 	}
 }
 
